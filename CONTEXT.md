@@ -135,10 +135,41 @@ inventing language the project does not use, or there is a real gap to record.
   The v1 tag+vector path over the shared `embedding` table is the same engine
   with the keyword half at zero, and it is still served.
 
+**Event**
+: Something a paired client is told about: `document.ingested`,
+  `document.failed`, `clusters.retrained`. One payload, carrying the KB and —
+  where there is one — the document, and a **deterministic id** derived from
+  what happened rather than from when it was noticed, so the same event
+  announced twice is recognisably one event.
+
 **Webhook**
-: A URL a paired client asked to be told at: `document.ingested`,
-  `document.failed`, `clusters.retrained`. Search does not know what the other
-  end does with it.
+: A URL a paired client asked to be told at. A delivery is signed
+  (`x-search-signature: sha256=<hex>`, HMAC over the raw body), retried with
+  backoff, and written down in a **delivery ledger** row per event. It is the
+  durable transport: it survives the client not being connected. Search does not
+  know what the other end does with it.
+
+**Event stream**
+: `GET /v1/events`, the same **Event** pushed down an open connection as
+  server-sent events. The live transport: no public URL needed, nothing kept if
+  nobody is listening, and strictly in-process — a second instance's events do
+  not appear on it. A client may register a **Webhook**, hold a stream, both, or
+  neither.
+
+**Contract**
+: A zod schema for one request, response, error or event on the wire, in
+  `packages/sdk/src/contracts/` and exported as `@actana/search/contracts`.
+  **There is one definition of each** (ADR 0009): the core validates with the
+  same object the SDK infers its types from. A field that is not in a contract
+  is not on the wire.
+
+**Mode**
+: Which retrieval path a **Query** runs. `hybrid` is the keyword+semantic blend
+  over the KB's **Partition**; `v1-tags` is the pre-v2 **Tag** filter followed
+  by a vector search over the shared `embedding` table. Both are served and
+  neither is a reimplementation of the other. Distinct from `queryKeywords`,
+  which picks between the two *hybrid* entry points — selected-from-the-KB's-
+  vocabulary, or exactly the caller's list.
 
 ## Rules
 
@@ -151,6 +182,13 @@ inventing language the project does not use, or there is a real gap to record.
 3. **The certificate is the identity.** Never read a client id from a URL, a
    body or a header.
 4. **The SDK is the only way in.** No consumer reads a table.
+4a. **One contract, in zod, in the SDK.** A request shape is defined once
+   (`@actana/search/contracts`), validated by the core with that object, and
+   inferred by the SDK from it. A hand-written request shape on either side is
+   the bug ADR 0009 exists to prevent.
+4b. **A row that is not the caller's is a 404.** `403` is for a restriction the
+   caller was told about at pairing time — a scope, a KB allow-list. Anything
+   else that would confirm an id exists answers `404` (ADR 0009 D5).
 5. **Search does not know what a workspace, an agent, a crew or a workflow
    is.** Where the lifted code did, the branch was cut and marked `// lifted:`.
 6. **A provider key is never logged, never returned by a route, and in wired

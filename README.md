@@ -37,11 +37,17 @@ pnpm db:migrate     # migrations are also applied at boot
 pnpm dev
 ```
 
-> **Where this is up to.** `pnpm db:migrate` and `pnpm dev` work today: the
-> schema, the migrator, the lifted engine and the mTLS pairing below are in.
-> `pnpm dev` migrates, mints this instance's identity, and serves `/v1/health`,
-> `/v1/pair/redeem`, `/v1/pair/status` and `/v1/capabilities`. The rest of the
-> REST surface lands in **TASK-004** and the worker and the CLI in **TASK-005**.
+> **Where this is up to.** The quickstart above is real as far as *querying
+> through the SDK*: `pnpm dev` migrates, mints this instance's identity, and
+> serves the whole `/v1` surface — knowledge bases, ingest, query, chunks,
+> keywords, clusters, tags, endpoints, webhooks and the event stream
+> ([`docs/external-api.md`](docs/external-api.md)). What is **not** in yet is
+> the **ingestion worker process**: the API enqueues the jobs and TASK-005
+> brings the worker that runs them, so on this commit a document posted to a
+> running instance stays `pending` unless something is draining the queue. The
+> fixture suite drives the whole pipeline with `SEARCH_INLINE_JOBS=1`, which
+> runs the jobs in-process and refuses to start outside a test.
+>
 > `SEARCH_ENCRYPTION_KEY` is required rather than generated, and nothing
 > generates one for you.
 
@@ -63,6 +69,7 @@ curl -s --unix-socket ~/.actana-search/admin.sock \
 
 ```ts
 // On the client. The key pair is generated here; only a CSR crosses the wire.
+import { readFile } from "node:fs/promises";
 import { pairWithSearch } from "@actana/search/pairing";
 import { SearchClient } from "@actana/search/client";
 
@@ -73,6 +80,45 @@ const blob = await pairWithSearch({
   client: { label: "actanastudio", platform: process.platform },
 });
 const search = SearchClient.fromRegistrationBlob(blob); // seal `blob`; it is the credential
+```
+
+Then everything else goes through that client, and nothing else does
+(`CONTEXT.md` rule 4):
+
+```ts
+// The endpoints this instance may embed and keyword with. `local` seals the
+// key here; `mirrored` keeps it on your side and is asked for one per job.
+const { endpoints } = await search.endpoints.put({
+  source: { kind: "local" },
+  endpoints: [{
+    externalId: "emb-main",
+    kind: "embedding",
+    provider: "openai",
+    model: "text-embedding-3-small",
+    dimensions: 1536,
+    label: "OpenAI small",
+    apiKey: process.env.OPENAI_API_KEY,
+  }],
+});
+
+const kb = await search.kbs.create({
+  name: "Handbook",
+  embeddingEndpointId: endpoints[0].id,
+});
+
+// Ingest is asynchronous, and a file and a string are two different pipelines.
+const doc = await search.kbs.ingest(kb.id, {
+  filename: "handbook.md",
+  file: await readFile("handbook.md"),
+});
+while ((await search.documents.get(kb.id, doc.documentId)).processingStatus !== "completed") {
+  await new Promise((r) => setTimeout(r, 500));   // or: for await (… of search.events())
+}
+
+const result = await search.kbs.query(kb.id, {
+  text: "parental leave policy",
+  topK: 5,
+});
 ```
 
 The code is single-use, expires in five minutes (`ttlMs` on the mint raises
@@ -121,6 +167,30 @@ Search owns its data: the `search` schema in Postgres (pgvector), its own
 BullMQ queue (prefix `search`), and its own S3-compatible bucket. When it
 shares Studio's Postgres it is still a schema Studio never references.
 
+## The API
+
+One surface, `/v1`, JSON in and out, multipart for a file ingest, server-sent
+events for progress. **Every request and response shape is a zod schema in the
+SDK package** (`@actana/search/contracts`); the core validates with those exact
+objects and the SDK's types are inferred from them, so there is one definition
+of a request and no way for the two halves to drift
+([ADR 0009](docs/adr/0009-one-contract-defined-once-in-zod.md)).
+
+The route table, with the schema for every request and response, is
+[`docs/external-api.md`](docs/external-api.md). Three things about it are worth
+knowing before reading it:
+
+- **Ingest is asynchronous, and the two encodings are two pipelines.** A file
+  takes the resumable worker flow; a string takes `ingestDocument`. They produce
+  measurably different corpora from the same bytes and both are frozen (ADR
+  0005), so the encoding is a choice about behaviour rather than about
+  convenience.
+- **`POST /kbs/:id/query` serves both retrieval paths**, chosen by `mode`: the
+  hybrid keyword+semantic rank, and the v1 tag-filter-then-vector path over the
+  shared `embedding` table. Neither is a reimplementation of the other.
+- **A knowledge base that is not yours answers `404`, not `403`.** A 403 would
+  confirm the id names something.
+
 ## Architecture decisions
 
 | # | Decision |
@@ -133,6 +203,7 @@ shares Studio's Postgres it is still a schema Studio never references.
 | [0006](docs/adr/0006-blob-storage-and-queue-are-searchs-own.md) | Blob storage and the queue are Search's own |
 | [0007](docs/adr/0007-the-sheetjs-exception.md) | The SheetJS exception — two advisories acknowledged, not fixed |
 | [0008](docs/adr/0008-the-pairing-code-is-copied-from-control.md) | The pairing code is copied from Control, and will be lifted into a package |
+| [0009](docs/adr/0009-one-contract-defined-once-in-zod.md) | One contract, defined once in zod, served and consumed |
 
 ## Moving data out of Studio
 
