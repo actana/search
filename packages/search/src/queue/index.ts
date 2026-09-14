@@ -14,19 +14,31 @@
  * there is one backend and `shouldExecuteInline` — the double-execution guard
  * that only existed to make the inline backend safe — has nothing to guard.
  *
- * The prefix is `search`, which is what makes sharing a client's Redis safe.
+ * The prefix is `search` (`SEARCH_QUEUE_PREFIX`), which is what makes sharing a
+ * client's Redis safe.
  */
 
 import { FlowProducer, Queue } from 'bullmq'
 import { createLogger } from '@actana/search-shared/log'
 import { generateId } from '@actana/search-shared/short-id'
+import { config } from '../config.ts'
 import { getQueueConnection } from './redis.ts'
 import { inlineFlowProducer, inlineJobQueue, inlineJobsEnabled } from './inline.ts'
 
 const logger = createLogger('queue')
 
-/** Namespace for every key Search writes into Redis. */
-export const QUEUE_PREFIX = 'search'
+/**
+ * Namespace for every key Search writes into Redis — `SEARCH_QUEUE_PREFIX`,
+ * default `search` (ADR 0006, ADR 0010).
+ *
+ * A function rather than a constant because it is read from configuration and
+ * the configuration parse is lazy: a module-level `config()` here would demand
+ * an environment from every unit test that imports the queue by accident. The
+ * queue and the worker must agree on it, and they do by both calling this.
+ */
+export function queuePrefix(): string {
+  return config().SEARCH_QUEUE_PREFIX
+}
 
 /** The queue every ingestion job lands on. */
 export const QUEUE_NAME = 'search-knowledge'
@@ -52,7 +64,17 @@ export type JobType =
   | 'kb.clusters.validate'
   | 'kb.ingest.document'
   | 'kb.embed.batch'
-  | 'kb.document.finalize'
+  /**
+   * The fan-in parent. **Was listed here as `kb.document.finalize`, which no
+   * code ever enqueued**: `embed-pipeline.ts` names the flow's parent
+   * `kb.embed.finalize` and always has, in Studio and here. The union was the
+   * thing that was wrong, and a worker routing on the wrong string would have
+   * dropped every finalize on the floor — so it is corrected here rather than
+   * in the pipeline (TASK-005).
+   */
+  | 'kb.embed.finalize'
+  /** The stranded-document sweep. Repeatable, not enqueued by the engine. */
+  | 'kb.document.timeout-sweep'
 
 export interface EnqueueOptions {
   maxAttempts?: number
@@ -71,8 +93,20 @@ export const JOB_TYPE_ATTEMPTS: Record<JobType, number> = {
   'kb.clusters.validate': 2,
   'kb.ingest.document': 3,
   'kb.embed.batch': 5,
-  'kb.document.finalize': 3,
+  'kb.embed.finalize': 3,
+  'kb.document.timeout-sweep': 1,
 }
+
+/**
+ * The backoff every retry waits, exponential from one second.
+ *
+ * It is here rather than on the worker because a retry is scheduled by the
+ * *queue*, and because it is what makes a resolver outage survivable: an
+ * endpoint key that cannot be fetched fails its job, and the five attempts a
+ * `kb.embed.batch` gets then span roughly half a minute rather than arriving
+ * back-to-back inside a second (ADR 0010).
+ */
+export const JOB_BACKOFF = { type: 'exponential' as const, delay: 1_000 }
 
 /**
  * The queue surface the engine sees. Named `JobQueueBackend` after Studio's
@@ -91,7 +125,7 @@ function bullQueue(): Queue {
   if (queue) return queue
   queue = new Queue(QUEUE_NAME, {
     connection: getQueueConnection(),
-    prefix: QUEUE_PREFIX,
+    prefix: queuePrefix(),
     defaultJobOptions: {
       removeOnComplete: { age: 24 * 60 * 60 },
       removeOnFail: { age: 48 * 60 * 60 },
@@ -109,6 +143,7 @@ const backend: JobQueueBackend = {
       {
         jobId,
         attempts: options?.maxAttempts ?? JOB_TYPE_ATTEMPTS[type] ?? 3,
+        backoff: JOB_BACKOFF,
         priority: options?.priority,
         delay: options?.delayMs,
       }
@@ -126,6 +161,7 @@ const backend: JobQueueBackend = {
         opts: {
           jobId,
           attempts: job.options?.maxAttempts ?? JOB_TYPE_ATTEMPTS[job.type] ?? 3,
+          backoff: JOB_BACKOFF,
           priority: job.options?.priority,
           delay: job.options?.delayMs,
         },
@@ -152,7 +188,7 @@ export async function getJobQueue(): Promise<JobQueueBackend> {
 let flowProducer: FlowProducer | undefined
 
 /**
- * The BullMQ flow producer. The embed fan-out is a parent `kb.document.finalize`
+ * The BullMQ flow producer. The embed fan-out is a parent `kb.embed.finalize`
  * job over N `kb.embed.batch` children, which is the whole reason a flow
  * producer is in the graph at all: the finalize step must run once, after the
  * last batch, whichever batch that turns out to be.
@@ -165,7 +201,7 @@ export function getFlowProducer(): FlowProducer {
   if (flowProducer) return flowProducer
   flowProducer = new FlowProducer({
     connection: getQueueConnection(),
-    prefix: QUEUE_PREFIX,
+    prefix: queuePrefix(),
   })
   return flowProducer
 }

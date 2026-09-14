@@ -166,6 +166,22 @@ export const pairedClient = searchSchema.table(
     kbIds: jsonb("kb_ids"),
     /** 'active' | 'revoked'. */
     status: text("status").notNull().default("active"),
+    /**
+     * Where this client's model-endpoint keys come from — what `PUT /endpoints`
+     * last declared (ADR 0004, ADR 0010).
+     *
+     * `{ kind: 'local' }`, or
+     * `{ kind: 'mirrored', resolverUrl, resolverKeyCiphertext, resolverScope? }`.
+     * NULL reads as local, which is what a client that has never declared
+     * anything is — and what every client paired before this column existed is.
+     *
+     * **The resolver credential is sealed here, never plain.** It is not itself
+     * a provider key; it is the credential that *fetches* provider keys, which
+     * makes it the more valuable of the two. `resolverKeyCiphertext` is
+     * AES-256-GCM under `SEARCH_ENCRYPTION_KEY`, so declaring a mirrored source
+     * needs that variable set even though nothing else in wired mode does.
+     */
+    endpointSource: jsonb("endpoint_source"),
     lastSeenAt: timestamp("last_seen_at"),
     revokedAt: timestamp("revoked_at"),
     createdAt: timestamp("created_at").notNull().defaultNow(),

@@ -17,12 +17,17 @@
  *   5. **The admin listener** on a Unix socket under `SEARCH_STATE_DIR`, which
  *      is where a pairing code is minted. `SEARCH_ADMIN_PORT` adds a loopback
  *      TCP port beside it for a platform with no Unix sockets.
+ *   6. **The ingestion workers**, unless `SEARCH_WORKERS=off`.
  *
  * The `/v1` REST surface is mounted at step 4 through `registerRoutes`
- * (`api/routes/index.ts`). The ingestion **worker process** and the endpoint
- * sources land in TASK-005: until then the jobs this API enqueues are picked up
- * by a worker started beside it, or — in a test — by the inline runner
- * (`SEARCH_INLINE_JOBS=1`, `queue/inline.ts`).
+ * (`api/routes/index.ts`).
+ *
+ * **One process by default, two when a deployment wants two** (ADR 0010).
+ * `pnpm dev` and the compose service run the API and the worker together,
+ * because a single container that ingests what it is given is what "run Search"
+ * should mean. A deployment that wants them apart runs `start:api` with
+ * `SEARCH_WORKERS=off` beside any number of `start:worker` processes; they share
+ * a Redis and a queue prefix and nothing else changes.
  */
 
 import { createLogger } from "@actana/search-shared/log";
@@ -36,6 +41,7 @@ import { registerSearchRoutes } from "./api/routes/index.ts";
 import { SearchPairingStore } from "./pairing/pairing-store.ts";
 import { PairingRevocations, startPairingRevocationSweep } from "./pairing/pairing-revocation.ts";
 import { ensureMaterial } from "./pairing/self-register.ts";
+import { installShutdownHandlers, startWorkers } from "./worker.ts";
 
 const logger = createLogger("search");
 
@@ -78,10 +84,22 @@ export async function boot(): Promise<void> {
     ...(cfg.SEARCH_ADMIN_PORT === undefined ? {} : { port: cfg.SEARCH_ADMIN_PORT }),
   });
 
+  /**
+   * The workers, in this process unless a deployment has split them out.
+   *
+   * `SEARCH_WORKERS=off` is read straight from the environment rather than
+   * through the config schema: it is a deployment shape, not a tuning knob, and
+   * the only two things that ever set it are `start:api` and a compose file.
+   */
+  const workersOff = /^(off|0|false|no)$/i.test(process.env.SEARCH_WORKERS ?? "");
+  const workers = workersOff ? null : await startWorkers();
+  if (workers) installShutdownHandlers(workers);
+
   logger.info("Search is up", {
     api: api.origin,
     adminSocket: admin.socketPath,
     adminPort: admin.port,
+    workers: workersOff ? "off (SEARCH_WORKERS=off)" : "in this process",
   });
 }
 

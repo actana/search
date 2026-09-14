@@ -19,6 +19,22 @@ const schema = z.object({
   SEARCH_DATABASE_URL: z.string().min(1).optional(),
   /** Redis, for the ingestion queue. Prefixed `search` so a shared server is safe (ADR 0006). */
   SEARCH_REDIS_URL: z.string().min(1).default("redis://localhost:6379"),
+  /**
+   * The namespace every key Search writes into Redis sits under (ADR 0006,
+   * ADR 0010).
+   *
+   * `search` is the answer for a deployment, standalone or wired: sharing a
+   * client's Redis is safe because the two engines' keys cannot collide. It is
+   * settable because two *Search* instances sharing one Redis — a test run
+   * beside a dev instance, two branches on one machine — is a real arrangement,
+   * and the alternative is a second Redis for the sake of a prefix.
+   */
+  SEARCH_QUEUE_PREFIX: z.string().min(1).default("search"),
+  /**
+   * Jobs one worker process runs at once on the knowledge queue. Mirrors
+   * Studio's `worker/index.ts` knowledge concurrency.
+   */
+  SEARCH_WORKER_CONCURRENCY: z.coerce.number().int().positive().default(20),
 
   /** The S3-compatible bucket Search owns. Never a client's bucket (ADR 0006). */
   SEARCH_S3_ENDPOINT: z.string().optional(),

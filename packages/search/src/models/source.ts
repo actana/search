@@ -56,21 +56,32 @@ export interface ProviderBinding {
 let configured: ModelEndpointSource | undefined
 
 /**
- * Install the source. Called once at boot — `LocalEndpointSource` standalone,
- * `MirroredEndpointSource` when wired (TASK-005). Also how a test injects a
- * stand-in without mocking a module.
+ * Override the process's source. How a test injects a stand-in without mocking
+ * a module; `undefined` puts the default back.
+ *
+ * **Not how wired mode is turned on.** There is no boot flag and there is no
+ * per-process answer: the default source reads each endpoint row and dispatches
+ * to the local or the mirrored source *per row*
+ * (`routing-endpoint-source.ts`), because "which source" is a fact about a
+ * paired client rather than about a process, and one instance serves both kinds
+ * of client at once (ADR 0004, ADR 0010).
+ *
+ * Named `install…` rather than `set…` because `setEndpointSource(clientId,
+ * source)` in `endpoint-registry.ts` is the one a route calls, and two
+ * functions with one name doing different things is one import away from being
+ * the wrong one.
  */
-export function setEndpointSource(source: ModelEndpointSource | undefined): void {
+export function installEndpointSource(source: ModelEndpointSource | undefined): void {
   configured = source
 }
 
 /**
- * The installed source, defaulting to the local one. Lazy, so importing this
+ * The installed source, defaulting to the routing one. Lazy, so importing this
  * module does not open a database connection.
  */
 export async function getEndpointSource(): Promise<ModelEndpointSource> {
   if (configured) return configured
-  const { LocalEndpointSource } = await import('./local-endpoint-source.ts')
-  configured = new LocalEndpointSource()
+  const { RoutingEndpointSource } = await import('./routing-endpoint-source.ts')
+  configured = new RoutingEndpointSource()
   return configured
 }

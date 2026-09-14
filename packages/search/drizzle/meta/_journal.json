@@ -15,6 +15,13 @@
       "when": 1789425864713,
       "tag": "0001_pairing_session_and_grant",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789427028440,
+      "tag": "0002_endpoint_source",
+      "breakpoints": true
     }
   ]
 }

@@ -59,7 +59,12 @@ export class LocalEndpointSource implements ModelEndpointSource {
       .where(
         and(
           eq(modelEndpoint.pairedClientId, binding.pairedClientId),
-          eq(modelEndpoint.provider, binding.provider)
+          eq(modelEndpoint.provider, binding.provider),
+          // Local rows only. A mirrored row has a NULL ciphertext, so without
+          // this a client with one mirrored Mistral endpoint resolves to `''`
+          // here and the OCR step reads that as "not configured" rather than as
+          // "ask the resolver" — a silent change to what a document parses into.
+          eq(modelEndpoint.source, 'local')
         )
       )
       .limit(1)

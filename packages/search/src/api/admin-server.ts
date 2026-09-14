@@ -45,11 +45,32 @@
 //     → { sessionId, code, ticket, expiresAt, caFingerprint, endpoint, scope, kbIds }
 //   GET  /admin/pair/clients → { clients: [...] }
 //   POST /admin/pair/revoke  { id } → { revoked }
+//   GET  /admin/endpoints    → { pairedClientId, endpoints: [...] }
+//   POST /admin/endpoints    { pairedClientId?, kind, provider, template?, model,
+//                              dimensions?, baseUrl?, label?, config?, apiKey }
+//     → { endpoint }
 //
 // **The code is in the response and nowhere else.** It is hashed before it is
 // stored (ADR 0034 D1), so this body is the only time it exists outside the
 // operator's head — `pair ls` cannot print it because there is nothing to
 // print.
+//
+// **The two endpoint routes are here for the same reason the pairing ones are,
+// and they are temporary** (TASK-005). Registering a *local* model endpoint
+// means handing the instance a provider key to seal, and the authenticated way
+// to do that is `PUT /v1/endpoints` over mTLS — which lands with the REST
+// surface in TASK-004. Until it does, an operator standing up a standalone
+// instance has no way to give it an embedding key at all, and "pair with
+// yourself first, then register the key you need in order to ingest anything"
+// is not a first run. So the mint's own guarantee is reused: the filesystem
+// decides who may, and the same 0600 socket carries it. When
+// `PUT /v1/endpoints` exists, `actana-search endpoint add` moves to it and
+// these two go — they are marked here so the removal is a deletion rather than
+// an archaeology exercise.
+//
+// Neither returns a key. `POST` takes one and seals it under
+// `SEARCH_ENCRYPTION_KEY`; the listing reports `hasKey` and never a value
+// (ADR 0004, `models/endpoint-registry.ts`).
 
 import * as fs from "node:fs";
 import * as http from "node:http";
@@ -115,6 +136,33 @@ export type AdminServerOptions = {
   host?: string;
   /** Where mints and revocations are recorded. Defaults to the instance log. */
   audit?: (event: PairingAuditEvent) => void;
+  /**
+   * The endpoint registry the two `/admin/endpoints` routes write through.
+   *
+   * A port rather than a direct import so this server can be started in a suite
+   * that has no database — the pairing e2e does exactly that — and so the
+   * routes' removal in TASK-004 is one field and two handlers. Defaults to
+   * `models/endpoint-registry.ts`, loaded lazily on the first call.
+   */
+  endpoints?: AdminEndpointPort;
+};
+
+/** What the two `/admin/endpoints` routes need. See `models/endpoint-registry.ts`. */
+export type AdminEndpointPort = {
+  listEndpoints(clientId: string): Promise<unknown[]>;
+  createLocalEndpoint(clientId: string, input: LocalEndpointDraft, apiKey: string): Promise<unknown>;
+};
+
+/** The subset of `LocalEndpointInput` this surface accepts. */
+export type LocalEndpointDraft = {
+  kind: "embedding" | "inference";
+  provider: string;
+  template: string;
+  model?: string | null;
+  dimensions?: number | null;
+  baseUrl?: string | null;
+  label?: string | null;
+  config?: Record<string, unknown> | null;
 };
 
 export type AdminServer = {
@@ -185,6 +233,8 @@ export async function startAdminServer(opts: AdminServerOptions): Promise<AdminS
     if (method === "GET" && url.pathname === "/admin/pair/clients") return listClients(res);
     if (method === "POST" && url.pathname === "/admin/pair/revoke") return revoke(req, res);
     if (method === "GET" && url.pathname === "/admin/pair/codes") return listCodes(res);
+    if (method === "GET" && url.pathname === "/admin/endpoints") return listEndpoints(url, res);
+    if (method === "POST" && url.pathname === "/admin/endpoints") return addEndpoint(req, res);
     sendRefusal(res, {
       status: 404,
       code: "not-found",
@@ -352,6 +402,157 @@ export async function startAdminServer(opts: AdminServerOptions): Promise<AdminS
       code: "not-found",
       message: `nothing paired or pending is named "${id}"`,
     });
+  }
+
+  /** The registry, loaded on first use so a suite with no database can start. */
+  async function endpointPort(): Promise<AdminEndpointPort> {
+    if (opts.endpoints) return opts.endpoints;
+    const registry = await import("../models/endpoint-registry.ts");
+    return {
+      listEndpoints: (clientId) => registry.listEndpoints(clientId),
+      createLocalEndpoint: (clientId, input, apiKey) =>
+        registry.createLocalEndpoint(clientId, input, apiKey),
+    };
+  }
+
+  /**
+   * Which paired client an endpoint verb acts for.
+   *
+   * Named explicitly, or — when there is exactly one active client — that one.
+   * The convenience is worth having and it is deliberately narrow: an instance
+   * with two clients makes an operator say which, because registering a
+   * provider key against the wrong one is not a mistake the next command would
+   * reveal.
+   */
+  async function resolveClientId(named: string | null): Promise<
+    { id: string } | { refusal: Refusal }
+  > {
+    const clients = (await opts.store.listClients()).filter((c) => c.revokedAt === null);
+    if (named) {
+      if (!clients.some((c) => c.id === named)) {
+        return {
+          refusal: {
+            status: 404,
+            code: "not-found",
+            message: `no active paired client is named "${named}"`,
+          },
+        };
+      }
+      return { id: named };
+    }
+    if (clients.length === 1) return { id: clients[0]!.id };
+    if (clients.length === 0) {
+      return {
+        refusal: {
+          status: 409,
+          code: "no-client",
+          message:
+            "nothing is paired with this instance yet — an endpoint belongs to a paired client, " +
+            "so run `actana-search pair new` and redeem it first",
+        },
+      };
+    }
+    return {
+      refusal: {
+        status: 400,
+        code: "ambiguous-client",
+        message:
+          `this instance has ${clients.length} paired clients, so say which one this endpoint ` +
+          "is for: --client <id>. `actana-search pair ls` lists them.",
+      },
+    };
+  }
+
+  async function listEndpoints(url: URL, res: http.ServerResponse): Promise<void> {
+    const resolved = await resolveClientId(url.searchParams.get("client"));
+    if ("refusal" in resolved) return sendRefusal(res, resolved.refusal);
+    const registry = await endpointPort();
+    sendJson(res, 200, {
+      pairedClientId: resolved.id,
+      endpoints: await registry.listEndpoints(resolved.id),
+    });
+  }
+
+  async function addEndpoint(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await readJson(req);
+    if (!body.ok) {
+      return sendRefusal(res, { status: 400, code: "bad-request", message: body.message });
+    }
+    const input = body.value as Record<string, unknown>;
+
+    const kind = input.kind;
+    if (kind !== "embedding" && kind !== "inference") {
+      return sendRefusal(res, {
+        status: 400,
+        code: "bad-request",
+        message: "`kind` must be embedding or inference",
+      });
+    }
+    const provider = typeof input.provider === "string" ? input.provider.trim() : "";
+    if (!provider) {
+      return sendRefusal(res, { status: 400, code: "bad-request", message: "`provider` is required" });
+    }
+    const apiKey = typeof input.apiKey === "string" ? input.apiKey : "";
+    if (!apiKey) {
+      return sendRefusal(res, {
+        status: 400,
+        code: "bad-request",
+        message: "`apiKey` is required — a local endpoint is one whose key this instance seals",
+      });
+    }
+    const dimensions =
+      typeof input.dimensions === "number" && Number.isInteger(input.dimensions)
+        ? input.dimensions
+        : null;
+    if (kind === "embedding" && (dimensions === null || dimensions <= 0)) {
+      return sendRefusal(res, {
+        status: 400,
+        code: "bad-request",
+        message:
+          "an embedding endpoint needs `dimensions` — a KB's partition is sized from it and " +
+          "cannot be created without one",
+      });
+    }
+
+    const resolved = await resolveClientId(
+      typeof input.pairedClientId === "string" && input.pairedClientId
+        ? input.pairedClientId
+        : null,
+    );
+    if ("refusal" in resolved) return sendRefusal(res, resolved.refusal);
+
+    const registry = await endpointPort();
+    let endpoint: unknown;
+    try {
+      endpoint = await registry.createLocalEndpoint(
+        resolved.id,
+        {
+          kind,
+          provider,
+          // The template defaults to the provider's own name, which is right for
+          // every first-party one in the catalog and wrong only where a provider
+          // speaks more than one shape — in which case it is named.
+          template: typeof input.template === "string" && input.template ? input.template : provider,
+          model: typeof input.model === "string" && input.model ? input.model : null,
+          dimensions,
+          baseUrl: typeof input.baseUrl === "string" && input.baseUrl ? input.baseUrl : null,
+          label: typeof input.label === "string" && input.label ? input.label : null,
+          config:
+            input.config && typeof input.config === "object" && !Array.isArray(input.config)
+              ? (input.config as Record<string, unknown>)
+              : null,
+        },
+        apiKey,
+      );
+    } catch (err) {
+      // The message, never the input: `input` holds the plaintext key.
+      const message = err instanceof Error ? err.message : "the endpoint could not be registered";
+      logger.error("admin.endpoints.create failed", { pairedClientId: resolved.id });
+      return sendRefusal(res, { status: 400, code: "bad-request", message });
+    }
+
+    // What comes back is `EndpointSummary`, which carries `hasKey` and no key.
+    sendJson(res, 200, { endpoint });
   }
 
   // One `http.Server`, listening on one or both. Two listeners would be two

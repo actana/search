@@ -1,7 +1,7 @@
 {
   "name": "@actana/search-core",
   "version": "0.1.0",
-  "description": "actana/search core \u2014 the HTTPS API, the ingestion workers, the migrations, and the mTLS pairing that fronts them.",
+  "description": "actana/search core — the HTTPS API, the ingestion workers, the migrations, and the mTLS pairing that fronts them.",
   "license": "MIT",
   "private": true,
   "type": "module",
@@ -11,7 +11,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "db:generate": "drizzle-kit generate --config=drizzle.config.ts",
-    "db:migrate": "node src/db/migrate-cli.ts"
+    "db:migrate": "node src/db/migrate-cli.ts",
+    "start:api": "node src/index.ts",
+    "start:worker": "node src/worker.ts"
   },
   "dependencies": {
     "@actana/search": "workspace:*",
