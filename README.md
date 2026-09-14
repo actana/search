@@ -37,17 +37,16 @@ pnpm db:migrate     # migrations are also applied at boot
 pnpm dev
 ```
 
-> **Where this is up to.** The quickstart above is real as far as *querying
-> through the SDK*: `pnpm dev` migrates, mints this instance's identity, and
+> **Where this is up to.** The quickstart above is real end to end: `pnpm dev`
+> migrates, mints this instance's identity, **starts the ingestion worker**, and
 > serves the whole `/v1` surface — knowledge bases, ingest, query, chunks,
 > keywords, clusters, tags, endpoints, webhooks and the event stream
-> ([`docs/external-api.md`](docs/external-api.md)). What is **not** in yet is
-> the **ingestion worker process**: the API enqueues the jobs and TASK-005
-> brings the worker that runs them, so on this commit a document posted to a
-> running instance stays `pending` unless something is draining the queue. The
-> fixture suite drives the whole pipeline with `SEARCH_INLINE_JOBS=1`, which
-> runs the jobs in-process and refuses to start outside a test: it is in the
-> configuration schema, so `config()` throws unless `NODE_ENV=test` or
+> ([`docs/external-api.md`](docs/external-api.md)). The `actana-search` CLI is
+> in beside it. `SEARCH_WORKERS=off` splits the worker out into its own
+> process (ADR 0010); the fixture suites drive the whole pipeline with
+> `SEARCH_INLINE_JOBS=1` instead, which runs the jobs in-process, starts no
+> worker, and refuses to start outside a test: it is in the configuration
+> schema, so `config()` throws unless `NODE_ENV=test` or
 > `SEARCH_TEST_DATABASE_URL` is set, and the queue's own switch throws too.
 >
 > `SEARCH_ENCRYPTION_KEY` is required rather than generated, and nothing
@@ -61,13 +60,18 @@ commands: mint a code on the instance, redeem it on the client.
 
 ```bash
 # On the machine that is the instance. The admin surface listens on a unix
-# socket under SEARCH_STATE_DIR at mode 0600 — the filesystem is what guards it.
-curl -s --unix-socket ~/.actana-search/admin.sock \
-  http://admin/admin/pair/new \
-  -H 'content-type: application/json' \
-  -d '{"label":"actanastudio","scope":"admin"}'
-# → { "ticket": "ps_7c1f:QK4M-9TRW", "caFingerprint": "3B:AF:…", "endpoint": … }
+# socket under SEARCH_STATE_DIR at mode 0600 — the filesystem is what guards it,
+# which is why this verb only works there and as that user.
+actana-search pair new --label actanastudio --scope admin
+# Ticket         ps_7c1f:QK4M-9TRW
+# CA fingerprint 3B:AF:…
+# Expires        … (in 5m)
 ```
+
+Read out **both** the ticket and the fingerprint. On the other machine either
+`actana-search pair redeem <address> <ticket> --fingerprint <fp>`, which stores
+the credential under `~/.actana-search/cli.json` as a **profile**, or the SDK
+directly:
 
 ```ts
 // On the client. The key pair is generated here; only a CSR crosses the wire.
@@ -136,7 +140,7 @@ certificate is the identity**: no route is scoped by anything in the URL.
 | `packages/search` | `@actana/search-core` | the core: HTTPS API (mTLS), ingestion workers, migrations, pairing |
 | `packages/sdk` | `@actana/search` | the typed client and the zod wire schemas. Everything else is built on it |
 | `packages/shared` | `@actana/search-shared` | pure code both sides need: chunkers, parsers, tokenization, ranking math |
-| `packages/cli` | `@actana/search-cli` | `actana-search`: `pair`, `kb ls`, `ingest`, `query` |
+| [`packages/cli`](packages/cli/README.md) | `@actana/search-cli` | `actana-search`: `pair`, `endpoint`, `status`, `kb`, `ingest`, `query` |
 | `packages/panel` | `@actana/search-panel` | the standalone management UI (TASK-016) |
 
 ```
@@ -148,6 +152,24 @@ actana-search
 ├── AGENTS.md       the entry point for an agent working in this repo
 └── tasks/          the task board
 ```
+
+## Running it
+
+`pnpm dev` is the API and the ingestion worker in one process, which is what
+"run Search" should mean — a service you can hand a document to. A deployment
+that wants them apart runs them apart, off the same entry points:
+
+| | |
+|---|---|
+| `pnpm dev` | API + worker, watching |
+| `pnpm --filter @actana/search-core start:api` | with `SEARCH_WORKERS=off`, the API alone |
+| `pnpm --filter @actana/search-core start:worker` | the worker alone; scale it horizontally |
+
+The two halves share only Redis and the queue prefix. Every job is idempotent
+and resumable, so a second worker is throughput rather than risk, and a worker
+that dies mid-job leaves work that the next one picks up
+([ADR 0010](docs/adr/0010-the-worker-is-searchs-own-and-a-missing-key-fails-a-job-cleanly.md)).
+[`deploy/README.md`](deploy/README.md) has the compose shape for both.
 
 ## How it works
 
@@ -166,8 +188,19 @@ caller's `keywordWeight`. The v1 tag+vector path over the shared `embedding`
 table is still there, unchanged, for the callers that use it.
 
 Search owns its data: the `search` schema in Postgres (pgvector), its own
-BullMQ queue (prefix `search`), and its own S3-compatible bucket. When it
-shares Studio's Postgres it is still a schema Studio never references.
+BullMQ queue (prefix `search`, settable as `SEARCH_QUEUE_PREFIX`), and its own
+S3-compatible bucket. When it shares Studio's Postgres it is still a schema
+Studio never references.
+
+Where a key comes from is an **endpoint source**, chosen per endpoint row rather
+than per process, so one instance serves a standalone client and a wired one at
+once. A standalone client's keys are sealed in `search.model_endpoint`; a wired
+client's are fetched from its resolver for the life of one job, cached for sixty
+seconds, and never written down. A key that cannot be fetched is a **typed**
+failure: transient reasons retry with backoff and the document stays where it
+is, and only a terminal one — an endpoint the client has forgotten — fails it
+([ADR 0004](docs/adr/0004-model-endpoints-flow-both-ways.md),
+[ADR 0010](docs/adr/0010-the-worker-is-searchs-own-and-a-missing-key-fails-a-job-cleanly.md)).
 
 ## The API
 
@@ -206,6 +239,7 @@ knowing before reading it:
 | [0007](docs/adr/0007-the-sheetjs-exception.md) | The SheetJS exception — two advisories acknowledged, not fixed |
 | [0008](docs/adr/0008-the-pairing-code-is-copied-from-control.md) | The pairing code is copied from Control, and will be lifted into a package |
 | [0009](docs/adr/0009-one-contract-defined-once-in-zod.md) | One contract, defined once in zod, served and consumed |
+| [0010](docs/adr/0010-the-worker-is-searchs-own-and-a-missing-key-fails-a-job-cleanly.md) | The worker is Search's own, and a missing key fails a job cleanly |
 
 ## Moving data out of Studio
 
@@ -244,7 +278,12 @@ moved.
   every handshake at once. The CA survives, so nothing paired re-pairs.
 - Provider keys are sealed with `SEARCH_ENCRYPTION_KEY` (AES-256-GCM) when
   Search holds them. When Studio holds them, Search never stores one — it
-  resolves the key per job and keeps it for the life of that job.
+  resolves the key per job, holds it in memory for sixty seconds, and never
+  writes it anywhere. No route returns one, no log line carries one, and an
+  error thrown from the resolving path is scrubbed of both the provider key and
+  the resolver credential — with the `message` and the `stack` asserted, not
+  assumed. The resolver credential itself rests sealed, so
+  `SEARCH_ENCRYPTION_KEY` is required in wired mode too.
 - `SEARCH_STATE_DIR` holds the CA, the server certificate and the pairing
   material. Treat a backup of it as secret material.
 
