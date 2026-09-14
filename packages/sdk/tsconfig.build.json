@@ -1,0 +1,23 @@
+// The published build.
+//
+// `tsconfig.json` is `noEmit` on purpose: inside the workspace the SDK is
+// consumed as TypeScript source and its relative imports carry `.ts`, so a
+// plain `node script.mjs` resolves them through Node's own type stripping.
+// That is not what npm can install — a registry consumer on Node 22 has no
+// type stripping at all — so the tarball ships compiled JavaScript with
+// `.d.ts` beside it. `rewriteRelativeImportExtensions` is what lets both be
+// true from one source tree.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rewriteRelativeImportExtensions": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "src/__tests__/**"]
+}

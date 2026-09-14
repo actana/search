@@ -1,0 +1,53 @@
+savePrefix: ""
+
+packages:
+  - "packages/*"
+
+# Release-age gate (SECURITY.md): nothing younger than seven days is installable,
+# so a compromised publish has a week to be noticed before it can reach a build
+# here. 10080 minutes = 7 days.
+minimumReleaseAge: 10080
+
+# Transitive versions this repo forces. Every one is here because
+# `pnpm audit --prod --audit-level high` — a required CI job — is otherwise red,
+# and a red audit that everyone waves through is worse than no audit.
+overrides:
+  # officeparser declares `pdfjs-dist: ^5.3.31` and resolves to a build inside
+  # GHSA-hq66-cqwq-w95j (>=5.6.83 <6.2.108): arbitrary JavaScript execution on
+  # opening a malicious PDF. Search never reaches it — officeparser is used for
+  # `.docx`, `.doc` and `.pptx`, and PDFs go to `unpdf` or to OCR — but "not
+  # currently reachable" is not a property to leave a high advisory resting on.
+  # Pinned to the newest 5.x *below* the vulnerable range rather than to the
+  # 6.2.108 fix, because officeparser does not declare support for pdfjs 6 and
+  # a major bump across a dependency's own API is not a security fix, it is a
+  # gamble with a security fix's name on it.
+  "pdfjs-dist": "5.5.207"
+
+# Two advisories are acknowledged rather than fixed, because there is nothing on
+# npm to move to. Both are against SheetJS (`xlsx`), which stopped publishing to
+# npm at 0.18.5 — the fixed 0.19.3 and 0.20.2 exist only on the vendor's own
+# CDN, and a tarball URL is a dependency form SECURITY.md forbids. The
+# alternative, dropping SheetJS, changes what a spreadsheet parses into and so
+# what it chunks into, which is the behaviour ADR 0005 exists to hold still.
+#
+# The reasoning, the exposure and what would end the exception are in
+# docs/adr/0007-the-sheetjs-exception.md. Read it before adding a third entry
+# here: this list is a place decisions go to be forgotten, and two is already
+# two more than it should have.
+auditConfig:
+  ignoreGhsas:
+    # Prototype pollution in SheetJS — fixed in 0.19.3, not on npm.
+    - GHSA-4r6h-8v6p-xvw6
+    # ReDoS in SheetJS — fixed in 0.20.2, not on npm.
+    - GHSA-5pgg-2g8v-p4x9
+
+# Allow-list, not a switch. Every package that is allowed to run an install
+# script is named here; everything else installs with its scripts disabled.
+allowBuilds:
+  # drizzle-kit bundles its own config loader with esbuild.
+  esbuild: true
+  # Denied, explicitly rather than by silence: `msgpackr-extract` is a native
+  # accelerator BullMQ's msgpackr pulls in optionally, and msgpackr falls back
+  # to its JavaScript path without it. A native build in the dependency graph
+  # of a queue serialiser is not worth the compile toolchain it asks for.
+  msgpackr-extract: false

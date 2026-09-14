@@ -1,0 +1,46 @@
+{
+  "name": "actana-search",
+  "version": "0.1.0",
+  "description": "actana/search \u2014 the Actana Knowledge Base as a standalone service: ingestion, hybrid retrieval, and an mTLS-paired API.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.4.1",
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "scripts": {
+    "check:node": "node scripts/require-node-24.mjs",
+    "preinstall": "node scripts/require-node-24.mjs",
+    "predev": "node scripts/require-node-24.mjs",
+    "prebuild": "node scripts/require-node-24.mjs",
+    "pretypecheck": "node scripts/require-node-24.mjs",
+    "prelint": "node scripts/require-node-24.mjs",
+    "pretest": "node scripts/require-node-24.mjs",
+    "predb:generate": "node scripts/require-node-24.mjs",
+    "predb:migrate": "node scripts/require-node-24.mjs",
+    "dev": "pnpm --filter @actana/search-core dev",
+    "build": "pnpm --filter @actana/search build",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "node scripts/check-strip-types.mjs && eslint packages scripts eslint.config.mjs",
+    "test": "node scripts/run-unit-tests.mjs",
+    "db:generate": "pnpm --filter @actana/search-core db:generate",
+    "db:migrate": "pnpm --filter @actana/search-core db:migrate",
+    "check:strip-types": "node scripts/check-strip-types.mjs"
+  },
+  "dependencies": {
+    "@actana/search": "workspace:*",
+    "@actana/search-cli": "workspace:*",
+    "@actana/search-core": "workspace:*",
+    "@actana/search-shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "25.8.0",
+    "eslint": "10.6.0",
+    "globals": "17.6.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.63.0",
+    "vitest": "4.1.6"
+  }
+}

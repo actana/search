@@ -1,0 +1,91 @@
+{
+  "service": {
+    "name": "retrieval-api",
+    "environment": "production",
+    "region": "eu-west-1",
+    "replicas": 6,
+    "shutdownGraceSeconds": 30
+  },
+  "http": {
+    "port": 8080,
+    "requestTimeoutMs": 15000,
+    "maxBodyBytes": 5242880,
+    "compression": "gzip",
+    "cors": {
+      "allowedOrigins": ["https://app.example.invalid"],
+      "allowCredentials": true,
+      "maxAgeSeconds": 600
+    }
+  },
+  "postgres": {
+    "host": "pg-primary.internal",
+    "port": 5432,
+    "database": "retrieval",
+    "sslMode": "verify-full",
+    "pool": {
+      "min": 4,
+      "max": 40,
+      "idleTimeoutMs": 20000,
+      "connectTimeoutMs": 30000,
+      "statementTimeoutMs": 10000
+    },
+    "readReplica": {
+      "host": "pg-replica-a.internal",
+      "port": 5432,
+      "maxLagBytes": 33554432
+    }
+  },
+  "redis": {
+    "url": "redis://redis.internal:6379",
+    "keyPrefix": "retrieval",
+    "connectionPool": {
+      "min": 2,
+      "max": 20,
+      "idleTimeoutMs": 30000
+    },
+    "commandTimeoutMs": 2000,
+    "enableOfflineQueue": false
+  },
+  "vector": {
+    "indexType": "hnsw",
+    "distance": "cosine",
+    "efSearch": 64,
+    "efConstruction": 200,
+    "m": 16,
+    "candidateOverfetch": 8
+  },
+  "chunking": {
+    "method": "recursive",
+    "chunkSize": 1024,
+    "overlap": 128,
+    "minCharactersPerChunk": 100
+  },
+  "queue": {
+    "driver": "bullmq",
+    "prefix": "search",
+    "concurrency": 8,
+    "attempts": 3,
+    "backoff": {
+      "type": "exponential",
+      "delayMs": 1000
+    }
+  },
+  "observability": {
+    "logLevel": "info",
+    "tracing": {
+      "enabled": true,
+      "sampleRate": 0.05,
+      "endpoint": "https://otel.internal:4318"
+    },
+    "metrics": {
+      "enabled": true,
+      "path": "/metrics"
+    }
+  },
+  "featureFlags": {
+    "clusterRouting": false,
+    "keywordExtraction": true,
+    "structuredChunker": true,
+    "tagFilterPushdown": true
+  }
+}

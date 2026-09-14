@@ -1,0 +1,54 @@
+{
+  "name": "@actana/search",
+  "version": "0.1.0",
+  "description": "The actana/search SDK \u2014 the typed client for a Search instance and the zod wire schemas it speaks.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "actana",
+    "search",
+    "knowledge-base",
+    "rag",
+    "sdk"
+  ],
+  "homepage": "https://github.com/actana/search/tree/main/packages/sdk#readme",
+  "bugs": "https://github.com/actana/search/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/actana/search.git",
+    "directory": "packages/sdk"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    "./*": "./src/*.ts"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "exports": {
+      "./*": {
+        "types": "./dist/*.d.ts",
+        "default": "./dist/*.js"
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "25.8.0",
+    "typescript": "6.0.3",
+    "vitest": "4.1.6"
+  }
+}

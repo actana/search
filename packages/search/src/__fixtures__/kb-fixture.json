@@ -1,0 +1,1771 @@
+{
+  "$comment": "Behaviour freeze for the Actana Studio Knowledge Base engine (plan 14, TASK-001). Plain JSON, relative document paths, no Studio code required to read it. The Search repo copies this file byte for byte. Regenerate expectations with KB_FIXTURE_RECORD=1 (see fixtures/README.md) — never hand-edit expectedTop5. There is deliberately no timestamp in this file so a re-record diff shows only what the engine actually did.",
+  "fixtureVersion": 1,
+  "embedder": {
+    "kind": "hash-ngram",
+    "dims": 256,
+    "version": 1,
+    "spec": "lowercase, split on [^a-z0-9]+, unigrams then bigrams joined with '_', FNV-1a 32-bit per gram, bucket = hash % 256, sign = -1 when bit 31 is set else +1, accumulate, L2 normalise; an all-zero accumulator stays all zero",
+    "reference": "apps/actana/lib/kb/testing/hash-ngram-embedder.ts"
+  },
+  "keywordExtractor": {
+    "kind": "deterministic-frequency",
+    "version": 1,
+    "spec": "lowercase, split on [^a-z0-9]+, keep only tokens in the fixed topic vocabulary, sort by count desc then token asc, take the first N; the list is bounded under 100 so Studio's query-time keyword menu (EXISTING_KEYWORDS_TOP_N) never truncates it",
+    "chunkLimit": 6,
+    "queryLimit": 6,
+    "reference": "apps/actana/lib/kb/testing/deterministic-keywords.ts",
+    "vocabularySize": 98,
+    "vocabulary": [
+      "parental",
+      "leave",
+      "entitlement",
+      "parent",
+      "birth",
+      "adoption",
+      "payroll",
+      "salary",
+      "manager",
+      "employee",
+      "expense",
+      "expenses",
+      "receipt",
+      "reimbursed",
+      "reimbursement",
+      "travel",
+      "flights",
+      "rail",
+      "hotel",
+      "meals",
+      "mileage",
+      "taxis",
+      "security",
+      "password",
+      "passwords",
+      "encryption",
+      "laptop",
+      "laptops",
+      "phishing",
+      "credentials",
+      "authentication",
+      "access",
+      "production",
+      "workflow",
+      "workflows",
+      "block",
+      "blocks",
+      "executor",
+      "trigger",
+      "deployment",
+      "agent",
+      "agents",
+      "tool",
+      "tools",
+      "procedure",
+      "procedures",
+      "knowledge",
+      "chunk",
+      "chunks",
+      "chunking",
+      "embedding",
+      "embeddings",
+      "vector",
+      "keyword",
+      "keywords",
+      "retrieval",
+      "cluster",
+      "clusters",
+      "clustering",
+      "semantic",
+      "query",
+      "queries",
+      "incident",
+      "severity",
+      "rotation",
+      "escalation",
+      "rollback",
+      "backup",
+      "backups",
+      "vacuum",
+      "index",
+      "indexes",
+      "replica",
+      "replicas",
+      "postgres",
+      "migration",
+      "migrations",
+      "maintenance",
+      "rate",
+      "limit",
+      "limits",
+      "pagination",
+      "cursor",
+      "idempotency",
+      "webhook",
+      "webhooks",
+      "redis",
+      "timeout",
+      "pool",
+      "queue",
+      "ticket",
+      "tickets",
+      "refund",
+      "customer",
+      "enterprise",
+      "support",
+      "changelog",
+      "release"
+    ]
+  },
+  "chunking": {
+    "method": "auto",
+    "chunkSize": 200,
+    "maxSize": 200,
+    "minSize": 100,
+    "overlap": 24,
+    "language": "english",
+    "$comment": "Studio reads different keys on the two ingest paths: lib/kb/ingest.ts::selectChunker reads chunkSize/overlap, lib/knowledge/documents/{service.ts::processDocumentAsync,embed-pipeline.ts::planDocumentEmbedding} read maxSize/overlap/minSize. All are set to the same numbers here so the paths are comparable. Studio's own defaults are NOT one set of numbers: the knowledge_base.chunking_config column defaults to {\"maxSize\": 1024, \"minSize\": 1, \"overlap\": 200} (packages/db/schema.ts:2644), which is what a UI-created KB stores, while the code fallbacks are chunkSize 1024 / overlap 128 (lib/kb/ingest.ts) and maxSize 1024 / minSize 100 / overlap 200 (service.ts, embed-pipeline.ts) — so a UI-created KB and a code-defaulted KB disagree on minSize (1 vs 100) and, on the ingest.ts path, on overlap (200 vs 128). The `defaults` knowledge base below freezes the column-default shape. The other three shrink the numbers so a 12-document corpus crosses the 50-chunk clustering cold start."
+  },
+  "knowledgeBases": [
+    {
+      "key": "hybrid",
+      "engine": "v2-hybrid",
+      "ingestVia": "lib/knowledge/documents/service.ts::processDocumentAsync",
+      "chunking": "fixture",
+      "kmeansK": 8,
+      "$comment": "The inline (non-BullMQ) ingestion fallback. Writes the shared `embedding` table (tags inherited from the document) and the per-KB vector partition with the same row ids, then extracts keywords inline. The nine v2 hybrid queries and the v1 tag+vector query run here."
+    },
+    {
+      "key": "bullmq",
+      "engine": "v2-hybrid",
+      "ingestVia": "lib/knowledge/documents/embed-pipeline.ts::planDocumentEmbedding -> processEmbedBatch -> finalizeDocumentEmbedding -> lib/kb/jobs/keywords-extract.ts::handleKeywordsExtract",
+      "chunking": "fixture",
+      "kmeansK": 8,
+      "$comment": "The production worker path (worker/processors/knowledge.ts:92-117 dispatches exactly these four jobs). Same corpus as `hybrid`. Has no queries of its own: the suite replays every `hybrid` query against it and asserts identical corpus counts and identical top-5s, which is what proves the resumable fan-out and the inline fallback agree."
+    },
+    {
+      "key": "sdk",
+      "engine": "v2-partition-only",
+      "ingestVia": "lib/kb/ingest.ts::ingestDocument",
+      "chunking": "fixture",
+      "kmeansK": 8,
+      "$comment": "The SDK / runtime-route / kb_add_file block path. Writes ONLY the per-KB vector partition, with freshly generated chunk ids that do not exist in the shared `embedding` table — so its keyword vocabulary stays empty for good (see fixtures/README.md, \"Known defects carried deliberately\"). It is also the only path that writes caller `metadata` into the partition (ingest.ts:332), which is why the metadata-filter probe lives here."
+    },
+    {
+      "key": "defaults",
+      "engine": "v2-partition-only",
+      "ingestVia": "lib/kb/ingest.ts::ingestDocument",
+      "chunking": "studio-column-default",
+      "kmeansK": 8,
+      "$comment": "Same path as `sdk`, but the knowledge_base row is inserted WITHOUT a chunking_config so the column default applies — the shape every UI-created KB actually has. At those numbers each fixture document is a single chunk (12 chunks total), which also puts the read path below the 50-chunk clustering cold start: no clusters, no cluster routing, and retrieval is effectively whole-document."
+    }
+  ],
+  "documents": [
+    {
+      "id": "handbook-parental-leave",
+      "path": "docs/handbook-parental-leave.md",
+      "filename": "handbook-parental-leave.md",
+      "mimeType": "text/markdown",
+      "knowledgeBases": ["hybrid", "bullmq", "sdk", "defaults"],
+      "tags": {
+        "tag1": "handbook",
+        "tag2": "people",
+        "number1": 2026,
+        "boolean1": true
+      },
+      "metadata": {
+        "category": "handbook",
+        "owner": "people"
+      }
+    },
+    {
+      "id": "handbook-expenses",
+      "path": "docs/handbook-expenses.md",
+      "filename": "handbook-expenses.md",
+      "mimeType": "text/markdown",
+      "knowledgeBases": ["hybrid", "bullmq", "defaults"],
+      "tags": {
+        "tag1": "handbook",
+        "tag2": "finance",
+        "number1": 2026,
+        "boolean1": true
+      },
+      "metadata": {
+        "category": "handbook",
+        "owner": "finance"
+      }
+    },
+    {
+      "id": "handbook-security",
+      "path": "docs/handbook-security.md",
+      "filename": "handbook-security.md",
+      "mimeType": "text/markdown",
+      "knowledgeBases": ["hybrid", "bullmq", "sdk", "defaults"],
+      "tags": {
+        "tag1": "handbook",
+        "tag2": "security",
+        "number1": 2026,
+        "boolean1": true
+      },
+      "metadata": {
+        "category": "handbook",
+        "owner": "security"
+      }
+    },
+    {
+      "id": "product-workflow-builder",
+      "path": "docs/product-workflow-builder.md",
+      "filename": "product-workflow-builder.md",
+      "mimeType": "text/markdown",
+      "knowledgeBases": ["hybrid", "bullmq", "defaults"],
+      "tags": {
+        "tag1": "product",
+        "tag2": "product",
+        "number1": 2026,
+        "boolean1": true
+      },
+      "metadata": {
+        "category": "product",
+        "owner": "product"
+      }
+    },
+    {
+      "id": "product-knowledge-base",
+      "path": "docs/product-knowledge-base.md",
+      "filename": "product-knowledge-base.md",
+      "mimeType": "text/markdown",
+      "knowledgeBases": ["hybrid", "bullmq", "sdk", "defaults"],
+      "tags": {
+        "tag1": "product",
+        "tag2": "product",
+        "number1": 2026,
+        "boolean1": true
+      },
+      "metadata": {
+        "category": "product",
+        "owner": "product"
+      }
+    },
+    {
+      "id": "product-agents",
+      "path": "docs/product-agents.md",
+      "filename": "product-agents.md",
+      "mimeType": "text/markdown",
+      "knowledgeBases": ["hybrid", "bullmq", "defaults"],
+      "tags": {
+        "tag1": "product",
+        "tag2": "product",
+        "number1": 2026,
+        "boolean1": true
+      },
+      "metadata": {
+        "category": "product",
+        "owner": "product"
+      }
+    },
+    {
+      "id": "runbook-incident-response",
+      "path": "docs/runbook-incident-response.md",
+      "filename": "runbook-incident-response.md",
+      "mimeType": "text/markdown",
+      "knowledgeBases": ["hybrid", "bullmq", "sdk", "defaults"],
+      "tags": {
+        "tag1": "runbook",
+        "tag2": "ops",
+        "number1": 2026,
+        "boolean1": true
+      },
+      "metadata": {
+        "category": "runbook",
+        "owner": "ops"
+      }
+    },
+    {
+      "id": "runbook-database-maintenance",
+      "path": "docs/runbook-database-maintenance.md",
+      "filename": "runbook-database-maintenance.md",
+      "mimeType": "text/markdown",
+      "knowledgeBases": ["hybrid", "bullmq", "defaults"],
+      "tags": {
+        "tag1": "runbook",
+        "tag2": "ops",
+        "number1": 2026,
+        "boolean1": true
+      },
+      "metadata": {
+        "category": "runbook",
+        "owner": "ops"
+      }
+    },
+    {
+      "id": "changelog",
+      "path": "docs/changelog.md",
+      "filename": "changelog.md",
+      "mimeType": "text/markdown",
+      "knowledgeBases": ["hybrid", "bullmq", "defaults"],
+      "tags": {
+        "tag1": "reference",
+        "tag2": "product",
+        "number1": 2026,
+        "boolean1": true
+      },
+      "metadata": {
+        "category": "reference",
+        "owner": "product"
+      }
+    },
+    {
+      "id": "api-reference",
+      "path": "docs/api-reference.md",
+      "filename": "api-reference.md",
+      "mimeType": "text/markdown",
+      "knowledgeBases": ["hybrid", "bullmq", "defaults"],
+      "tags": {
+        "tag1": "reference",
+        "tag2": "platform",
+        "number1": 2026,
+        "boolean1": true
+      },
+      "metadata": {
+        "category": "reference",
+        "owner": "platform"
+      }
+    },
+    {
+      "id": "service-config",
+      "path": "docs/service-config.json",
+      "filename": "service-config.json",
+      "mimeType": "application/json",
+      "knowledgeBases": ["hybrid", "bullmq", "defaults"],
+      "tags": {
+        "tag1": "reference",
+        "tag2": "platform",
+        "number1": 2026,
+        "boolean1": false
+      },
+      "metadata": {
+        "category": "reference",
+        "owner": "platform"
+      }
+    },
+    {
+      "id": "support-tickets",
+      "path": "docs/support-tickets.csv",
+      "filename": "support-tickets.csv",
+      "mimeType": "text/csv",
+      "knowledgeBases": ["hybrid", "bullmq", "defaults"],
+      "tags": {
+        "tag1": "data",
+        "tag2": "support",
+        "number1": 2026,
+        "boolean1": false
+      },
+      "metadata": {
+        "category": "data",
+        "owner": "support"
+      }
+    }
+  ],
+  "queries": [
+    {
+      "id": "q01-keyword-pure",
+      "knowledgeBase": "hybrid",
+      "api": "handleKbQuery",
+      "text": "parental leave entitlement for a birthing parent",
+      "params": {
+        "topK": 5,
+        "keywordWeight": 1
+      },
+      "probe": "Pure keyword ranking. The blend collapses to the normalised keyword score, so only chunks carrying the query's selected vocabulary can rank at the top.",
+      "expectedTop5": [
+        {
+          "documentId": "handbook-parental-leave",
+          "chunkIndex": 1
+        },
+        {
+          "documentId": "handbook-parental-leave",
+          "chunkIndex": 0
+        },
+        {
+          "documentId": "handbook-parental-leave",
+          "chunkIndex": 4
+        },
+        {
+          "documentId": "changelog",
+          "chunkIndex": 5
+        },
+        {
+          "documentId": "handbook-parental-leave",
+          "chunkIndex": 3
+        }
+      ]
+    },
+    {
+      "id": "q02-semantic-pure",
+      "knowledgeBase": "hybrid",
+      "api": "handleKbQuery",
+      "text": "book rail travel standard class through the company travel desk",
+      "params": {
+        "topK": 5,
+        "keywordWeight": 0
+      },
+      "probe": "Pure semantic ranking (keywordWeight 0). The keyword side is switched off entirely, so the vector distance alone has to put the expenses policy on top.",
+      "expectedTop5": [
+        {
+          "documentId": "handbook-expenses",
+          "chunkIndex": 3
+        },
+        {
+          "documentId": "handbook-expenses",
+          "chunkIndex": 4
+        },
+        {
+          "documentId": "changelog",
+          "chunkIndex": 2
+        },
+        {
+          "documentId": "changelog",
+          "chunkIndex": 3
+        },
+        {
+          "documentId": "handbook-expenses",
+          "chunkIndex": 6
+        }
+      ]
+    },
+    {
+      "id": "q03-hybrid-default",
+      "knowledgeBase": "hybrid",
+      "api": "handleKbQuery",
+      "text": "incident severity levels and the on-call rotation",
+      "params": {
+        "topK": 5
+      },
+      "probe": "Default 50/50 blend with no explicit keywordWeight.",
+      "expectedTop5": [
+        {
+          "documentId": "runbook-incident-response",
+          "chunkIndex": 4
+        },
+        {
+          "documentId": "runbook-incident-response",
+          "chunkIndex": 6
+        },
+        {
+          "documentId": "runbook-incident-response",
+          "chunkIndex": 1
+        },
+        {
+          "documentId": "runbook-incident-response",
+          "chunkIndex": 3
+        },
+        {
+          "documentId": "handbook-expenses",
+          "chunkIndex": 7
+        }
+      ]
+    },
+    {
+      "id": "q04-min-score",
+      "knowledgeBase": "hybrid",
+      "api": "handleKbQuery",
+      "text": "incident severity levels and the on-call rotation",
+      "params": {
+        "topK": 5,
+        "minScore": 0.6
+      },
+      "probe": "Same query as q03 with a minScore that must trim the tail. minScore is applied on the normalised [0,1] blend, after ranking and before the topK slice.",
+      "expectedTop5": [
+        {
+          "documentId": "runbook-incident-response",
+          "chunkIndex": 4
+        },
+        {
+          "documentId": "runbook-incident-response",
+          "chunkIndex": 6
+        },
+        {
+          "documentId": "runbook-incident-response",
+          "chunkIndex": 1
+        }
+      ]
+    },
+    {
+      "id": "q05-metadata-filter",
+      "knowledgeBase": "sdk",
+      "api": "handleKbQuery",
+      "text": "full disk encryption on company laptops",
+      "params": {
+        "topK": 5,
+        "filter": {
+          "category": "handbook"
+        }
+      },
+      "probe": "Metadata filter, run on the one path that actually stores metadata: ingestDocument writes the caller's `metadata` into the partition row (ingest.ts:332). Frozen as a no-op — queryKb accepts `filter` and never applies it (query.ts:73, 110-120). Asserted equal to the same query without the filter.",
+      "expectedTop5": [
+        {
+          "documentId": "handbook-security",
+          "chunkIndex": 3
+        },
+        {
+          "documentId": "runbook-incident-response",
+          "chunkIndex": 0
+        },
+        {
+          "documentId": "handbook-security",
+          "chunkIndex": 1
+        },
+        {
+          "documentId": "handbook-security",
+          "chunkIndex": 2
+        },
+        {
+          "documentId": "handbook-parental-leave",
+          "chunkIndex": 5
+        }
+      ]
+    },
+    {
+      "id": "q06-neighbor-clusters",
+      "knowledgeBase": "hybrid",
+      "api": "queryKb",
+      "text": "chunk overlap and vector retrieval blending",
+      "params": {
+        "topK": 5,
+        "neighborClusters": 4,
+        "includeDiagnostics": true
+      },
+      "probe": "Cluster routing after clustering has run. Below CLUSTER_PRUNE_MIN_CHUNKS (50 000) the read path is never pruned, so neighborClusters must not change the result and diagnostics.candidateClusterIds must be null.",
+      "expectedTop5": [
+        {
+          "documentId": "product-knowledge-base",
+          "chunkIndex": 2
+        },
+        {
+          "documentId": "service-config",
+          "chunkIndex": 2
+        },
+        {
+          "documentId": "product-workflow-builder",
+          "chunkIndex": 6
+        },
+        {
+          "documentId": "product-agents",
+          "chunkIndex": 3
+        },
+        {
+          "documentId": "product-workflow-builder",
+          "chunkIndex": 3
+        }
+      ]
+    },
+    {
+      "id": "q07-include-content-false",
+      "knowledgeBase": "hybrid",
+      "api": "queryKb",
+      "text": "exceeding the rate limit returns retry after and backoff with jitter",
+      "params": {
+        "topK": 5,
+        "includeContent": false
+      },
+      "probe": "Response shape with content suppressed: every match keeps its ids, scores and metadata but content is null.",
+      "expectedTop5": [
+        {
+          "documentId": "api-reference",
+          "chunkIndex": 1
+        },
+        {
+          "documentId": "product-workflow-builder",
+          "chunkIndex": 6
+        },
+        {
+          "documentId": "product-workflow-builder",
+          "chunkIndex": 0
+        },
+        {
+          "documentId": "product-workflow-builder",
+          "chunkIndex": 4
+        },
+        {
+          "documentId": "runbook-incident-response",
+          "chunkIndex": 4
+        }
+      ]
+    },
+    {
+      "id": "q08-structured-json",
+      "knowledgeBase": "hybrid",
+      "api": "handleKbQuery",
+      "text": "redis connection pool idle timeout",
+      "params": {
+        "topK": 5
+      },
+      "probe": "Routes to the JSON document chunked by the structured chunker rather than to the prose runbooks.",
+      "expectedTop5": [
+        {
+          "documentId": "service-config",
+          "chunkIndex": 1
+        },
+        {
+          "documentId": "handbook-security",
+          "chunkIndex": 5
+        },
+        {
+          "documentId": "service-config",
+          "chunkIndex": 2
+        },
+        {
+          "documentId": "api-reference",
+          "chunkIndex": 1
+        },
+        {
+          "documentId": "api-reference",
+          "chunkIndex": 0
+        }
+      ]
+    },
+    {
+      "id": "q09-csv-rows",
+      "knowledgeBase": "hybrid",
+      "api": "handleKbQuery",
+      "text": "refund request ticket from an enterprise customer",
+      "params": {
+        "topK": 3
+      },
+      "probe": "Routes to the CSV document and exercises a topK below the default.",
+      "expectedTop5": [
+        {
+          "documentId": "support-tickets",
+          "chunkIndex": 0
+        },
+        {
+          "documentId": "service-config",
+          "chunkIndex": 3
+        },
+        {
+          "documentId": "api-reference",
+          "chunkIndex": 0
+        }
+      ]
+    },
+    {
+      "id": "q10-v1-tag-and-vector",
+      "knowledgeBase": "hybrid",
+      "api": "handleTagAndVectorSearch",
+      "text": "parental leave entitlement",
+      "params": {
+        "topK": 5,
+        "structuredFilters": [
+          {
+            "tagSlot": "tag1",
+            "fieldType": "text",
+            "operator": "eq",
+            "value": "handbook"
+          },
+          {
+            "tagSlot": "tag2",
+            "fieldType": "text",
+            "operator": "eq",
+            "value": "people"
+          }
+        ]
+      },
+      "probe": "The v1 path in app/api/knowledge/search/utils.ts: tag filter over the shared `embedding` table first, then a vector search restricted to the surviving ids. Two filters on different slots are ANDed.",
+      "expectedTop5": [
+        {
+          "documentId": "handbook-parental-leave",
+          "chunkIndex": 0
+        },
+        {
+          "documentId": "handbook-parental-leave",
+          "chunkIndex": 1
+        },
+        {
+          "documentId": "handbook-parental-leave",
+          "chunkIndex": 5
+        },
+        {
+          "documentId": "handbook-parental-leave",
+          "chunkIndex": 4
+        },
+        {
+          "documentId": "handbook-parental-leave",
+          "chunkIndex": 3
+        }
+      ]
+    },
+    {
+      "id": "q11-sdk-keyword-pure",
+      "knowledgeBase": "sdk",
+      "api": "handleKbQuery",
+      "text": "parental leave entitlement for a birthing parent",
+      "params": {
+        "topK": 5,
+        "keywordWeight": 1
+      },
+      "probe": "q01 re-run on the ingestDocument path. keywordWeight 1 is a no-op there: the KB has no keyword vocabulary, so selectQueryKeywordsFromMenu returns [] and queryKb forces the weight to 0. Frozen to equal the pure-semantic ranking of the same KB.",
+      "expectedTop5": [
+        {
+          "documentId": "handbook-parental-leave",
+          "chunkIndex": 1
+        },
+        {
+          "documentId": "handbook-parental-leave",
+          "chunkIndex": 0
+        },
+        {
+          "documentId": "runbook-incident-response",
+          "chunkIndex": 1
+        },
+        {
+          "documentId": "handbook-parental-leave",
+          "chunkIndex": 4
+        },
+        {
+          "documentId": "handbook-security",
+          "chunkIndex": 4
+        }
+      ]
+    },
+    {
+      "id": "q12-sdk-hybrid-default",
+      "knowledgeBase": "sdk",
+      "api": "handleKbQuery",
+      "text": "incident severity levels and the on-call rotation",
+      "params": {
+        "topK": 5
+      },
+      "probe": "q03 re-run on the ingestDocument path, with the default 50/50 blend. Also semantic-only for the reason above — the frozen ids are the shape of that collapse.",
+      "expectedTop5": [
+        {
+          "documentId": "runbook-incident-response",
+          "chunkIndex": 3
+        },
+        {
+          "documentId": "runbook-incident-response",
+          "chunkIndex": 4
+        },
+        {
+          "documentId": "runbook-incident-response",
+          "chunkIndex": 6
+        },
+        {
+          "documentId": "runbook-incident-response",
+          "chunkIndex": 1
+        },
+        {
+          "documentId": "handbook-parental-leave",
+          "chunkIndex": 4
+        }
+      ]
+    },
+    {
+      "id": "q13-defaults-keyword-pure",
+      "knowledgeBase": "defaults",
+      "api": "handleKbQuery",
+      "text": "parental leave entitlement for a birthing parent",
+      "params": {
+        "topK": 5,
+        "keywordWeight": 1
+      },
+      "probe": "q01 at Studio's column-default chunking. One chunk per document, so this is document-level retrieval.",
+      "expectedTop5": [
+        {
+          "documentId": "handbook-parental-leave",
+          "chunkIndex": 0
+        },
+        {
+          "documentId": "changelog",
+          "chunkIndex": 0
+        },
+        {
+          "documentId": "runbook-database-maintenance",
+          "chunkIndex": 0
+        },
+        {
+          "documentId": "runbook-incident-response",
+          "chunkIndex": 0
+        },
+        {
+          "documentId": "product-agents",
+          "chunkIndex": 0
+        }
+      ]
+    },
+    {
+      "id": "q14-defaults-cold-start",
+      "knowledgeBase": "defaults",
+      "api": "queryKb",
+      "text": "knowledge base chunking embeddings keyword vocabulary and hybrid retrieval",
+      "params": {
+        "topK": 5,
+        "neighborClusters": 4,
+        "includeDiagnostics": true
+      },
+      "probe": "Cold-start read path: under COLD_START_MIN_CHUNKS (50) no clusters are fitted at all, so diagnostics.candidateClusterIds is null for a second, independent reason from q06. The query text is denser than q06's because at column-default chunking a whole document is one chunk, and a four-word query cannot separate twelve long documents.",
+      "expectedTop5": [
+        {
+          "documentId": "product-knowledge-base",
+          "chunkIndex": 0
+        },
+        {
+          "documentId": "support-tickets",
+          "chunkIndex": 0
+        },
+        {
+          "documentId": "handbook-security",
+          "chunkIndex": 0
+        },
+        {
+          "documentId": "product-workflow-builder",
+          "chunkIndex": 0
+        },
+        {
+          "documentId": "product-agents",
+          "chunkIndex": 0
+        }
+      ]
+    },
+    {
+      "id": "q15-defaults-structured-json",
+      "knowledgeBase": "defaults",
+      "api": "handleKbQuery",
+      "text": "redis connection pool idle timeout",
+      "params": {
+        "topK": 5
+      },
+      "probe": "q08 at Studio's column-default chunking, where the JSON config is a single chunk rather than four.",
+      "expectedTop5": [
+        {
+          "documentId": "service-config",
+          "chunkIndex": 0
+        },
+        {
+          "documentId": "api-reference",
+          "chunkIndex": 0
+        },
+        {
+          "documentId": "handbook-security",
+          "chunkIndex": 0
+        },
+        {
+          "documentId": "runbook-incident-response",
+          "chunkIndex": 0
+        },
+        {
+          "documentId": "product-agents",
+          "chunkIndex": 0
+        }
+      ]
+    }
+  ],
+  "expectations": {
+    "$comment": "Filled in by the recorder. corpus counts, the keyword vocabulary produced by the deterministic extractor, and the per-query results. Everything here is an assertion target, not an input.",
+    "corpus": {
+      "hybridDocuments": 12,
+      "hybridEmbeddingRows": 71,
+      "hybridPartitionRows": 71,
+      "hybridClusteredRows": 71,
+      "bullmqDocuments": 12,
+      "bullmqEmbeddingRows": 71,
+      "bullmqPartitionRows": 71,
+      "bullmqClusteredRows": 71,
+      "sdkDocuments": 4,
+      "sdkPartitionRows": 25,
+      "defaultsDocuments": 12,
+      "defaultsPartitionRows": 12
+    },
+    "keywordVocabulary": [
+      "access",
+      "adoption",
+      "agent",
+      "agents",
+      "authentication",
+      "backup",
+      "backups",
+      "birth",
+      "block",
+      "blocks",
+      "changelog",
+      "chunk",
+      "chunking",
+      "chunks",
+      "cluster",
+      "clustering",
+      "clusters",
+      "credentials",
+      "cursor",
+      "customer",
+      "deployment",
+      "embedding",
+      "employee",
+      "encryption",
+      "enterprise",
+      "entitlement",
+      "escalation",
+      "executor",
+      "expense",
+      "expenses",
+      "flights",
+      "hotel",
+      "incident",
+      "index",
+      "indexes",
+      "keyword",
+      "keywords",
+      "knowledge",
+      "laptop",
+      "laptops",
+      "leave",
+      "limit",
+      "limits",
+      "maintenance",
+      "manager",
+      "meals",
+      "migration",
+      "migrations",
+      "mileage",
+      "pagination",
+      "parent",
+      "parental",
+      "password",
+      "passwords",
+      "payroll",
+      "phishing",
+      "pool",
+      "postgres",
+      "procedure",
+      "procedures",
+      "production",
+      "queries",
+      "query",
+      "queue",
+      "rail",
+      "rate",
+      "receipt",
+      "redis",
+      "refund",
+      "reimbursed",
+      "reimbursement",
+      "release",
+      "replica",
+      "replicas",
+      "retrieval",
+      "rollback",
+      "salary",
+      "security",
+      "semantic",
+      "severity",
+      "support",
+      "taxis",
+      "ticket",
+      "tickets",
+      "tool",
+      "tools",
+      "travel",
+      "trigger",
+      "vacuum",
+      "vector",
+      "webhooks",
+      "workflow"
+    ],
+    "sdkPath": {
+      "documents": [
+        {
+          "filename": "handbook-parental-leave.md",
+          "chunkCount": 6,
+          "processingStatus": "completed",
+          "keywordStatus": "extracted"
+        },
+        {
+          "filename": "handbook-security.md",
+          "chunkCount": 6,
+          "processingStatus": "completed",
+          "keywordStatus": "extracted"
+        },
+        {
+          "filename": "product-knowledge-base.md",
+          "chunkCount": 6,
+          "processingStatus": "completed",
+          "keywordStatus": "extracted"
+        },
+        {
+          "filename": "runbook-incident-response.md",
+          "chunkCount": 7,
+          "processingStatus": "completed",
+          "keywordStatus": "extracted"
+        }
+      ],
+      "partitionRows": 25,
+      "sharedEmbeddingRows": 0,
+      "keywordVocabularySize": 0
+    },
+    "defaultsPath": {
+      "storedChunkingConfig": {
+        "maxSize": 1024,
+        "minSize": 1,
+        "overlap": 200
+      },
+      "documents": [
+        {
+          "filename": "api-reference.md",
+          "chunkCount": 1
+        },
+        {
+          "filename": "changelog.md",
+          "chunkCount": 1
+        },
+        {
+          "filename": "handbook-expenses.md",
+          "chunkCount": 1
+        },
+        {
+          "filename": "handbook-parental-leave.md",
+          "chunkCount": 1
+        },
+        {
+          "filename": "handbook-security.md",
+          "chunkCount": 1
+        },
+        {
+          "filename": "product-agents.md",
+          "chunkCount": 1
+        },
+        {
+          "filename": "product-knowledge-base.md",
+          "chunkCount": 1
+        },
+        {
+          "filename": "product-workflow-builder.md",
+          "chunkCount": 1
+        },
+        {
+          "filename": "runbook-database-maintenance.md",
+          "chunkCount": 1
+        },
+        {
+          "filename": "runbook-incident-response.md",
+          "chunkCount": 1
+        },
+        {
+          "filename": "service-config.json",
+          "chunkCount": 1
+        },
+        {
+          "filename": "support-tickets.csv",
+          "chunkCount": 1
+        }
+      ],
+      "partitionRows": 12,
+      "sharedEmbeddingRows": 0
+    },
+    "bullmqParity": {
+      "embedBatchRows": 12,
+      "embedBatchStatuses": ["completed"],
+      "documents": [
+        {
+          "filename": "api-reference.md",
+          "chunkCount": 5,
+          "processingStatus": "completed",
+          "keywordStatus": "extracted"
+        },
+        {
+          "filename": "changelog.md",
+          "chunkCount": 6,
+          "processingStatus": "completed",
+          "keywordStatus": "extracted"
+        },
+        {
+          "filename": "handbook-expenses.md",
+          "chunkCount": 8,
+          "processingStatus": "completed",
+          "keywordStatus": "extracted"
+        },
+        {
+          "filename": "handbook-parental-leave.md",
+          "chunkCount": 6,
+          "processingStatus": "completed",
+          "keywordStatus": "extracted"
+        },
+        {
+          "filename": "handbook-security.md",
+          "chunkCount": 6,
+          "processingStatus": "completed",
+          "keywordStatus": "extracted"
+        },
+        {
+          "filename": "product-agents.md",
+          "chunkCount": 7,
+          "processingStatus": "completed",
+          "keywordStatus": "extracted"
+        },
+        {
+          "filename": "product-knowledge-base.md",
+          "chunkCount": 6,
+          "processingStatus": "completed",
+          "keywordStatus": "extracted"
+        },
+        {
+          "filename": "product-workflow-builder.md",
+          "chunkCount": 7,
+          "processingStatus": "completed",
+          "keywordStatus": "extracted"
+        },
+        {
+          "filename": "runbook-database-maintenance.md",
+          "chunkCount": 5,
+          "processingStatus": "completed",
+          "keywordStatus": "extracted"
+        },
+        {
+          "filename": "runbook-incident-response.md",
+          "chunkCount": 7,
+          "processingStatus": "completed",
+          "keywordStatus": "extracted"
+        },
+        {
+          "filename": "service-config.json",
+          "chunkCount": 4,
+          "processingStatus": "completed",
+          "keywordStatus": "extracted"
+        },
+        {
+          "filename": "support-tickets.csv",
+          "chunkCount": 4,
+          "processingStatus": "completed",
+          "keywordStatus": "extracted"
+        }
+      ],
+      "keywordVocabularySize": 92,
+      "rankings": {
+        "q01-keyword-pure": [
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 1
+          },
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 4
+          },
+          {
+            "documentId": "changelog",
+            "chunkIndex": 5
+          },
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 3
+          }
+        ],
+        "q02-semantic-pure": [
+          {
+            "documentId": "handbook-expenses",
+            "chunkIndex": 3
+          },
+          {
+            "documentId": "handbook-expenses",
+            "chunkIndex": 4
+          },
+          {
+            "documentId": "changelog",
+            "chunkIndex": 2
+          },
+          {
+            "documentId": "changelog",
+            "chunkIndex": 3
+          },
+          {
+            "documentId": "handbook-expenses",
+            "chunkIndex": 6
+          }
+        ],
+        "q03-hybrid-default": [
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 4
+          },
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 6
+          },
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 1
+          },
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 3
+          },
+          {
+            "documentId": "handbook-expenses",
+            "chunkIndex": 7
+          }
+        ],
+        "q04-min-score": [
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 4
+          },
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 6
+          },
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 1
+          }
+        ],
+        "q06-neighbor-clusters": [
+          {
+            "documentId": "product-knowledge-base",
+            "chunkIndex": 2
+          },
+          {
+            "documentId": "service-config",
+            "chunkIndex": 2
+          },
+          {
+            "documentId": "product-workflow-builder",
+            "chunkIndex": 6
+          },
+          {
+            "documentId": "product-agents",
+            "chunkIndex": 3
+          },
+          {
+            "documentId": "product-workflow-builder",
+            "chunkIndex": 3
+          }
+        ],
+        "q07-include-content-false": [
+          {
+            "documentId": "api-reference",
+            "chunkIndex": 1
+          },
+          {
+            "documentId": "product-workflow-builder",
+            "chunkIndex": 6
+          },
+          {
+            "documentId": "product-workflow-builder",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "product-workflow-builder",
+            "chunkIndex": 4
+          },
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 4
+          }
+        ],
+        "q08-structured-json": [
+          {
+            "documentId": "service-config",
+            "chunkIndex": 1
+          },
+          {
+            "documentId": "handbook-security",
+            "chunkIndex": 5
+          },
+          {
+            "documentId": "service-config",
+            "chunkIndex": 2
+          },
+          {
+            "documentId": "api-reference",
+            "chunkIndex": 1
+          },
+          {
+            "documentId": "api-reference",
+            "chunkIndex": 0
+          }
+        ],
+        "q09-csv-rows": [
+          {
+            "documentId": "support-tickets",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "service-config",
+            "chunkIndex": 3
+          },
+          {
+            "documentId": "api-reference",
+            "chunkIndex": 0
+          }
+        ],
+        "q10-v1-tag-and-vector": [
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 1
+          },
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 5
+          },
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 4
+          },
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 3
+          }
+        ]
+      }
+    },
+    "queries": {
+      "q01-keyword-pure": {
+        "top5": [
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 1
+          },
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 4
+          },
+          {
+            "documentId": "changelog",
+            "chunkIndex": 5
+          },
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 3
+          }
+        ],
+        "matchCount": 5,
+        "scores": [1, 0.75, 0.75, 0.5, 0.5],
+        "keywordScores": [1, 0.75, 0.75, 0.5, 0.5],
+        "candidateClusterIds": null,
+        "queryKeywords": ["entitlement", "leave", "parent", "parental"]
+      },
+      "q02-semantic-pure": {
+        "top5": [
+          {
+            "documentId": "handbook-expenses",
+            "chunkIndex": 3
+          },
+          {
+            "documentId": "handbook-expenses",
+            "chunkIndex": 4
+          },
+          {
+            "documentId": "changelog",
+            "chunkIndex": 2
+          },
+          {
+            "documentId": "changelog",
+            "chunkIndex": 3
+          },
+          {
+            "documentId": "handbook-expenses",
+            "chunkIndex": 6
+          }
+        ],
+        "matchCount": 5,
+        "scores": [1, 0.689953, 0.642453, 0.53662, 0.53562],
+        "keywordScores": [1, 0, 0, 0, 0.5],
+        "candidateClusterIds": null,
+        "queryKeywords": ["travel", "rail"]
+      },
+      "q03-hybrid-default": {
+        "top5": [
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 4
+          },
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 6
+          },
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 1
+          },
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 3
+          },
+          {
+            "documentId": "handbook-expenses",
+            "chunkIndex": 7
+          }
+        ],
+        "matchCount": 5,
+        "scores": [0.862084, 0.74506, 0.727998, 0.5, 0.399429],
+        "keywordScores": [1, 1, 1, 0, 0],
+        "candidateClusterIds": null,
+        "queryKeywords": ["incident", "severity"]
+      },
+      "q04-min-score": {
+        "top5": [
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 4
+          },
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 6
+          },
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 1
+          }
+        ],
+        "matchCount": 3,
+        "scores": [0.862084, 0.74506, 0.727998],
+        "keywordScores": [1, 1, 1],
+        "candidateClusterIds": null,
+        "queryKeywords": ["incident", "severity"]
+      },
+      "q05-metadata-filter": {
+        "top5": [
+          {
+            "documentId": "handbook-security",
+            "chunkIndex": 3
+          },
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "handbook-security",
+            "chunkIndex": 1
+          },
+          {
+            "documentId": "handbook-security",
+            "chunkIndex": 2
+          },
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 5
+          }
+        ],
+        "matchCount": 5,
+        "scores": [1, 0.959081, 0.927438, 0.904254, 0.835678],
+        "keywordScores": [0, 0, 0, 0, 0],
+        "candidateClusterIds": null,
+        "queryKeywords": null
+      },
+      "q06-neighbor-clusters": {
+        "top5": [
+          {
+            "documentId": "product-knowledge-base",
+            "chunkIndex": 2
+          },
+          {
+            "documentId": "service-config",
+            "chunkIndex": 2
+          },
+          {
+            "documentId": "product-workflow-builder",
+            "chunkIndex": 6
+          },
+          {
+            "documentId": "product-agents",
+            "chunkIndex": 3
+          },
+          {
+            "documentId": "product-workflow-builder",
+            "chunkIndex": 3
+          }
+        ],
+        "matchCount": 5,
+        "scores": [1, 0.884583, 0.854414, 0.706377, 0.668419],
+        "keywordScores": [0, 0, 0, 0, 0],
+        "candidateClusterIds": null,
+        "queryKeywords": []
+      },
+      "q07-include-content-false": {
+        "top5": [
+          {
+            "documentId": "api-reference",
+            "chunkIndex": 1
+          },
+          {
+            "documentId": "product-workflow-builder",
+            "chunkIndex": 6
+          },
+          {
+            "documentId": "product-workflow-builder",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "product-workflow-builder",
+            "chunkIndex": 4
+          },
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 4
+          }
+        ],
+        "matchCount": 5,
+        "scores": [1, 0.573476, 0.558941, 0.42714, 0.413691],
+        "keywordScores": [0, 0, 0, 0, 0],
+        "candidateClusterIds": null,
+        "queryKeywords": null
+      },
+      "q08-structured-json": {
+        "top5": [
+          {
+            "documentId": "service-config",
+            "chunkIndex": 1
+          },
+          {
+            "documentId": "handbook-security",
+            "chunkIndex": 5
+          },
+          {
+            "documentId": "service-config",
+            "chunkIndex": 2
+          },
+          {
+            "documentId": "api-reference",
+            "chunkIndex": 1
+          },
+          {
+            "documentId": "api-reference",
+            "chunkIndex": 0
+          }
+        ],
+        "matchCount": 5,
+        "scores": [1, 0.406684, 0.371768, 0.342178, 0.339787],
+        "keywordScores": [1, 0, 0, 0, 0],
+        "candidateClusterIds": null,
+        "queryKeywords": ["pool", "redis"]
+      },
+      "q09-csv-rows": {
+        "top5": [
+          {
+            "documentId": "support-tickets",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "service-config",
+            "chunkIndex": 3
+          },
+          {
+            "documentId": "api-reference",
+            "chunkIndex": 0
+          }
+        ],
+        "matchCount": 3,
+        "scores": [1, 0.484547, 0.308746],
+        "keywordScores": [0.75, 0, 0],
+        "candidateClusterIds": null,
+        "queryKeywords": ["customer", "enterprise", "refund", "ticket"]
+      },
+      "q11-sdk-keyword-pure": {
+        "top5": [
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 1
+          },
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 1
+          },
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 4
+          },
+          {
+            "documentId": "handbook-security",
+            "chunkIndex": 4
+          }
+        ],
+        "matchCount": 5,
+        "scores": [1, 0.775349, 0.640042, 0.629413, 0.518436],
+        "keywordScores": [0, 0, 0, 0, 0],
+        "candidateClusterIds": null,
+        "queryKeywords": null
+      },
+      "q12-sdk-hybrid-default": {
+        "top5": [
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 3
+          },
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 4
+          },
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 6
+          },
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 1
+          },
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 4
+          }
+        ],
+        "matchCount": 5,
+        "scores": [1, 0.819882, 0.667047, 0.644764, 0.570431],
+        "keywordScores": [0, 0, 0, 0, 0],
+        "candidateClusterIds": null,
+        "queryKeywords": null
+      },
+      "q13-defaults-keyword-pure": {
+        "top5": [
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "changelog",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "runbook-database-maintenance",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "product-agents",
+            "chunkIndex": 0
+          }
+        ],
+        "matchCount": 5,
+        "scores": [1, 0.813861, 0.757861, 0.667594, 0.635819],
+        "keywordScores": [0, 0, 0, 0, 0],
+        "candidateClusterIds": null,
+        "queryKeywords": null
+      },
+      "q14-defaults-cold-start": {
+        "top5": [
+          {
+            "documentId": "product-knowledge-base",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "support-tickets",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "handbook-security",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "product-workflow-builder",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "product-agents",
+            "chunkIndex": 0
+          }
+        ],
+        "matchCount": 5,
+        "scores": [1, 0.949447, 0.657235, 0.597787, 0.545988],
+        "keywordScores": [0, 0, 0, 0, 0],
+        "candidateClusterIds": null,
+        "queryKeywords": []
+      },
+      "q15-defaults-structured-json": {
+        "top5": [
+          {
+            "documentId": "service-config",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "api-reference",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "handbook-security",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "runbook-incident-response",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "product-agents",
+            "chunkIndex": 0
+          }
+        ],
+        "matchCount": 5,
+        "scores": [1, 0.708407, 0.561419, 0.51336, 0.444542],
+        "keywordScores": [0, 0, 0, 0, 0],
+        "candidateClusterIds": null,
+        "queryKeywords": null
+      },
+      "q10-v1-tag-and-vector": {
+        "top5": [
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 0
+          },
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 1
+          },
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 5
+          },
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 4
+          },
+          {
+            "documentId": "handbook-parental-leave",
+            "chunkIndex": 3
+          }
+        ],
+        "matchCount": 5,
+        "distances": [0.65359, 0.685515, 0.841265, 0.842733, 0.861804],
+        "tags": [
+          {
+            "tag1": "handbook",
+            "tag2": "people",
+            "number1": 2026
+          },
+          {
+            "tag1": "handbook",
+            "tag2": "people",
+            "number1": 2026
+          },
+          {
+            "tag1": "handbook",
+            "tag2": "people",
+            "number1": 2026
+          },
+          {
+            "tag1": "handbook",
+            "tag2": "people",
+            "number1": 2026
+          },
+          {
+            "tag1": "handbook",
+            "tag2": "people",
+            "number1": 2026
+          }
+        ]
+      }
+    }
+  }
+}

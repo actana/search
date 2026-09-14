@@ -1,0 +1,23 @@
+{
+  "name": "@actana/search-cli",
+  "version": "0.1.0",
+  "description": "actana-search — pair with a Search instance, list knowledge bases, ingest a document, run a query.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "actana-search": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@actana/search": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "25.8.0",
+    "typescript": "6.0.3",
+    "vitest": "4.1.6"
+  }
+}

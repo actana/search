@@ -1,0 +1,23 @@
+node_modules
+dist
+.pnpm-store
+.DS_Store
+*.sw?
+*.log
+.env
+.env.local
+coverage/
+test-results/
+
+# Runtime state: the CA, the server certificate and the pairing material
+# (SEARCH_STATE_DIR defaults to ~/.actana-search; a repo-local run lands here).
+.actana-search/
+.certs
+
+# Agent scratch
+.claude
+.codex
+.opencode
+.cursor
+CLAUDE.local.md
+.scratch/

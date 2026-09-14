@@ -1,0 +1,33 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    // Relative imports inside this package carry their `.ts` extension, so
+    // `node src/index.ts` resolves the whole tree through Node 24's own type
+    // stripping — no bundler, no loader, no build step before the service can
+    // run. Safe with `noEmit`.
+    "allowImportingTsExtensions": true,
+    "strict": true,
+    "noFallthroughCasesInSwitch": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "useDefineForClassFields": true,
+    "ignoreDeprecations": "6.0",
+    "noEmit": true,
+    "types": ["node"],
+    // The core reaches its workspace siblings by package name, never by a
+    // relative path across package boundaries: the declared dependency is the
+    // boundary. Same arrangement as Control's Core (ADR 0016 D3 there).
+    "baseUrl": ".",
+    "paths": {
+      "@actana/search-shared/*": ["../shared/src/*"]
+    }
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "drizzle"]
+}

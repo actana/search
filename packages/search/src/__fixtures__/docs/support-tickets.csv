@@ -1,0 +1,16 @@
+ticket_id,opened_at,channel,product_area,severity,status,customer_tier,subject,resolution
+T-4101,2026-08-03,email,knowledge-base,high,closed,enterprise,Refund request after duplicate annual charge,Refund issued to the original card within three working days
+T-4102,2026-08-03,chat,workflows,medium,closed,growth,Scheduled workflow stopped firing after timezone change,Schedule re-saved with the new timezone and backfilled the missed run
+T-4103,2026-08-04,email,agents,low,closed,starter,How do I attach a knowledge base to an agent,Pointed the customer at the agent knowledge tab and confirmed retrieval worked
+T-4104,2026-08-05,phone,billing,high,closed,enterprise,Refund request for an unused seat block,Prorated credit applied to the next invoice rather than a card refund
+T-4105,2026-08-06,email,knowledge-base,high,closed,growth,Uploaded PDF produced zero chunks,File was a scanned image; enabled optical character recognition and re-ingested
+T-4106,2026-08-07,chat,workflows,critical,closed,enterprise,Production workflow failing with a rate limit error,Raised the connector rate limit and added exponential backoff to the retry policy
+T-4107,2026-08-10,email,security,critical,closed,enterprise,Suspected phishing mail impersonating the finance team,Confirmed phishing; blocked the sender domain and notified all workspace admins
+T-4108,2026-08-11,chat,knowledge-base,medium,closed,starter,Search returns the same chunk twice,Duplicate document had been uploaded twice; removed the older copy
+T-4109,2026-08-12,email,billing,medium,open,growth,Refund request after cancelling mid-term,Awaiting finance approval under the mid-term cancellation policy
+T-4110,2026-08-13,email,agents,medium,closed,enterprise,Agent picks the wrong tool for refund questions,Rewrote the tool description and added a procedure for refund handling
+T-4111,2026-08-14,chat,workflows,low,closed,starter,Cannot reference an output from a looped block,Explained loop scoping and moved the reference inside the loop body
+T-4112,2026-08-17,email,knowledge-base,low,closed,growth,Keyword search misses obvious terms,Vocabulary had not been extracted yet; re-ran keyword extraction for the base
+T-4113,2026-08-18,phone,security,high,closed,enterprise,Lost laptop while travelling,Device wiped remotely and all sessions revoked within the hour
+T-4114,2026-08-19,email,billing,low,closed,starter,Invoice missing the purchase order number,Reissued the invoice with the purchase order reference added
+T-4115,2026-08-20,chat,agents,high,open,growth,Agent conversation stuck in triage with no owner,Assigned to the support lead and added an escalation rule for unowned tickets

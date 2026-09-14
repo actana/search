@@ -60,3 +60,11 @@ Control.
 `pnpm lint`, `pnpm test` are green; the lifted unit tests pass; the fixture suite passes
 in-process against `SEARCH_TEST_DATABASE_URL`; `git log` is a series of Conventional
 Commits on `feat/bootstrap-and-lift`.
+
+## Outcome
+
+Done on `feat/bootstrap-and-lift`. The workspace, the conventions and ADRs 0001–0007 are in; 152 TypeScript files lifted out of Studio (47 into `packages/shared`, 105 into `packages/search`, ~29.5k lines) with 49 `// lifted:` markers recording every cut; `pnpm install --frozen-lockfile`, `pnpm typecheck`, `pnpm lint`, `pnpm test` and `pnpm audit --prod --audit-level high` are all green (506 tests), and Studio's behaviour-freeze fixture replays 24/24 against the lifted engine across all four ingest paths.
+
+**Deviation from Control, recorded deliberately:** `packageManager` is `pnpm@12.4.1`, not Control's `pnpm@11.1.2`. 12.4.1 is what is installed on the machine this was built on, and declaring a version the repo is never actually built with is worse than declaring the one it is. `pnpm-workspace.yaml` uses 12's `minimumReleaseAge` and `auditConfig`, neither of which 11 reads, so aligning the two would mean giving up the release-age gate. Control should move to 12 rather than Search moving back.
+
+The review round that followed added: the strip-types gate and the CI boot job (the service could not start under Node's type stripping); explicit schema qualification everywhere and the removal of the `search_path` trick (on a shared database it resolved Studio's identically-named partitions); the Mistral OCR path, which the first pass had retired rather than lifted; the SSRF guard on the download path; an advisory lock around the migrator (two replicas booting together raced); and ADR 0007 for the two SheetJS advisories that have no npm fix.

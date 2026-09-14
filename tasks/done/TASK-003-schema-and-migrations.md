@@ -28,3 +28,7 @@ lines ~2602–3088 so the phase-4 move is `SET SCHEMA` + renames):
 
 Also: `schema_version` exposed by `GET /v1/capabilities`. Integration test that runs the
 migrations on an empty database twice (idempotent) and creates/drops a partition.
+
+## Outcome
+
+Done on `feat/bootstrap-and-lift`. Fourteen tables under `pgSchema('search')` with Studio's columns and index names unchanged, generated migrations in `packages/search/drizzle/`, applied at boot by `db/migrate.ts` behind `CREATE EXTENSION IF NOT EXISTS vector`; the integration suite migrates an empty database twice, proves two migrators starting at once are safe, and creates and drops a partition through the lifted `ddl.ts`, gated on `SEARCH_TEST_DATABASE_URL`. `knowledge_base.paired_client_id` is NOT NULL (ADR 0003), every raw statement qualifies its table by schema, and `docs/migration-from-studio.md` records what phase 4 actually has to do — `SET SCHEMA` is not the whole of it.

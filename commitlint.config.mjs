@@ -1,0 +1,135 @@
+/**
+ * Commitlint configuration — enforces Conventional Commits v1.0.0.
+ *
+ * Copied from actana/control, whose rules this repo follows deliberately: a
+ * contributor moving between the two writes the same commit messages.
+ * Keep the `type-enum` list in sync with:
+ *   - .github/workflows/ci.yml (the Conventions job's PR title check)
+ *   - CONTRIBUTING.md (documentation)
+ *
+ * Self-contained on purpose: the Conventions job copies *this file alone* into
+ * RUNNER_TEMP beside a throwaway commitlint install, so the rule below is an
+ * inline plugin rather than an import. One file, one place to change it.
+ */
+
+/**
+ * Tokens that genuinely open a footer. Everything else on a line of its own is
+ * prose — see TRAILER_PATTERN. Case-insensitive; keep the list tight, because
+ * a word added here becomes a word contributors can no longer start a wrapped
+ * body line with.
+ */
+const TRAILER_TOKENS = [
+  'BREAKING[ -]CHANGE',
+  'Refs?',
+  'References',
+  'Closes?',
+  'Closed',
+  'Fix(es|ed)?',
+  'Resolves?',
+  'Resolved',
+  'Reverts?',
+  'Co-authored-by',
+  'Signed-off-by',
+  'Reviewed-by',
+  'Acked-by',
+  'Tested-by',
+  'Reported-by',
+  'Suggested-by',
+  'Helped-by',
+  'Cc',
+];
+
+/**
+ * A real trailer is one of those tokens followed by `: ` or ` #<digits>`.
+ * Requiring the separator is what keeps `Fixes the crash under Podman` — a
+ * sentence — from being read as a `Fixes` footer.
+ */
+const TRAILER_PATTERN = new RegExp(`^(${TRAILER_TOKENS.join('|')})(:[ \t]|[ \t]#\\d)`, 'i');
+
+/**
+ * `footer-leading-blank`, minus the false positives.
+ *
+ * The stock rule asks conventional-commits-parser where the footer starts, and
+ * that parser calls any line shaped like `token: value` a footer — including a
+ * body sentence that happens to wrap onto `that: the partition was never
+ * created…` or `to: a different schema entirely…`. A check that fails on
+ * correct input is a check people learn to wave through, and this rule was
+ * added in actana/control after three such commits failed CI with nothing
+ * wrong in them.
+ *
+ * So we find the footer ourselves: the first line that opens with a *known*
+ * trailer token (`Refs #39`, `Co-authored-by:`, `BREAKING CHANGE:`) starts the
+ * footer, and that line must have a blank line above it. Prose is left alone.
+ *
+ * The trade is a missed report when someone jams an exotic trailer straight
+ * onto the body. That is the cheaper failure: the tokens this repo actually
+ * uses are all covered, and a false negative costs a blank line while a false
+ * positive costs a red required check on a good commit.
+ */
+const trailerLeadingBlank = (parsed) => {
+  const lines = String(parsed.raw ?? '').split('\n');
+
+  // Start at 1: line 0 is the header, which has no line above it to be blank.
+  for (let i = 1; i < lines.length; i += 1) {
+    if (!TRAILER_PATTERN.test(lines[i])) continue;
+    if (lines[i - 1].trim() === '') return [true];
+    return [
+      false,
+      `footer must have leading blank line — "${lines[i].slice(0, 40)}" follows body text directly`,
+    ];
+  }
+
+  return [true];
+};
+
+export default {
+  extends: ['@commitlint/config-conventional'],
+  rules: {
+    'type-enum': [
+      2,
+      'always',
+      [
+        'feat',
+        'fix',
+        'docs',
+        'style',
+        'refactor',
+        'perf',
+        'test',
+        'build',
+        'ci',
+        'chore',
+        'revert',
+      ],
+    ],
+    // Off, not "never sentence-case". Subjects here legitimately open with a
+    // ticket id — `test(search): TASK-004 — the fixture suite over REST` — and
+    // every case rule available would reject that.
+    'subject-case': [0],
+    'subject-empty': [2, 'never'],
+    'subject-full-stop': [2, 'never', '.'],
+    // 120, not the conventional 72: 84 of the 120 commits before this rule
+    // landed were longer than 72, and 33 were longer than 100. A limit the
+    // project's own history fails is a limit people learn to bypass. This one
+    // catches a runaway subject without arguing with the house style.
+    'header-max-length': [2, 'always', 120],
+    // 132, not 100, and the same for the footer: this repo squashes with
+    // COMMIT_MESSAGES, so a train squash carries every ticket PR title
+    // concatenated into its body. Those titles are capped at 112 plus a
+    // ` (#NNN)` suffix, and the parser may land the tail of that block in the
+    // footer, so both limits must clear the 120 `header-max-length` above —
+    // otherwise a title that was legal as a header is illegal once quoted.
+    'body-max-line-length': [2, 'always', 132],
+    'footer-max-line-length': [2, 'always', 132],
+    'body-leading-blank': [2, 'always'],
+    // Off in favour of `trailer-leading-blank` above it — same intent, without
+    // mistaking a wrapped body sentence for a footer.
+    'footer-leading-blank': [0],
+    'trailer-leading-blank': [2, 'always'],
+  },
+  plugins: [{ rules: { 'trailer-leading-blank': trailerLeadingBlank } }],
+  ignores: [
+    // Allow auto-generated merge/revert messages from GitHub UI
+    (message) => message.startsWith('Merge '),
+  ],
+};
