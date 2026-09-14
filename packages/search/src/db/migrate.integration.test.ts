@@ -24,7 +24,17 @@ import { dropKbPartition, provisionKbPartition } from "../kb/ddl.ts";
 import { kbPartitionName } from "../kb/partition.ts";
 import { resetConfig } from "../config.ts";
 import { createDatabase, type SearchDatabase } from "./client.ts";
-import { MIGRATIONS_TABLE, runMigrations, SEARCH_SCHEMA } from "./migrate.ts";
+import { MIGRATIONS_FOLDER, MIGRATIONS_TABLE, runMigrations, SEARCH_SCHEMA } from "./migrate.ts";
+import { readFileSync } from "node:fs";
+import * as path from "node:path";
+
+/** How many migrations the journal names. One ledger row is owed per entry. */
+function journalEntries(): number {
+  const journal = JSON.parse(
+    readFileSync(path.join(MIGRATIONS_FOLDER, "meta", "_journal.json"), "utf8"),
+  ) as { entries: unknown[] };
+  return journal.entries.length;
+}
 
 const configuredUrl = process.env.SEARCH_TEST_DATABASE_URL;
 
@@ -159,9 +169,42 @@ describe.skipIf(!url)("migrations", () => {
     await Promise.all([runMigrations({ url: url! }), runMigrations({ url: url! })]);
 
     expect(await tableNames()).toContain("knowledge_base");
-    // One ledger row, not two: the second migrator found nothing to do.
+    // One ledger row per migration, not two per migration: the second migrator
+    // found nothing to do. Counted against the journal rather than a literal,
+    // so adding a migration does not have to remember to come back here.
     const applied = await rows(sql.raw(`SELECT id FROM "${SEARCH_SCHEMA}"."${MIGRATIONS_TABLE}"`));
-    expect(applied).toHaveLength(1);
+    expect(applied).toHaveLength(journalEntries());
+  });
+
+  it("refuses a database where a migration was skipped rather than applied", async () => {
+    // The failure this guards is silent by construction. Drizzle applies a
+    // migration only when its journal timestamp is newer than the newest row in
+    // the ledger, and it does not record *which file* a row was — so a database
+    // migrated by a checkout whose timestamps run ahead of ours leaves a row
+    // newer than a migration we have never run, and that migration is skipped
+    // for ever. The first symptom is a query failing on a column.
+    //
+    // Reproduced here the way it actually happens: a full ledger, minus its
+    // oldest row. Nothing is left to apply — the newest timestamp is unchanged
+    // — and the count no longer matches the journal.
+    await db.execute(sql.raw(`DROP SCHEMA IF EXISTS "${SEARCH_SCHEMA}" CASCADE`));
+    await runMigrations({ url: url! });
+    expect(journalEntries()).toBeGreaterThan(1);
+
+    await db.execute(
+      sql.raw(
+        `DELETE FROM "${SEARCH_SCHEMA}"."${MIGRATIONS_TABLE}" ` +
+          `WHERE created_at = (SELECT min(created_at) FROM "${SEARCH_SCHEMA}"."${MIGRATIONS_TABLE}")`,
+      ),
+    );
+
+    await expect(runMigrations({ url: url! })).rejects.toThrowError(
+      /migrations are recorded .* skipped rather than applied/s,
+    );
+
+    // And it recovers the way the message says it does.
+    await db.execute(sql.raw(`DROP SCHEMA IF EXISTS "${SEARCH_SCHEMA}" CASCADE`));
+    await expect(runMigrations({ url: url! })).resolves.toBeUndefined();
   });
 
   it("creates and drops a per-KB partition in the search schema", async () => {

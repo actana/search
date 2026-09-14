@@ -27,6 +27,7 @@
 
 import { sql } from "drizzle-orm";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
+import { readFile } from "node:fs/promises";
 import * as path from "node:path";
 import { createLogger } from "@actana/search-shared/log";
 import { createDatabase, type SearchDatabase } from "./client.ts";
@@ -139,8 +140,66 @@ async function applyTo(db: SearchDatabase, migrationsFolder: string): Promise<vo
       }
       throw err;
     }
+
+    // Under the lock, and after the migrator: reading the ledger while another
+    // migrator is halfway through it would compare a count against a moving
+    // target and refuse a database that was perfectly fine a moment later.
+    await assertNothingWasSkipped(db, migrationsFolder);
   } finally {
     await db.execute(sql`SELECT pg_advisory_unlock(${MIGRATION_LOCK_KEY})`);
   }
   logger.info("Migrations applied", { migrationsFolder });
+}
+
+/**
+ * Refuse a database that came back from `migrate()` missing a migration.
+ *
+ * **Drizzle decides what to apply by timestamp, not by identity.** It records
+ * one row per applied migration carrying that migration's `when` from
+ * `meta/_journal.json`, and on the next run it applies only the entries whose
+ * `when` is greater than the newest row's. It does not record which *file* a
+ * row was, so a database migrated by a different checkout — a second clone of
+ * this repository, a branch whose `0000` was regenerated with a later `when` —
+ * leaves a row newer than a migration this checkout has not applied yet, and
+ * that migration is then skipped **silently, for ever**. The first symptom is a
+ * query failing on a column, several files away from the cause.
+ *
+ * That is not hypothetical: it is how a reviewer's clone and this one, sharing
+ * one `search_test` database, spent an afternoon producing errors about
+ * `cert_subject`.
+ *
+ * So: one row per journal entry, or say so. The count is exact — `migrate()`
+ * inserts exactly one row per migration it runs — and the message names the fix
+ * rather than the symptom, because the fix (drop the schema and migrate again)
+ * is not one a reader deduces from "column does not exist".
+ */
+async function assertNothingWasSkipped(db: SearchDatabase, migrationsFolder: string): Promise<void> {
+  const journalPath = path.join(migrationsFolder, "meta", "_journal.json");
+  let expected: number;
+  try {
+    const journal = JSON.parse(await readFile(journalPath, "utf8")) as { entries?: unknown[] };
+    expected = Array.isArray(journal.entries) ? journal.entries.length : 0;
+  } catch {
+    // No journal is not this function's problem — `migrate()` has already
+    // thrown for it. Nothing to compare against, so nothing to report.
+    return;
+  }
+  if (expected === 0) return;
+
+  const rows = (await db.execute(
+    sql.raw(`SELECT count(*)::int AS applied FROM "${SEARCH_SCHEMA}"."${MIGRATIONS_TABLE}"`),
+  )) as unknown;
+  const applied = Number(
+    (Array.isArray(rows) ? rows[0] : (rows as { rows?: Array<{ applied?: unknown }> }).rows?.[0])
+      ?.applied ?? 0,
+  );
+  if (applied >= expected) return;
+
+  throw new Error(
+    `${applied} of ${expected} migrations are recorded in "${SEARCH_SCHEMA}"."${MIGRATIONS_TABLE}", ` +
+      "so at least one was skipped rather than applied. Drizzle applies a migration only when its " +
+      "journal timestamp is newer than the newest recorded one, so this database was migrated by a " +
+      "different checkout of this repository whose migration timestamps are newer than ours. Drop " +
+      `the "${SEARCH_SCHEMA}" schema and migrate again, or point this instance at a database of its own.`,
+  );
 }

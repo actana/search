@@ -36,6 +36,27 @@ const schema = z.object({
 
   SEARCH_PORT: z.coerce.number().int().positive().default(7443),
   SEARCH_PUBLIC_HOST: z.string().default("localhost"),
+  /**
+   * An **opt-in** loopback TCP port for the admin surface that mints pairing
+   * codes and revokes clients (TASK-006).
+   *
+   * Unset by default, and that is the recommended setting: the admin surface
+   * normally listens on a Unix socket at `$SEARCH_STATE_DIR/admin.sock`, mode
+   * 0600, so what guards it is the filesystem — the same thing that guards the
+   * CA key beside it. A loopback port is reachable by every process on the
+   * host, containers sharing the network namespace included, and this surface
+   * has no authentication of its own. Set it only where Unix sockets are not
+   * available. Bound to `127.0.0.1` and nothing else when set.
+   */
+  SEARCH_ADMIN_PORT: z.coerce.number().int().nonnegative().optional(),
+  /**
+   * Plain HTTP, with the caller read from an `x-paired-client` header instead
+   * of a certificate (ADR 0003 says identity is never read from a header, which
+   * is exactly why this is not a deployment mode). For the fixture suites only:
+   * the server refuses to start this way unless `NODE_ENV=test` or
+   * `SEARCH_TEST_DATABASE_URL` is set.
+   */
+  SEARCH_DEV_INSECURE: booleanish.default(false),
   /** CA, server certificate, pairing material. The instance's identity. */
   SEARCH_STATE_DIR: z.string().optional(),
   SEARCH_LOG_LEVEL: z.enum(["debug", "info", "warn", "error", "silent"]).default("info"),

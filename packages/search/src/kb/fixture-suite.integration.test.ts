@@ -458,7 +458,7 @@ describeDb('KB behaviour freeze (fixture suite)', () => {
       label: `${PREFIX} client`,
       certSerial: `${PREFIX}-serial`,
       certFingerprint: `${PREFIX}-fingerprint`,
-      scopes: 'read,write,admin',
+      scope: 'admin',
       status: 'active',
       createdAt: now,
     })

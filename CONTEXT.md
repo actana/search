@@ -84,18 +84,38 @@ inventing language the project does not use, or there is a real gap to record.
   a workspace is.
 
 **Pairing code**
-: A short, single-use, expiring code a Search instance prints, redeemed exactly
-  once at `POST /v1/pair/redeem` — the only route reachable without a client
-  certificate.
+: A short, single-use, expiring code an operator mints on a Search instance and
+  reads out, redeemed exactly once at `POST /v1/pair/redeem` — the only route
+  that *grants* anything without a client certificate. Eight characters from a
+  31-character alphabet with no ambiguous glyphs, five-minute expiry, five
+  attempts. It travels beside the **pairing session** id that names it, as one
+  ticket (`<sessionId>:<XXXX-XXXX>`), and it is never stored: what the instance
+  keeps is a digest keyed by its own secret.
+
+**Pairing session**
+: The row a minted code opens (`search.pairing_code`) and a redemption spends.
+  It carries the digest, the expiry, the attempt count and the **scope** the
+  code grants. A redemption names one session and is answered by that session
+  or by nothing — there is no search for a session a code might fit.
 
 **Registration blob**
-: What a redemption returns: the endpoint address, the CA certificate, and the
-  client's own certificate. The client seals it and presents the certificate on
-  every later request. The certificate is the identity; nothing in a URL is.
+: What a client assembles from a redemption: the endpoint address, the CA
+  certificate, its own certificate — and the private key it generated locally
+  and never sent. The client seals it and presents the certificate on every
+  later request. The certificate is the identity; nothing in a URL is. The shape
+  is Control's `CoreRegistrationBlob`, field for field (ADR 0008).
 
 **Scope**
-: `read`, `write` or `admin`, plus an optional list of KB ids. Recorded against
-  the paired client, checked in the API layer, and deliberately coarse.
+: `read`, `write` or `admin`, plus an optional list of KB ids. Decided by the
+  operator when the **pairing code** is minted, copied onto the **paired
+  client** by the redemption, checked in the API layer, and deliberately coarse.
+  Nothing a redeeming client sends can influence it.
+
+**Open set**
+: The two paths that answer on a connection with no client certificate:
+  `POST /v1/pair/redeem`, which grants a certificate and carries every defence
+  ADR 0034 names, and `GET /v1/health`, which grants nothing. Enumerated in
+  `preauth-gate.test.ts`; a third entry is a change to ADR 0008 D5.
 
 ### Work
 

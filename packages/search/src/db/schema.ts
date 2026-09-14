@@ -80,7 +80,7 @@ export function qualified(table: string): string {
  * talking to is older than the SDK it is holding. Bump it in the same commit
  * as a new migration.
  */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /**
  * Dimensionless `vector` column for the shared `embedding` table. The per-KB
@@ -154,8 +154,14 @@ export const pairedClient = searchSchema.table(
     certSerial: text("cert_serial").notNull(),
     /** SHA-256 of the certificate, for display and for revocation lists. */
     certFingerprint: text("cert_fingerprint").notNull(),
-    /** Comma-separated subset of `read`, `write`, `admin`. Deliberately coarse. */
-    scopes: text("scopes").notNull().default("read"),
+    /** The subject as issued, e.g. `CN=actanastudio`. Display only. */
+    certSubject: text("cert_subject").notNull().default(""),
+    /** Wall clock at which the issued certificate stops verifying. */
+    certNotAfter: timestamp("cert_not_after"),
+    /** The pairing session this client redeemed, so an audit can join the two. */
+    sessionId: text("session_id"),
+    /** One of `read`, `write`, `admin`. Deliberately coarse (ADR 0003). */
+    scope: text("scope").notNull().default("read"),
     /** Optional allow-list of KB ids. NULL means every KB this client owns. */
     kbIds: jsonb("kb_ids"),
     /** 'active' | 'revoked'. */
@@ -172,24 +178,48 @@ export const pairedClient = searchSchema.table(
 );
 
 /**
- * The short-code pairing session. Control keeps this in memory or SQLite;
- * Search keeps it in Postgres because Search may be more than one process and
- * a code redeemed against one of them must be spent for all of them.
+ * The short-code pairing session. Control keeps this in a JSON file beside its
+ * material; Search keeps it in Postgres because Search may be more than one
+ * process and a code redeemed against one of them must be spent for all of
+ * them.
+ *
+ * **The code itself is not in here.** The primary key is the *session id* — the
+ * thing a redemption names — and `code_hash` is a digest keyed by the
+ * instance's own secret (`@actana/search-shared/pairing/pairing-code-digest`).
+ * A copy of this table is therefore not a pile of live pairing codes, which is
+ * ADR 0034 D1 and the reason the column the table shipped with in TASK-003 was
+ * renamed rather than filled in: a column called `code` that held a digest
+ * would have been a lie a reader could act on.
  */
 export const pairingCode = searchSchema.table(
   "pairing_code",
   {
-    code: text("code").primaryKey(),
+    /** The session id. What a redemption names, and what the digest binds to. */
+    id: text("id").primaryKey(),
     /** Set on redemption — the client this code minted. */
     pairedClientId: text("paired_client_id").references(() => pairedClient.id, {
       onDelete: "set null",
     }),
-    label: text("label"),
+    /** The operator's name for the machine being paired. Display only. */
+    label: text("label").notNull().default(""),
+    /** HMAC of `<sessionId>:<CODE>` under the instance's derived key. */
+    codeHash: text("code_hash").notNull(),
     expiresAt: timestamp("expires_at").notNull(),
     /** Set once, by the redemption that spent it. Single-use is enforced here. */
     consumedAt: timestamp("consumed_at"),
+    /** Set by `pair revoke` cancelling a code before anybody redeemed it. */
+    revokedAt: timestamp("revoked_at"),
     /** Failed redemption attempts against this code. */
     attempts: integer("attempts").notNull().default(0),
+    /** This session's cap, copied at mint so a config change cannot revive it. */
+    attemptCap: integer("attempt_cap").notNull().default(5),
+    /** The grant this code carries onto the client that redeems it (ADR 0003). */
+    scope: text("scope").notNull().default("admin"),
+    kbIds: jsonb("kb_ids"),
+    /** Inert, carried from Control: the hooks a later identity layer reads. */
+    createdBy: text("created_by"),
+    tenantId: text("tenant_id"),
+    authMethod: text("auth_method"),
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
   (table) => ({

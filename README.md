@@ -38,20 +38,48 @@ pnpm dev
 ```
 
 > **Where this is up to.** `pnpm db:migrate` and `pnpm dev` work today: the
-> schema, the migrator and the lifted engine are in. There is no listener yet —
-> `pnpm dev` applies the migrations and says so. The routes land in **TASK-004**,
-> the worker and the CLI in **TASK-005**, and the pairing handshake described
-> below in **TASK-006**. `SEARCH_ENCRYPTION_KEY` is required rather than
-> generated, and nothing generates one for you.
+> schema, the migrator, the lifted engine and the mTLS pairing below are in.
+> `pnpm dev` migrates, mints this instance's identity, and serves `/v1/health`,
+> `/v1/pair/redeem`, `/v1/pair/status` and `/v1/capabilities`. The rest of the
+> REST surface lands in **TASK-004** and the worker and the CLI in **TASK-005**.
+> `SEARCH_ENCRYPTION_KEY` is required rather than generated, and nothing
+> generates one for you.
 
-### How a client will connect (TASK-006)
+### How a client connects
 
-Search prints a one-time pairing code and its CA fingerprint on first start.
-A client — Studio's Settings → Search, or `actana-search pair` — redeems the
-code once and receives a registration blob holding the endpoint, the CA
-certificate and its own client certificate. Every later request carries that
-certificate, **and the certificate is the identity**: no route is scoped by
-anything in the URL.
+On first start Search mints its identity into `SEARCH_STATE_DIR` (default
+`~/.actana-search`) and logs the CA fingerprint. Pairing a client takes two
+commands: mint a code on the instance, redeem it on the client.
+
+```bash
+# On the machine that is the instance. The admin surface listens on a unix
+# socket under SEARCH_STATE_DIR at mode 0600 — the filesystem is what guards it.
+curl -s --unix-socket ~/.actana-search/admin.sock \
+  http://admin/admin/pair/new \
+  -H 'content-type: application/json' \
+  -d '{"label":"actanastudio","scope":"admin"}'
+# → { "ticket": "ps_7c1f:QK4M-9TRW", "caFingerprint": "3B:AF:…", "endpoint": … }
+```
+
+```ts
+// On the client. The key pair is generated here; only a CSR crosses the wire.
+import { pairWithSearch } from "@actana/search/pairing";
+import { SearchClient } from "@actana/search/client";
+
+const blob = await pairWithSearch({
+  address: "search.internal:7443",
+  code: "ps_7c1f:QK4M-9TRW",
+  expectedCaFingerprint: "3B:AF:…",
+  client: { label: "actanastudio", platform: process.platform },
+});
+const search = SearchClient.fromRegistrationBlob(blob); // seal `blob`; it is the credential
+```
+
+The code is single-use, expires in five minutes (`ttlMs` on the mint raises
+that, to at most 24 hours), and dies after five wrong guesses. The fingerprint
+is compared **before** the code is sent, on a connection that trusts nothing — a caller with no fingerprint is not a caller
+with a waived one. Every later request carries the issued certificate, **and the
+certificate is the identity**: no route is scoped by anything in the URL.
 
 ## Layout
 
@@ -104,6 +132,7 @@ shares Studio's Postgres it is still a schema Studio never references.
 | [0005](docs/adr/0005-behaviour-is-identical-nothing-is-retired.md) | Behaviour is identical; nothing is retired |
 | [0006](docs/adr/0006-blob-storage-and-queue-are-searchs-own.md) | Blob storage and the queue are Search's own |
 | [0007](docs/adr/0007-the-sheetjs-exception.md) | The SheetJS exception — two advisories acknowledged, not fixed |
+| [0008](docs/adr/0008-the-pairing-code-is-copied-from-control.md) | The pairing code is copied from Control, and will be lifted into a package |
 
 ## Moving data out of Studio
 
@@ -117,8 +146,29 @@ moved.
 
 ## Security & privacy
 
-- Exactly one route is reachable without a client certificate:
-  `POST /v1/pair/redeem`. Everything else is behind mutual TLS.
+- Exactly one route grants anything without a client certificate:
+  `POST /v1/pair/redeem`, and it is treated as a security boundary — single-use
+  codes, a five-minute expiry, capped attempts, per-caller and global rate
+  limits, and the code consumed before the certificate is signed. `GET
+  /v1/health` also answers without one and grants nothing; those two are the
+  whole open set, enumerated in `preauth-gate.test.ts`. Everything else is
+  behind mutual TLS, re-checked per request rather than only at the handshake.
+- Revocation is by certificate serial, swept every second, and **fails closed**:
+  an instance that cannot read `search.paired_client` refuses every paired
+  client rather than serving one an operator has taken back.
+- The pairing mechanism is Control's, copied rather than reimplemented — see
+  [ADR 0008](docs/adr/0008-the-pairing-code-is-copied-from-control.md) for what
+  must stay wire-identical while the copy exists.
+- The admin surface that mints codes and revokes clients listens on a **unix
+  socket** at `$SEARCH_STATE_DIR/admin.sock`, mode 0600: it has no
+  authentication of its own, so reaching it is the credential and the filesystem
+  is what decides who can. `SEARCH_ADMIN_PORT` adds a loopback TCP port beside
+  it for a platform with no unix sockets — every process on the host can then
+  reach it, so it is off by default; when set it refuses any request carrying an
+  `Origin` and anything but `content-type: application/json`.
+- The server certificate is re-signed against the same CA when it is within 30
+  days of expiry, so an instance that is never redeployed does not one day fail
+  every handshake at once. The CA survives, so nothing paired re-pairs.
 - Provider keys are sealed with `SEARCH_ENCRYPTION_KEY` (AES-256-GCM) when
   Search holds them. When Studio holds them, Search never stores one — it
   resolves the key per job and keeps it for the life of that job.
