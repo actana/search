@@ -4,14 +4,21 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('../db/client.ts', () => {
+  /** See `insertValues` below — declared inline because `vi.mock` is hoisted. */
+  const values = () =>
+    vi.fn(() =>
+      Object.assign(Promise.resolve(undefined), {
+        onConflictDoNothing: vi.fn(async () => undefined),
+      })
+    )
   const mockTx = {
     execute: vi.fn(async () => ({ rows: [] })),
-    insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
+    insert: vi.fn(() => ({ values: values() })),
     update: vi.fn(() => ({ set: vi.fn(() => ({ where: vi.fn(async () => undefined) })) })),
   }
   const db = {
     select: vi.fn(),
-    insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
+    insert: vi.fn(() => ({ values: values() })),
     update: vi.fn(() => ({ set: vi.fn(() => ({ where: vi.fn(async () => undefined) })) })),
     execute: vi.fn(async () => ({ rows: [{ c: 0 }] })),
     transaction: vi.fn(async (fn: (tx: typeof mockTx) => Promise<void>) => fn(mockTx)),
@@ -154,14 +161,24 @@ describe('selectChunker', () => {
   })
 })
 
+/**
+ * `db.insert(...).values(...)` is awaited directly by most of the lifted code
+ * and chained with `.onConflictDoNothing()` by `stageIngestedDocument`, so the
+ * stand-in has to be both a promise and an object with that method on it.
+ */
+const insertValues = () =>
+  vi.fn(() =>
+    Object.assign(Promise.resolve(undefined), {
+      onConflictDoNothing: vi.fn(async () => undefined),
+    })
+  )
+
 describe('ingestDocument', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     queueAdd.mockClear()
     ;(db.execute as ReturnType<typeof vi.fn>).mockResolvedValue({ rows: [{ c: 0 }] })
-    ;(db.insert as ReturnType<typeof vi.fn>).mockReturnValue({
-      values: vi.fn(async () => undefined),
-    })
+    ;(db.insert as ReturnType<typeof vi.fn>).mockReturnValue({ values: insertValues() })
     ;(db.update as ReturnType<typeof vi.fn>).mockReturnValue({
       set: vi.fn(() => ({ where: vi.fn(async () => undefined) })),
     })

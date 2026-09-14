@@ -35,6 +35,8 @@ import type { AddressInfo } from "node:net";
 import { createLogger } from "@actana/search-shared/log";
 import type { PairedClient } from "@actana/search-shared/pairing/pairing-code-digest";
 import type { SearchHealth, SearchPairStatus } from "@actana/search/pairing-wire";
+import { SEARCH_PROTOCOL_VERSION } from "@actana/search";
+import { SEARCH_FEATURES, type Capabilities } from "@actana/search/contracts";
 import { SCHEMA_VERSION } from "../db/schema.ts";
 import {
   CLIENT_CERT_REFUSAL_CODE,
@@ -298,7 +300,7 @@ async function serve(
     if (route.scope !== null && !scopeAllows(client.scope, route.scope)) {
       return sendRefusal(res, {
         status: 403,
-        code: "forbidden",
+        code: "scope-forbidden",
         message: `this client is scoped \`${client.scope}\` and this route needs \`${route.scope}\``,
       });
     }
@@ -491,21 +493,26 @@ function registerBuiltinRoutes(router: SearchRouter, opts: SearchServerOptions):
   });
 
   /**
-   * What this instance can do. TASK-004 fills the feature list out; the shape
-   * is fixed now because the SDK reads it to decide whether it is newer than
-   * the instance it is holding.
+   * What this instance can do.
+   *
+   * The feature list is `SEARCH_FEATURES` in the contracts — the whole closed
+   * enum, because this build serves all of it. It is a list rather than a
+   * version number so that a caller tests membership (`features.includes
+   * ("v1-tags")`) instead of inferring capability from an ordering nobody
+   * agreed on.
    */
   router.add({
     method: "GET",
     path: "/v1/capabilities",
     scope: "read",
     handle: ({ res }) => {
-      sendJson(res, 200, {
-        protocol: 1,
+      const body: Capabilities = {
+        protocol: SEARCH_PROTOCOL_VERSION,
         schemaVersion: SCHEMA_VERSION,
-        features: [] as string[],
+        features: [...SEARCH_FEATURES],
         publicHost: opts.publicHosts[0] ?? "localhost",
-      });
+      };
+      sendJson(res, 200, body);
     },
   });
 }
