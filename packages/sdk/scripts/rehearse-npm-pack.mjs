@@ -39,6 +39,10 @@ const pkg = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "u
 const ENTRY_POINTS = [
   pkg.name,
   `${pkg.name}/client`,
+  `${pkg.name}/contracts`,
+  `${pkg.name}/contracts/kbs`,
+  `${pkg.name}/contracts/documents`,
+  `${pkg.name}/contracts/events`,
   `${pkg.name}/pairing`,
   `${pkg.name}/pairing-wire`,
   `${pkg.name}/pairing-csr`,
@@ -50,6 +54,16 @@ const ENTRY_POINTS = [
 const MUST_EXPORT = {
   [pkg.name]: ["SearchClient", "SearchApiError", "pairWithSearch", "SEARCH_PROTOCOL_VERSION"],
   [`${pkg.name}/client`]: ["SearchClient"],
+  [`${pkg.name}/contracts`]: [
+    "QueryRequestSchema",
+    "DocumentSchema",
+    "SearchEventSchema",
+    "SEARCH_ERROR_CODES",
+    "SEARCH_FEATURES",
+  ],
+  [`${pkg.name}/contracts/kbs`]: ["KnowledgeBaseSchema", "QueryResponseSchema"],
+  [`${pkg.name}/contracts/documents`]: ["IngestJsonRequestSchema", "ChunkSchema"],
+  [`${pkg.name}/contracts/events`]: ["SEARCH_EVENT_NAMES", "SEARCH_SIGNATURE_HEADER"],
   [`${pkg.name}/pairing`]: ["pairWithSearch", "SearchPairingError"],
   [`${pkg.name}/pairing-wire`]: ["SEARCH_PAIRING_REDEEM_PATH"],
   [`${pkg.name}/pairing-csr`]: ["generateClientCsr"],

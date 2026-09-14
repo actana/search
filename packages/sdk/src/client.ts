@@ -19,6 +19,7 @@
 // to reach the connection pool somehow. Naming the dependency is the honest
 // version of the same thing.
 
+import { randomBytes } from "node:crypto";
 import { Agent, request as undiciRequest } from "undici";
 import type { Dispatcher } from "undici";
 import { SearchApiError } from "./errors.ts";
@@ -27,6 +28,63 @@ import {
   type SearchRegistrationBlob,
 } from "./registration-blob.ts";
 import type { SearchHealth, SearchPairStatus } from "./pairing-wire.ts";
+import type {
+  AttachChunkKeywordRequest,
+  Capabilities,
+  Chunk,
+  ChunkKeywordResponse,
+  ClusteringStatus,
+  CreateKbRequest,
+  DeleteChunkResponse,
+  DeleteDocumentResponse,
+  DeleteKbResponse,
+  DeleteKeywordResponse,
+  DeleteTagDefinitionResponse,
+  DeleteWebhookResponse,
+  ExtractKeywordsRequest,
+  ExtractKeywordsResponse,
+  GetEndpointsResponse,
+  GetWebhookResponse,
+  IncludeDocumentRequest,
+  IncludeDocumentResponse,
+  IngestJsonRequest,
+  IngestResponse,
+  Keyword,
+  KnowledgeBase,
+  ListChunksQuery,
+  ListChunksResponse,
+  ListClustersQuery,
+  ListClustersResponse,
+  ListDocumentsQuery,
+  ListDocumentsResponse,
+  ListKbsQuery,
+  ListKbsResponse,
+  ListKeywordsQuery,
+  ListKeywordsResponse,
+  ListTagDefinitionsResponse,
+  NextAvailableSlotQuery,
+  NextAvailableSlotResponse,
+  PutEndpointsRequest,
+  PutEndpointsResponse,
+  PutKeywordRequest,
+  PutTagDefinitionsRequest,
+  PutTagDefinitionsResponse,
+  PutWebhookRequest,
+  QueryRequest,
+  QueryResponse,
+  ReclusterResponse,
+  SearchDocument,
+  SearchEvent,
+  TagDefinition,
+  TagUsage,
+  TagUsageResponse,
+  UpdateChunkRequest,
+  UpdateDocumentRequest,
+  UpdateKbRequest,
+  UpsertDocumentRequest,
+  UpsertDocumentResponse,
+} from "./contracts.ts";
+
 
 /** What a request may carry. One of these, or nothing. */
 export type SearchRequestBody =
@@ -53,16 +111,6 @@ export type SearchClientOptions = {
 
 /** The default per-request timeout. Ingest passes its own. */
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
-
-/** A namespace TASK-004 fills. Every member throws until it does. */
-function pending(namespace: string, method: string): never {
-  throw new SearchApiError(
-    "not-implemented",
-    0,
-    `${namespace}.${method}() lands with the REST surface in TASK-004. ` +
-      "Use client.request() against the route in the meantime.",
-  );
-}
 
 export class SearchClient {
   /** `https://host:port`. No path, no trailing slash. */
@@ -165,8 +213,21 @@ export class SearchClient {
       headers["content-type"] = "application/json";
       body = JSON.stringify(options.json);
     } else if (options.multipart) {
-      // `undici` sets the multipart boundary itself from a `FormData`.
-      body = options.multipart as unknown as Dispatcher.RequestOptions["body"];
+      /**
+       * Encoded here rather than handed over as a `FormData`.
+       *
+       * `undici.request` — the dispatch-level API this client uses, because it
+       * is the one that takes a `dispatcher` and therefore the one mTLS
+       * material can reach — does **not** accept a `FormData` body. Only
+       * `fetch` does, and `fetch` has no typed per-request dispatcher. Passing
+       * one anyway sends a request with no body at all, which the far side
+       * eventually answers `408` on: a failure mode with no error in it.
+       *
+       * So the envelope is written out here, and the boundary is ours.
+       */
+      const encoded = await encodeMultipart(options.multipart);
+      headers["content-type"] = encoded.contentType;
+      body = encoded.body;
     } else if (options.stream) {
       headers["content-type"] = options.contentType ?? "application/octet-stream";
       body = options.stream as unknown as Dispatcher.RequestOptions["body"];
@@ -219,13 +280,8 @@ export class SearchClient {
   }
 
   /** `GET /v1/capabilities`. What this instance's build can do. */
-  capabilities(): Promise<{
-    protocol: number;
-    schemaVersion: number;
-    features: string[];
-    publicHost: string;
-  }> {
-    return this.request("GET", "/v1/capabilities");
+  capabilities(): Promise<Capabilities> {
+    return this.request<Capabilities>("GET", "/v1/capabilities");
   }
 
   /** `GET /v1/pair/status`. Who this certificate is, and what it was granted. */
@@ -233,70 +289,469 @@ export class SearchClient {
     return this.request<SearchPairStatus>("GET", "/v1/pair/status");
   }
 
-  // ── The namespaces TASK-004 fills ──────────────────────────────────────────
+  // ── The namespaces ────────────────────────────────────────────────────────
   //
-  // Declared now so the client's shape is one decision. Each throws
-  // `not-implemented` until the route behind it exists.
+  // Every signature below is `z.infer`red from `@actana/search/contracts`,
+  // which is the same object the instance validates the request with (ADR
+  // 0009). A field this client can send is a field that route accepts, by
+  // construction rather than by review.
 
   readonly kbs = {
-    list: () => pending("kbs", "list"),
-    create: (_input: unknown) => pending("kbs", "create"),
-    get: (_id: string) => pending("kbs", "get"),
-    update: (_id: string, _patch: unknown) => pending("kbs", "update"),
-    delete: (_id: string) => pending("kbs", "delete"),
-    query: (_id: string, _input: unknown) => pending("kbs", "query"),
-    ingest: (_id: string, _input: unknown) => pending("kbs", "ingest"),
+    /** `GET /v1/kbs`. */
+    list: async (query: ListKbsQuery = {}): Promise<KnowledgeBase[]> => {
+      const answer = await this.request<ListKbsResponse>("GET", "/v1/kbs", {
+        query: { ...(query.scope === undefined ? {} : { scope: query.scope }) },
+      });
+      return answer.knowledgeBases;
+    },
+
+    /** `POST /v1/kbs`. */
+    create: (input: CreateKbRequest): Promise<KnowledgeBase> =>
+      this.request<KnowledgeBase>("POST", "/v1/kbs", { json: input }),
+
+    /** `GET /v1/kbs/:id`. 404 for a KB that is not this client's (ADR 0009). */
+    get: (kbId: string): Promise<KnowledgeBase> =>
+      this.request<KnowledgeBase>("GET", `/v1/kbs/${encodeURIComponent(kbId)}`),
+
+    /** `PATCH /v1/kbs/:id`. */
+    update: (kbId: string, patch: UpdateKbRequest): Promise<KnowledgeBase> =>
+      this.request<KnowledgeBase>("PATCH", `/v1/kbs/${encodeURIComponent(kbId)}`, { json: patch }),
+
+    /** `DELETE /v1/kbs/:id`. A soft delete: the KB becomes archived. */
+    delete: (kbId: string): Promise<DeleteKbResponse> =>
+      this.request<DeleteKbResponse>("DELETE", `/v1/kbs/${encodeURIComponent(kbId)}`),
+
+    /**
+     * `POST /v1/kbs/:id/query`.
+     *
+     * The return type follows `mode`: the default is the hybrid rank, and
+     * `mode: "v1-tags"` is the pre-v2 tag-filter-then-vector path. Both are
+     * served; neither is a reimplementation of the other.
+     */
+    query: (kbId: string, input: QueryRequest): Promise<QueryResponse> =>
+      this.request<QueryResponse>("POST", `/v1/kbs/${encodeURIComponent(kbId)}/query`, {
+        json: input,
+      }),
+
+    /**
+     * `POST /v1/kbs/:id/documents` — the ingest.
+     *
+     * Three shapes, and they are three different pipelines rather than three
+     * spellings of one: `{ file }` uploads bytes as `multipart/form-data` and
+     * runs the resumable worker flow over them, `{ url }` has the instance
+     * fetch them and do the same, and `{ text }` takes the `ingestDocument`
+     * path. Asynchronous in all three: what comes back is a document id and a
+     * status to poll, or to wait for on {@link SearchClient.events}.
+     */
+    ingest: (kbId: string, input: IngestInput): Promise<IngestResponse> => {
+      const path = `/v1/kbs/${encodeURIComponent(kbId)}/documents`;
+      if ("file" in input) {
+        return this.request<IngestResponse>("POST", path, {
+          multipart: ingestFormData(input),
+        });
+      }
+      return this.request<IngestResponse>("POST", path, { json: input });
+    },
   };
 
   readonly documents = {
-    list: (_kbId: string) => pending("documents", "list"),
-    get: (_kbId: string, _docId: string) => pending("documents", "get"),
-    update: (_kbId: string, _docId: string, _patch: unknown) => pending("documents", "update"),
-    delete: (_kbId: string, _docId: string) => pending("documents", "delete"),
-    chunks: (_kbId: string, _docId: string) => pending("documents", "chunks"),
-    updateChunk: (_kbId: string, _docId: string, _chunkId: string, _patch: unknown) =>
-      pending("documents", "updateChunk"),
-    deleteChunk: (_kbId: string, _docId: string, _chunkId: string) =>
-      pending("documents", "deleteChunk"),
-    include: (_kbId: string, _docId: string, _input: unknown) => pending("documents", "include"),
-    upsert: (_kbId: string, _input: unknown) => pending("documents", "upsert"),
+    /** `GET /v1/kbs/:id/documents`. */
+    list: (kbId: string, query: ListDocumentsQuery = {}): Promise<ListDocumentsResponse> =>
+      this.request<ListDocumentsResponse>(
+        "GET",
+        `/v1/kbs/${encodeURIComponent(kbId)}/documents`,
+        { query: query as Record<string, string | number | boolean | undefined> },
+      ),
+
+    /** `GET /v1/kbs/:id/documents/:docId`. Poll this for `processingStatus`. */
+    get: (kbId: string, documentId: string): Promise<SearchDocument> =>
+      this.request<SearchDocument>("GET", documentPath(kbId, documentId)),
+
+    /** `PATCH /v1/kbs/:id/documents/:docId`. */
+    update: (
+      kbId: string,
+      documentId: string,
+      patch: UpdateDocumentRequest,
+    ): Promise<SearchDocument> =>
+      this.request<SearchDocument>("PATCH", documentPath(kbId, documentId), { json: patch }),
+
+    /** `DELETE /v1/kbs/:id/documents/:docId`. */
+    delete: (kbId: string, documentId: string): Promise<DeleteDocumentResponse> =>
+      this.request<DeleteDocumentResponse>("DELETE", documentPath(kbId, documentId)),
+
+    /** `GET …/documents/:docId/chunks`. */
+    chunks: (
+      kbId: string,
+      documentId: string,
+      query: ListChunksQuery = {},
+    ): Promise<ListChunksResponse> =>
+      this.request<ListChunksResponse>("GET", `${documentPath(kbId, documentId)}/chunks`, {
+        query: query as Record<string, string | number | boolean | undefined>,
+      }),
+
+    /** `PATCH …/chunks/:chunkId`. Changing `content` re-embeds the chunk. */
+    updateChunk: (
+      kbId: string,
+      documentId: string,
+      chunkId: string,
+      patch: UpdateChunkRequest,
+    ): Promise<Chunk> =>
+      this.request<Chunk>(
+        "PATCH",
+        `${documentPath(kbId, documentId)}/chunks/${encodeURIComponent(chunkId)}`,
+        { json: patch },
+      ),
+
+    /** `DELETE …/chunks/:chunkId`. */
+    deleteChunk: (
+      kbId: string,
+      documentId: string,
+      chunkId: string,
+    ): Promise<DeleteChunkResponse> =>
+      this.request<DeleteChunkResponse>(
+        "DELETE",
+        `${documentPath(kbId, documentId)}/chunks/${encodeURIComponent(chunkId)}`,
+      ),
+
+    /** `POST …/documents/:docId/include` — the searchable-or-not toggle. */
+    include: (
+      kbId: string,
+      documentId: string,
+      input: IncludeDocumentRequest,
+    ): Promise<IncludeDocumentResponse> =>
+      this.request<IncludeDocumentResponse>(
+        "POST",
+        `${documentPath(kbId, documentId)}/include`,
+        { json: input },
+      ),
+
+    /** `POST /v1/kbs/:id/documents/upsert` — replace-by-identity, or create. */
+    upsert: (kbId: string, input: UpsertDocumentRequest): Promise<UpsertDocumentResponse> =>
+      this.request<UpsertDocumentResponse>(
+        "POST",
+        `/v1/kbs/${encodeURIComponent(kbId)}/documents/upsert`,
+        { json: input },
+      ),
   };
 
   readonly keywords = {
-    list: (_kbId: string) => pending("keywords", "list"),
-    put: (_kbId: string, _input: unknown) => pending("keywords", "put"),
-    delete: (_kbId: string, _keywordId: string) => pending("keywords", "delete"),
-    extract: (_kbId: string, _input: unknown) => pending("keywords", "extract"),
+    /** `GET /v1/kbs/:id/keywords`. */
+    list: async (kbId: string, query: ListKeywordsQuery = {}): Promise<Keyword[]> => {
+      const answer = await this.request<ListKeywordsResponse>(
+        "GET",
+        `/v1/kbs/${encodeURIComponent(kbId)}/keywords`,
+        { query: query as Record<string, string | number | boolean | undefined> },
+      );
+      return answer.keywords;
+    },
+
+    /** `PUT /v1/kbs/:id/keywords`. Create, or return the canonical row. */
+    put: (kbId: string, input: PutKeywordRequest): Promise<Keyword> =>
+      this.request<Keyword>("PUT", `/v1/kbs/${encodeURIComponent(kbId)}/keywords`, {
+        json: input,
+      }),
+
+    /** `DELETE /v1/kbs/:id/keywords/:keywordId`. */
+    delete: (kbId: string, keywordId: string): Promise<DeleteKeywordResponse> =>
+      this.request<DeleteKeywordResponse>(
+        "DELETE",
+        `/v1/kbs/${encodeURIComponent(kbId)}/keywords/${encodeURIComponent(keywordId)}`,
+      ),
+
+    /** `POST /v1/kbs/:id/extract-keywords`. Enqueues; does not extract. */
+    extract: (kbId: string, input: ExtractKeywordsRequest): Promise<ExtractKeywordsResponse> =>
+      this.request<ExtractKeywordsResponse>(
+        "POST",
+        `/v1/kbs/${encodeURIComponent(kbId)}/extract-keywords`,
+        { json: input },
+      ),
+
+    /** `PUT …/chunks/:chunkId/keywords` — attach one keyword by hand. */
+    attachToChunk: (
+      kbId: string,
+      documentId: string,
+      chunkId: string,
+      input: AttachChunkKeywordRequest,
+    ): Promise<ChunkKeywordResponse> =>
+      this.request<ChunkKeywordResponse>(
+        "PUT",
+        `${documentPath(kbId, documentId)}/chunks/${encodeURIComponent(chunkId)}/keywords`,
+        { json: input },
+      ),
+
+    /** `DELETE …/chunks/:chunkId/keywords/:keywordId`. */
+    detachFromChunk: (
+      kbId: string,
+      documentId: string,
+      chunkId: string,
+      keywordId: string,
+    ): Promise<{ id: string; deleted: true }> =>
+      this.request(
+        "DELETE",
+        `${documentPath(kbId, documentId)}/chunks/${encodeURIComponent(chunkId)}` +
+          `/keywords/${encodeURIComponent(keywordId)}`,
+      ),
   };
 
   readonly clusters = {
-    list: (_kbId: string) => pending("clusters", "list"),
-    status: (_kbId: string) => pending("clusters", "status"),
-    recluster: (_kbId: string) => pending("clusters", "recluster"),
+    /** `GET /v1/kbs/:id/clusters`. Centroids only when asked for. */
+    list: (kbId: string, query: ListClustersQuery = {}): Promise<ListClustersResponse> =>
+      this.request<ListClustersResponse>("GET", `/v1/kbs/${encodeURIComponent(kbId)}/clusters`, {
+        query: query as Record<string, string | number | boolean | undefined>,
+      }),
+
+    /** `GET /v1/kbs/:id/clustering-status`. */
+    status: (kbId: string): Promise<ClusteringStatus> =>
+      this.request<ClusteringStatus>(
+        "GET",
+        `/v1/kbs/${encodeURIComponent(kbId)}/clustering-status`,
+      ),
+
+    /** `POST /v1/kbs/:id/recluster`. Enqueues a fit. */
+    recluster: (kbId: string): Promise<ReclusterResponse> =>
+      this.request<ReclusterResponse>(
+        "POST",
+        `/v1/kbs/${encodeURIComponent(kbId)}/recluster`,
+      ),
   };
 
   readonly tags = {
-    definitions: (_kbId: string) => pending("tags", "definitions"),
-    put: (_kbId: string, _input: unknown) => pending("tags", "put"),
-    delete: (_kbId: string, _tagId: string) => pending("tags", "delete"),
-    usage: (_kbId: string) => pending("tags", "usage"),
-    nextAvailableSlot: (_kbId: string) => pending("tags", "nextAvailableSlot"),
+    /** `GET /v1/kbs/:id/tag-definitions`. */
+    definitions: async (kbId: string): Promise<TagDefinition[]> => {
+      const answer = await this.request<ListTagDefinitionsResponse>(
+        "GET",
+        `/v1/kbs/${encodeURIComponent(kbId)}/tag-definitions`,
+      );
+      return answer.definitions;
+    },
+
+    /** `PUT /v1/kbs/:id/tag-definitions` — the bulk create-or-rename. */
+    put: (
+      kbId: string,
+      input: PutTagDefinitionsRequest,
+    ): Promise<PutTagDefinitionsResponse> =>
+      this.request<PutTagDefinitionsResponse>(
+        "PUT",
+        `/v1/kbs/${encodeURIComponent(kbId)}/tag-definitions`,
+        { json: input },
+      ),
+
+    /** `DELETE /v1/kbs/:id/tag-definitions/:tagId`. */
+    delete: (kbId: string, tagId: string): Promise<DeleteTagDefinitionResponse> =>
+      this.request<DeleteTagDefinitionResponse>(
+        "DELETE",
+        `/v1/kbs/${encodeURIComponent(kbId)}/tag-definitions/${encodeURIComponent(tagId)}`,
+      ),
+
+    /** `GET /v1/kbs/:id/tag-usage`. */
+    usage: async (kbId: string): Promise<TagUsage[]> => {
+      const answer = await this.request<TagUsageResponse>(
+        "GET",
+        `/v1/kbs/${encodeURIComponent(kbId)}/tag-usage`,
+      );
+      return answer.usage;
+    },
+
+    /** `GET /v1/kbs/:id/next-available-slot?fieldType=…`. `null` when full. */
+    nextAvailableSlot: (
+      kbId: string,
+      fieldType: NextAvailableSlotQuery["fieldType"],
+    ): Promise<NextAvailableSlotResponse> =>
+      this.request<NextAvailableSlotResponse>(
+        "GET",
+        `/v1/kbs/${encodeURIComponent(kbId)}/next-available-slot`,
+        { query: { fieldType } },
+      ),
   };
 
   readonly endpoints = {
-    get: () => pending("endpoints", "get"),
-    put: (_input: unknown) => pending("endpoints", "put"),
+    /** `GET /v1/endpoints`. Never carries a key. */
+    get: (): Promise<GetEndpointsResponse> =>
+      this.request<GetEndpointsResponse>("GET", "/v1/endpoints"),
+
+    /** `PUT /v1/endpoints`. The push, keyed by each endpoint's `externalId`. */
+    put: (input: PutEndpointsRequest): Promise<PutEndpointsResponse> =>
+      this.request<PutEndpointsResponse>("PUT", "/v1/endpoints", { json: input }),
   };
 
   readonly webhooks = {
-    get: () => pending("webhooks", "get"),
-    put: (_input: unknown) => pending("webhooks", "put"),
+    /** `GET /v1/webhooks`. */
+    get: (): Promise<GetWebhookResponse> =>
+      this.request<GetWebhookResponse>("GET", "/v1/webhooks"),
+
+    /** `PUT /v1/webhooks`. Replaces the hook, ledger and all. */
+    put: (input: PutWebhookRequest): Promise<{ webhook: GetWebhookResponse["webhook"] }> =>
+      this.request("PUT", "/v1/webhooks", { json: input }),
+
+    /** `DELETE /v1/webhooks`. */
+    delete: (): Promise<DeleteWebhookResponse> =>
+      this.request<DeleteWebhookResponse>("DELETE", "/v1/webhooks"),
   };
 
-  /** `GET /v1/events` as an async iterator of SSE payloads. TASK-004. */
-  events(): AsyncIterable<unknown> {
-    return pending("events", "()");
+  /**
+   * `GET /v1/events` as an async iterator.
+   *
+   * Yields one {@link SearchEvent} per `event:`/`data:` frame and swallows the
+   * heartbeat comments, so a caller writes `for await (const event of
+   * search.events())` and sees only events. Break out of the loop, or abort the
+   * signal, to close the connection.
+   *
+   * In-process on the instance's side: a second Search instance's events do not
+   * arrive here. A delivery that has to survive a disconnect is a webhook.
+   */
+  async *events(options: { signal?: AbortSignal } = {}): AsyncGenerator<SearchEvent> {
+    const url = new URL("/v1/events", this.baseUrl);
+    const headers: Record<string, string> = { accept: "text/event-stream" };
+    if (this.insecureClientId) headers["x-paired-client"] = this.insecureClientId;
+
+    let response;
+    try {
+      response = await undiciRequest(url, {
+        method: "GET",
+        dispatcher: this.agent,
+        headers,
+        // An event stream is idle between events by definition, so the
+        // body timeout that protects an ordinary request is exactly wrong here.
+        headersTimeout: this.timeoutMs,
+        bodyTimeout: 0,
+        ...(options.signal ? { signal: options.signal } : {}),
+      });
+    } catch (err) {
+      throw new SearchApiError(
+        "unreachable",
+        0,
+        `GET /v1/events could not be opened: ${err instanceof Error ? err.message : String(err)}`,
+        undefined,
+        { cause: err },
+      );
+    }
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      const text = await response.body.text();
+      const failure = (safeJson(text) ?? {}) as { code?: unknown; message?: unknown };
+      throw new SearchApiError(
+        typeof failure.code === "string" ? failure.code : `http-${response.statusCode}`,
+        response.statusCode,
+        typeof failure.message === "string" ? failure.message : "the event stream was refused",
+      );
+    }
+
+    let buffered = "";
+    for await (const chunk of response.body) {
+      buffered += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+      let split = buffered.indexOf("\n\n");
+      while (split !== -1) {
+        const frame = buffered.slice(0, split);
+        buffered = buffered.slice(split + 2);
+        const event = parseSseFrame(frame);
+        if (event) yield event;
+        split = buffered.indexOf("\n\n");
+      }
+    }
   }
+}
+
+/** `/v1/kbs/:kbId/documents/:docId`, escaped. */
+function documentPath(kbId: string, documentId: string): string {
+  return `/v1/kbs/${encodeURIComponent(kbId)}/documents/${encodeURIComponent(documentId)}`;
+}
+
+/** What {@link SearchClient.kbs.ingest} takes: bytes, a URL, or text. */
+export type IngestInput =
+  | (Omit<IngestJsonRequest, "text" | "url"> & {
+      /** The bytes. A `Blob`, a `Buffer`, or any `Uint8Array`. */
+      file: Blob | Uint8Array;
+    })
+  | IngestJsonRequest;
+
+/**
+ * Build the multipart body for a file ingest.
+ *
+ * `FormData` and `Blob` are Node's own globals here (they are undici's, which
+ * is what this client dispatches through), so no polyfill and no dependency:
+ * undici sets the boundary and streams the parts itself.
+ */
+function ingestFormData(
+  input: Omit<IngestJsonRequest, "text" | "url"> & { file: Blob | Uint8Array },
+): FormData {
+  const form = new FormData();
+  const blob =
+    input.file instanceof Blob
+      ? input.file
+      : new Blob([new Uint8Array(input.file)], {
+          type: input.mimeType ?? "application/octet-stream",
+        });
+  form.append("file", blob, input.filename);
+  form.append("filename", input.filename);
+  if (input.mimeType !== undefined) form.append("mimeType", input.mimeType);
+  if (input.metadata !== undefined) form.append("metadata", JSON.stringify(input.metadata));
+  if (input.includedInKb !== undefined) form.append("includedInKb", String(input.includedInKb));
+  for (const [slot, value] of Object.entries(input.tags ?? {})) {
+    if (value !== undefined) form.append(slot, String(value));
+  }
+  return form;
+}
+
+/**
+ * One SSE frame into an event, or `null` for a comment.
+ *
+ * Only `data:` is read: the `event:` line repeats what is inside the payload,
+ * and trusting the payload means one definition of the event rather than two
+ * that can disagree.
+ */
+function parseSseFrame(frame: string): SearchEvent | null {
+  const data = frame
+    .split("\n")
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trimStart())
+    .join("\n");
+  if (data === "") return null;
+  try {
+    return JSON.parse(data) as SearchEvent;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A `FormData` as the bytes of a `multipart/form-data` body.
+ *
+ * Deliberately small: the parts this surface sends are a file and a handful of
+ * short strings. Every part is written with `content-disposition`, a file part
+ * carries its `content-type`, and the boundary is random per request so it
+ * cannot appear in the content by coincidence.
+ */
+async function encodeMultipart(form: FormData): Promise<{ contentType: string; body: Buffer }> {
+  const boundary = `----actana-search-${randomBytes(16).toString("hex")}`;
+  const parts: Buffer[] = [];
+  for (const [name, value] of form.entries()) {
+    parts.push(Buffer.from(`--${boundary}\r\n`));
+    if (typeof value === "string") {
+      parts.push(
+        Buffer.from(`content-disposition: form-data; name="${escapeQuotes(name)}"\r\n\r\n`),
+      );
+      parts.push(Buffer.from(value, "utf8"));
+    } else {
+      const filename = escapeQuotes(value.name ?? name);
+      parts.push(
+        Buffer.from(
+          `content-disposition: form-data; name="${escapeQuotes(name)}"; filename="${filename}"\r\n` +
+            `content-type: ${value.type || "application/octet-stream"}\r\n\r\n`,
+        ),
+      );
+      parts.push(Buffer.from(await value.arrayBuffer()));
+    }
+    parts.push(Buffer.from("\r\n"));
+  }
+  parts.push(Buffer.from(`--${boundary}--\r\n`));
+  return {
+    contentType: `multipart/form-data; boundary=${boundary}`,
+    body: Buffer.concat(parts),
+  };
+}
+
+/** A quote inside a part name would end the quoted string early. */
+function escapeQuotes(value: string): string {
+  return value.replace(/"/g, "%22").replace(/[\r\n]/g, "");
 }
 
 function safeJson(text: string): unknown {
