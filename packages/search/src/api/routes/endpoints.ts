@@ -143,14 +143,21 @@ export async function applyEndpointDeclaration(
      * not a sequence, so the answer cannot depend on the order the client
      * happened to serialise it in.
      *
-     * The two halves are Search's ids for the endpoints this client already
-     * has, and the `externalId`s this body declares — which is the id a client
-     * pushing its own catalog has for a sibling it is declaring in the same
-     * breath. Neither can name another client's endpoint, which is the hole
-     * this check exists to close; what a link *resolves* to at use time is
-     * still `resolveEndpointApiKey`'s business, and it follows Search's id.
+     * The halves are Search's ids for the endpoints this client already has,
+     * *their* `externalId`s, and the `externalId`s this body declares — the
+     * last being the id a client pushing its own catalog has for a sibling it
+     * is declaring in the same breath. None of them can name another client's
+     * endpoint, which is the hole this check exists to close.
+     *
+     * What a link resolves to at use time is `resolveEndpointApiKey`'s
+     * business and it follows **Search's** id, so every accepted `externalId`
+     * is rewritten to one by {@link translateApiKeyLinks} before this
+     * transaction commits. Accepting a spelling and storing it unresolved was
+     * a `200` that failed on the first embed.
      */
-    const linkable = new Set((await listEndpoints(clientId, tx)).map((e) => e.id));
+    const existing = await listEndpoints(clientId, tx);
+    const linkable = new Set(existing.map((e) => e.id));
+    for (const row of existing) if (row.externalId !== null) linkable.add(row.externalId);
     for (const declared of body.endpoints) linkable.add(declared.externalId);
 
     const written: Array<{ id: string; externalId: string }> = [];
@@ -181,6 +188,8 @@ export async function applyEndpointDeclaration(
     if (mirrored.length > 0) {
       written.push(...(await asBadRequest(() => upsertMirroredEndpoints(clientId, mirrored, tx))));
     }
+
+    await translateApiKeyLinks(clientId, body.endpoints, written, existing, tx);
 
     await removeUndeclared(
       clientId,
@@ -222,6 +231,65 @@ async function asBadRequest<T>(run: () => Promise<T>): Promise<T> {
     // siblings — is left exactly as it is.
     if (err instanceof Error && "status" in err) throw err;
     throw badRequest(err instanceof Error ? err.message : "that endpoint cannot be registered");
+  }
+}
+
+/**
+ * Rewrite every accepted `config.apiKeyEndpointId` to **Search's** id for the
+ * endpoint it names, in the same transaction that wrote the rows.
+ *
+ * A client declares its catalog in its own ids, so the natural thing to write
+ * in a link is a sibling's `externalId` — and the check above accepts one,
+ * because a body is allowed to key an endpoint on another the same body
+ * declares. But the value was then stored exactly as it arrived, and nothing
+ * downstream reads it that way: `resolveEndpointApiKey` selects
+ * `modelEndpoint.id`, and `createLocalEndpoint` mints that id from
+ * `generateId()` with no relation to the `externalId` beside it. So the
+ * borrower was written with a link that leads nowhere — listed `hasKey: false`,
+ * resolving to the empty string through the deleted-link fall-back, and
+ * failing on the first embed with a provider rejecting an empty bearer. A
+ * `200` whose consequence arrives minutes later in a job is the worst shape a
+ * refusal can take, and this is the request that could have fixed it.
+ *
+ * **Both spellings are accepted for either kind of target** — a sibling in
+ * this body or an endpoint the client already has — so a client does not have
+ * to know which of its links Search has already assigned an id to. A value
+ * that is already one of this client's Search ids is left alone, which is what
+ * makes the translation idempotent under the re-push `PUT` is built around: a
+ * client that reads `GET /v1/endpoints` and pushes it back is pushing Search's
+ * ids, and they must not be re-resolved as somebody's `externalId`.
+ *
+ * An id wins over an `externalId` when one string is somehow both. That is not
+ * a case worth a refusal — the ids are generated and an `externalId` is the
+ * client's own — and the precedence has to be *some* documented order.
+ */
+async function translateApiKeyLinks(
+  clientId: string,
+  declarations: EndpointDeclaration[],
+  written: Array<{ id: string; externalId: string }>,
+  existing: EndpointSummary[],
+  executor: SearchExecutor,
+): Promise<void> {
+  const searchIds = new Set([...existing.map((row) => row.id), ...written.map((row) => row.id)]);
+  // The body's rows last, so a re-declared `externalId` resolves to the row
+  // this request just wrote rather than to whatever held the spelling before.
+  const searchIdOf = new Map<string, string>();
+  for (const row of existing) {
+    if (row.externalId !== null) searchIdOf.set(row.externalId, row.id);
+  }
+  for (const row of written) searchIdOf.set(row.externalId, row.id);
+  const rowIdOf = new Map(written.map((row) => [row.externalId, row.id]));
+
+  for (const declared of declarations) {
+    const linkedId = readApiKeyEndpointId(declared.config);
+    if (linkedId === null || searchIds.has(linkedId)) continue;
+    const target = searchIdOf.get(linkedId);
+    const rowId = rowIdOf.get(declared.externalId);
+    if (target === undefined || target === linkedId || rowId === undefined) continue;
+    await executor
+      .update(modelEndpoint)
+      .set({ config: { ...declared.config, apiKeyEndpointId: target } })
+      .where(and(eq(modelEndpoint.pairedClientId, clientId), eq(modelEndpoint.id, rowId)));
   }
 }
 
