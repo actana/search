@@ -231,8 +231,16 @@ export function probeApi() {
  * A test that imports the module gets the helpers and no exit; the probe's real
  * behaviour is asserted by spawning this file, because a guard that silently
  * stopped matching would be a health check that always passes.
+ *
+ * **And it is `undefined` below Node 24.2**, where the property does not exist
+ * — so on an older runtime than this repo's floor the guard was simply false,
+ * the probe never ran, and `node healthcheck.mjs` exited 0 without opening a
+ * socket: a health check that passes for a container that is not listening,
+ * which is the worst answer of the three. `process.argv[1]` compared against
+ * this file is the same question asked the way every Node version can answer
+ * it, and `??` keeps `import.meta.main` as the primary where it exists.
  */
-if (import.meta.main) {
+if (import.meta.main ?? process.argv[1] === import.meta.filename) {
   if (isWorkerRole(process.env.SEARCH_ROLE)) probeRedis();
   else probeApi();
 }

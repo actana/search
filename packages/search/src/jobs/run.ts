@@ -35,7 +35,6 @@ import type { SearchEvent } from "@actana/search/contracts";
 import { db } from "../db/client.ts";
 import { document, knowledgeBase } from "../db/schema.ts";
 import { publishSearchEvent, searchEventId } from "../events/publish.ts";
-import { prepareIngestDocument } from "./ingest-idempotency.ts";
 
 const logger = createLogger("jobs/run");
 
@@ -162,13 +161,22 @@ const JOB_HANDLERS: Record<string, JobHandlerEntry> = {
      * the signal yet — `ingestDocument`'s parameters are frozen (ADR 0005) —
      * so today the budget is the bound the transport reasons with rather than
      * one the work honours, and the safety against an over-running attempt is
-     * {@link prepareIngestDocument} below.
+     * `prepareIngestDocument` below and the engine's own replace-before-insert.
      */
     budgetMs: async (payload) =>
       (await import("../knowledge/documents/service.ts")).computeProcessingTimeoutMs(
         typeof payload.text === "string" ? Buffer.byteLength(payload.text, "utf8") : 0,
       ),
-    prepare: (payload) => prepareIngestDocument(payload),
+    /**
+     * Loaded on demand, like every `load` above it. A static import here
+     * closed a cycle — `ingest-idempotency.ts` reads `documentRow` off this
+     * module — and a cycle between a dispatch table and the module it
+     * dispatches to resolves in whichever order the first importer happens
+     * to produce, which is not a thing to leave to chance for the table
+     * every job goes through.
+     */
+    prepare: async (payload) =>
+      (await import("./ingest-idempotency.ts")).prepareIngestDocument(payload),
   },
   "kb-keywords-extract": {
     load: async () => (await import("../kb/jobs/keywords-extract.ts")).handleKeywordsExtract,
@@ -356,13 +364,24 @@ export function resetAnnouncedEvents(): void {
  * A client that re-included a document was told nothing, and the row said
  * `completed` with no event to explain when.
  *
- * `processingStartedAt` is the generation, because it is stamped once per run
- * and not once per attempt: every path that starts a document over writes it
- * (`knowledge/documents/service.ts`, `embed-pipeline.ts`), and nothing writes
- * it between the attempts of one job. That is exactly the line the dedupe
- * wants — five attempts of one ingest are one event, two includes are two —
- * where `processingCompletedAt` moves on every attempt and would have made the
- * dedupe a no-op.
+ * `processingStartedAt` is the generation, because it moves when a document is
+ * *started over* — every path that re-runs one writes it
+ * (`knowledge/documents/service.ts`, `embed-pipeline.ts`) — and so two includes
+ * are two events, where `processingCompletedAt` moves every time an attempt
+ * records a terminal state, including the attempts that are not the end of the
+ * story, and is therefore no name for a run at all.
+ *
+ * **It is not stamped once per job on every path, and does not have to be.**
+ * `kb.ingest.document`'s row is staged once — `stageIngestedDocument` upserts
+ * with `onConflictDoNothing` — so every attempt of one ingest reads the same
+ * stamp. `knowledge-process-document` re-stamps it at the top of *each* attempt
+ * (`embed-pipeline.ts`), so attempt three of a plan carries a different
+ * generation from attempt one. That costs the dedupe nothing, because at most
+ * one attempt of a job ever announces: a `document.failed` an attempt wrote is
+ * held back while the dispatch threw and attempts remain (ADR 0010 D4), and a
+ * `completed` row is reached once. And the thing an id is for — two workers
+ * noticing the same finished document — is unaffected either way, because both
+ * read the one stamp on the row.
  *
  * It falls back to `processingCompletedAt` for a row that has no start stamp (a
  * document that was never included and then failed), and to the status alone

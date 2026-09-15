@@ -148,11 +148,23 @@ twice. `POST /v1/kbs/:id/documents/:docId/include` re-runs the pipeline over a
 document that has already ingested, and the second `document.ingested` carried
 the *first one's* id: dropped in-process by the announced-id set, and dropped in
 the ledger by that same unique index, permanently. So the digest includes the
-row's `processing_started_at`, which is stamped once per run and never between
-the attempts of one job. That is exactly the line the dedupe wants — five
-attempts of one ingest are one event, two includes are two — where
-`processing_completed_at` moves on every attempt and would have made the dedupe
-a no-op instead.
+row's `processing_started_at`, which moves when a document is started over —
+which is what makes two includes two events — where
+`processing_completed_at` moves every time an attempt records a terminal state,
+including the attempts that are not the end of the story, and is therefore no
+name for a run at all.
+
+**The stamp is per run on one path and per attempt on the other, and the dedupe
+survives both.** `kb.ingest.document` stages its document row once
+(`onConflictDoNothing`), so every attempt of one ingest reads the same stamp;
+`knowledge-process-document` re-stamps `processing_started_at` at the top of
+each attempt (`embed-pipeline.ts`), so attempt three of a plan carries a
+different generation from attempt one. Nothing is lost, because at most one
+attempt of a job ever announces: a `document.failed` an attempt wrote is held
+back while the dispatch threw and attempts remain (D9 below, ADR 0010 D4), and
+a document reaches `completed` once. The property the id exists for — two
+workers noticing the same finished document producing one event — holds
+whichever path wrote the stamp, because both read the one row.
 
 **D8b — The signature is over the raw body.** `x-search-signature:
 sha256=<hex>`, an HMAC-SHA256 over the exact bytes sent, keyed by the webhook's

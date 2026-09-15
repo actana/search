@@ -739,6 +739,68 @@ describeDb('the endpoint registry', () => {
       expect(await registry.listEndpoints(LINKER)).toEqual([])
     })
 
+    /**
+     * The same check, order-independent (the fix round's NIT #1).
+     *
+     * The linkable set used to be grown *as* the write loop created rows, so a
+     * body whose first endpoint was keyed on its second was refused and the
+     * same body in the other order was accepted — a declaration answered by
+     * the order the client happened to serialise it in. Both halves are now
+     * collected before the first row is written, and the endpoint below names
+     * a sibling that comes *after* it in the body.
+     */
+    it('accepts a link to an endpoint the same body declares later', async () => {
+      const { applyEndpointDeclaration } = await import('../api/routes/endpoints.ts')
+      const written = await applyEndpointDeclaration(LINKER, {
+        source: { kind: 'local' },
+        endpoints: [
+          {
+            externalId: 'the-borrower',
+            kind: 'inference',
+            provider: 'openai',
+            model: 'gpt-4o-mini',
+            label: 'keyed on the one below it',
+            config: { apiKeyEndpointId: 'the-keyholder' },
+          },
+          {
+            externalId: 'the-keyholder',
+            kind: 'embedding',
+            provider: 'openai',
+            template: 'openai',
+            model: 'text-embedding-3-small',
+            dimensions: 1536,
+            label: 'the key this client does own',
+            apiKey: 'sk-mine-and-declared-here-0123456789',
+          },
+        ],
+      })
+      expect(written.map((row) => row.externalId).sort()).toEqual([
+        'the-borrower',
+        'the-keyholder',
+      ])
+
+      // And a link to an id that is neither owned nor declared is still refused.
+      await expect(
+        applyEndpointDeclaration(LINKER, {
+          source: { kind: 'local' },
+          endpoints: [
+            {
+              externalId: 'the-borrower',
+              kind: 'inference',
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              label: 'keyed on nothing at all',
+              config: { apiKeyEndpointId: `${foreignEndpointId}` },
+            },
+          ],
+        }),
+      ).rejects.toThrow(/not one of your endpoints/)
+
+      // This client's catalog is a fixture the tests around it count, so this
+      // one hands it back the way it found it.
+      await db.delete(modelEndpoint).where(eq(modelEndpoint.pairedClientId, LINKER))
+    })
+
     it('refuses to resolve one that was planted underneath the route', async () => {
       // The row as it would exist if it had been written before this check
       // existed — or by anything other than the route.

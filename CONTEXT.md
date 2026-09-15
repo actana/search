@@ -184,8 +184,10 @@ inventing language the project does not use, or there is a real gap to record.
   that wrote it threw and the queue still has attempts for it — a Document the
   engine marked `failed` on a retryable attempt is not news — but never once the
   job has *finished*, whatever the attempt count says. The id carries the
-  processing run, so the attempts of one job are one Event and a re-included
-  Document is a new one.
+  processing run the announcement read, so a re-included Document is a new
+  Event — and because at most one attempt of a job ever announces, the attempts
+  of one job are at most one Event, including on the pipeline that re-stamps
+  the run at the top of every attempt.
 
 **Webhook**
 : A URL a paired client asked to be told at. A delivery is signed

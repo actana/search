@@ -22,9 +22,18 @@
  */
 
 import { db } from '../db/client.ts'
-import { document, kbCluster, knowledgeBase } from '../db/schema.ts'
+// lifted: additive guard, no result change (TASK-005 merge review) — the three
+// names below are what the replace-before-insert guard in the chunk
+// transaction reads and writes. Nothing else in this file uses them.
+import {
+  document,
+  embeddingKeyword,
+  kbCluster,
+  kbKeyword,
+  knowledgeBase,
+} from '../db/schema.ts'
 import { createLogger } from '@actana/search-shared/log'
-import { eq, sql } from 'drizzle-orm'
+import { eq, inArray, sql } from 'drizzle-orm'
 import { JsonYamlChunker } from '@actana/search-shared/chunkers/json-yaml-chunker'
 import { RecursiveChunker } from '@actana/search-shared/chunkers/recursive-chunker'
 import { TextChunker } from '@actana/search-shared/chunkers/text-chunker'
@@ -374,6 +383,72 @@ export async function ingestDocument(args: IngestDocumentArgs): Promise<IngestDo
     })
 
     await db.transaction(async (tx) => {
+      /**
+       * lifted: additive guard, no result change (TASK-005 merge review).
+       *
+       * Two runs of one ingest can be inside this transaction for the same
+       * document at once — an attempt whose worker lost its BullMQ lock is
+       * re-queued while the first attempt is still chunking and embedding — and
+       * the insert below has no `(document_id, chunk_index)` uniqueness to fall
+       * back on. So the second run *added* a second copy of every chunk: the
+       * document row said N, the partition held 2N, and every query over that
+       * KB was answered twice out of the same text.
+       *
+       * The lock serialises the two runs on the document id for the rest of
+       * this transaction, and the delete that follows it makes the run that
+       * arrives second a *replacement* rather than an addition. A job-layer
+       * delete cannot do this: it commits minutes before this insert, so the
+       * other run's chunks are written after it has finished looking.
+       *
+       * Neither statement changes what a single run writes, or what any query
+       * reads afterwards: a first ingest locks a row nothing else wants and
+       * deletes nothing.
+       */
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${documentId}))`)
+      // lifted: additive guard, no result change (TASK-005 merge review)
+      const replaced = (await tx.execute(
+        sql`DELETE FROM ${sql.raw(partitionTable)} WHERE document_id = ${documentId} RETURNING id`
+      )) as { rows?: Array<{ id: string }> } | Array<{ id: string }>
+      const replacedRows = Array.isArray(replaced) ? replaced : (replaced.rows ?? [])
+      if (replacedRows.length > 0) {
+        /**
+         * lifted: additive guard, no result change (TASK-005 merge review).
+         *
+         * The keyword links that hung off the chunks just removed, and the
+         * `kb_keyword.usage_count` those links were counted in — the count the
+         * engine maintains on every attach and detach
+         * (`kb/keywords/service.ts`), which orders `listKbKeywords` and the
+         * query menu. Deleting the links without it left the count inflated by
+         * one re-run's worth of chunks, for good.
+         *
+         * `embedding_keyword` is keyed by chunk id and a partition chunk id and
+         * an `search.embedding` id come out of the same generator, so the rows
+         * go by the ids actually removed rather than on the assumption that the
+         * two stores can never share one. One statement, so the delete and the
+         * decrement cannot disagree.
+         */
+        await tx.execute(sql`
+          WITH unlinked AS (
+            DELETE FROM ${embeddingKeyword}
+            WHERE ${inArray(
+              embeddingKeyword.embeddingId,
+              replacedRows.map((row) => row.id)
+            )}
+            RETURNING ${embeddingKeyword.kbKeywordId} AS kb_keyword_id
+          ), counted AS (
+            SELECT kb_keyword_id, count(*)::int AS n FROM unlinked GROUP BY kb_keyword_id
+          )
+          UPDATE ${kbKeyword}
+             SET usage_count = GREATEST(${kbKeyword.usageCount} - counted.n, 0)
+            FROM counted
+           WHERE ${kbKeyword.id} = counted.kb_keyword_id
+        `)
+        logger.info('ingest: replaced a previous run of this document', {
+          kbId,
+          documentId,
+          replacedChunks: replacedRows.length,
+        })
+      }
       if (chunkRows.length > 0) {
         for (const row of chunkRows) {
           const embeddingLit = `[${row.embedding.join(',')}]`

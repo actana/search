@@ -125,8 +125,7 @@ export async function applyEndpointDeclaration(
     await asBadRequest(() => setEndpointSource(clientId, body.source, tx));
 
     /**
-     * The endpoint ids this client may link a key to: its own, plus the ones
-     * this request is creating.
+     * The endpoint ids this client may link a key to.
      *
      * `config` is a `z.record(z.unknown())` on the wire and this route passes
      * it through, so `config.apiKeyEndpointId` was a free choice of *any*
@@ -136,8 +135,23 @@ export async function applyEndpointDeclaration(
      * `resolveEndpointApiKey` refuses that at the moment of use; this refuses
      * it at the moment it is declared, which is the message that reaches the
      * client that made the mistake.
+     *
+     * **Both halves are collected before the first row is written**, because
+     * the set used to be grown *as* the loop created rows: a body whose second
+     * endpoint was keyed on its fourth was refused, and the same body with its
+     * endpoints in the other order was accepted. A declaration is a set and
+     * not a sequence, so the answer cannot depend on the order the client
+     * happened to serialise it in.
+     *
+     * The two halves are Search's ids for the endpoints this client already
+     * has, and the `externalId`s this body declares — which is the id a client
+     * pushing its own catalog has for a sibling it is declaring in the same
+     * breath. Neither can name another client's endpoint, which is the hole
+     * this check exists to close; what a link *resolves* to at use time is
+     * still `resolveEndpointApiKey`'s business, and it follows Search's id.
      */
     const linkable = new Set((await listEndpoints(clientId, tx)).map((e) => e.id));
+    for (const declared of body.endpoints) linkable.add(declared.externalId);
 
     const written: Array<{ id: string; externalId: string }> = [];
     const mirrored: MirroredEndpointInput[] = [];
@@ -146,7 +160,7 @@ export async function applyEndpointDeclaration(
       if (linkedId !== null && !linkable.has(linkedId)) {
         throw badRequest(
           `config.apiKeyEndpointId "${linkedId}" is not one of your endpoints — a key can ` +
-            "only be shared with an endpoint this client owns",
+            "only be shared with an endpoint this client owns or is declaring in this body",
         );
       }
       if (body.source.kind === "mirrored") {
@@ -162,7 +176,6 @@ export async function applyEndpointDeclaration(
       const row = await asBadRequest(() =>
         createLocalEndpoint(clientId, localInput(declared), declared.apiKey ?? null, tx),
       );
-      linkable.add(row.id);
       written.push({ id: row.id, externalId: declared.externalId });
     }
     if (mirrored.length > 0) {
