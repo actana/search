@@ -35,6 +35,7 @@ import type { SearchEvent } from "@actana/search/contracts";
 import { db } from "../db/client.ts";
 import { document, knowledgeBase } from "../db/schema.ts";
 import { publishSearchEvent, searchEventId } from "../events/publish.ts";
+import { prepareIngestDocument } from "./ingest-idempotency.ts";
 
 const logger = createLogger("jobs/run");
 
@@ -46,6 +47,31 @@ export type SearchJob = { type: string; payload: unknown };
  * request; the work is resumable, so a timeout is a retry rather than a loss.
  */
 export const EMBED_BATCH_TIMEOUT_MS = 15 * 60 * 1000;
+
+/**
+ * What a document of unknown size is allowed for its download alone, on top of
+ * the base processing budget.
+ *
+ * `knowledge-process-document`'s budget is `computeProcessingTimeoutMs(fileSize)`
+ * — and the JSON `url` branch of the ingest route stages a document it has not
+ * fetched, so the size it knows is `0` (`api/routes/documents.ts`, and the same
+ * `0` comes back through `POST …/documents/:id/include`). At `0` the budget is
+ * the base one, `KB_CONFIG_MAX_DURATION` (600s by default) — which is *exactly*
+ * the engine's own `TIMEOUTS.FILE_DOWNLOAD`. The job's abort therefore raced
+ * the download's own timeout: which of the two fired first decided whether the
+ * operator was told "download timed out" or nothing at all, and neither number
+ * left any of the budget for the parsing and embedding the download is only the
+ * prelude to.
+ *
+ * So a document whose size is unknown gets the download's wall *plus* the base
+ * budget. It is a floor and not a replacement: a document whose size we do know
+ * keeps the size-scaled number exactly as before.
+ *
+ * `document-processor.ts` exports its `TIMEOUTS` so that the agreement between
+ * this number and the download's is asserted in a test rather than in a
+ * comment.
+ */
+export const UNKNOWN_SIZE_DOWNLOAD_ALLOWANCE_MS = 600_000;
 
 /** One entry of the dispatch table. */
 type JobHandlerEntry = {
@@ -63,6 +89,21 @@ type JobHandlerEntry = {
    * import them lazily, the same way {@link JobHandlerEntry.load} does.
    */
   budgetMs?: (payload: Record<string, unknown>) => number | Promise<number>;
+  /**
+   * Run before the handler, and decide whether to run it at all.
+   *
+   * The job layer's half of "every job on this queue is idempotent and
+   * resumable" (ADR 0010 D1). The engine is frozen (ADR 0005), so a handler
+   * that is not idempotent on its own is made idempotent *here* — by removing
+   * what a previous attempt of this same job wrote, or by answering that the
+   * work is already done.
+   *
+   * `{ skip: true }` returns from {@link runSearchJob} without calling the
+   * handler. The announcement still runs: it reads the row, and the row's
+   * terminal state is the same one the run that completed it already announced
+   * under the same event id, so nothing new goes out.
+   */
+  prepare?: (payload: Record<string, unknown>) => Promise<{ skip: boolean }>;
 };
 
 /**
@@ -94,10 +135,15 @@ const JOB_HANDLERS: Record<string, JobHandlerEntry> = {
      * here, but parsing a large file still is, so it keeps the size-scaled
      * budget Studio gave it.
      */
-    budgetMs: async (payload) =>
-      (await import("../knowledge/documents/service.ts")).computeProcessingTimeoutMs(
-        (payload.docData as { fileSize?: number } | undefined)?.fileSize ?? 0,
-      ),
+    budgetMs: async (payload) => {
+      const { computeProcessingTimeoutMs } = await import("../knowledge/documents/service.ts");
+      const fileSize = (payload.docData as { fileSize?: number } | undefined)?.fileSize ?? 0;
+      const budget = computeProcessingTimeoutMs(fileSize);
+      // An unknown size is the `url` branch of the ingest route, which stages a
+      // document it has not fetched. Its budget has to cover the download it is
+      // about to do — see {@link UNKNOWN_SIZE_DOWNLOAD_ALLOWANCE_MS}.
+      return fileSize > 0 ? budget : budget + UNKNOWN_SIZE_DOWNLOAD_ALLOWANCE_MS;
+    },
   },
   "kb.embed.batch": {
     load: async () => (await import("../knowledge/documents/embed-pipeline.ts")).processEmbedBatch,
@@ -105,6 +151,24 @@ const JOB_HANDLERS: Record<string, JobHandlerEntry> = {
   },
   "kb.ingest.document": {
     load: async () => (await import("../kb/ingest.ts")).ingestDocument,
+    /**
+     * The same size-scaled budget the planner gets, off the text this payload
+     * carries — `kb.ingest.document` is the direct-text path, so the bytes are
+     * in hand and there is no download to allow for.
+     *
+     * It had none at all, which is the number the queue's lock has to be
+     * checked against (`WORKER_LOCK_TUNING`): an unbudgeted job is one with no
+     * answer to "how long may this hold a lock for". The engine does not take
+     * the signal yet — `ingestDocument`'s parameters are frozen (ADR 0005) —
+     * so today the budget is the bound the transport reasons with rather than
+     * one the work honours, and the safety against an over-running attempt is
+     * {@link prepareIngestDocument} below.
+     */
+    budgetMs: async (payload) =>
+      (await import("../knowledge/documents/service.ts")).computeProcessingTimeoutMs(
+        typeof payload.text === "string" ? Buffer.byteLength(payload.text, "utf8") : 0,
+      ),
+    prepare: (payload) => prepareIngestDocument(payload),
   },
   "kb-keywords-extract": {
     load: async () => (await import("../kb/jobs/keywords-extract.ts")).handleKeywordsExtract,
@@ -139,18 +203,33 @@ export type RunSearchJobOptions = {
    */
   signal?: AbortSignal;
   /**
-   * How many further attempts the transport will give this job if it throws.
+   * How many further attempts the transport will give this job **if it throws**.
    *
-   * `0` — the default, and what the inline runner passes — means this attempt
-   * is the last one, so a document the engine left `failed` is announced. Above
-   * zero the `document.failed` announcement is **held back**: the engine marks
-   * a document `failed` on a *retryable* attempt too (a resolver that was away
-   * for thirty seconds), and Studio's trigger must not see a failure for a
-   * document that is about to ingest on the next attempt. A success is
-   * announced whatever the number is.
+   * `0` — the default, and what the inline runner passes — means a failure now
+   * is final. Above zero the `document.failed` announcement is held back *for a
+   * dispatch that threw*: the engine marks a document `failed` on a retryable
+   * attempt too (a resolver that was away for thirty seconds), and Studio's
+   * trigger must not see a failure for a document that is about to ingest on
+   * the next attempt.
+   *
+   * It says nothing about a handler that **returned**. That distinction is the
+   * whole of the bug below (see {@link announce}), and it is why this number is
+   * read beside the outcome rather than on its own.
    */
   attemptsRemaining?: number;
 };
+
+/**
+ * What the dispatch did — which is not the same question as how many attempts
+ * are left, and conflating the two lost an event.
+ *
+ * `threw` is about *this* dispatch: a handler that raised is a handler whose
+ * work the transport may run again, so a `failed` row it left behind is not
+ * news yet. A handler that returned normally has finished, whatever the attempt
+ * counter says, and the row it wrote is the truth about the document —
+ * including when that row is `failed`.
+ */
+type JobOutcome = { threw: boolean; result?: unknown };
 
 /**
  * Run one job to completion, then announce whatever it made terminal.
@@ -163,13 +242,19 @@ export async function runSearchJob(
   options: RunSearchJobOptions = {},
 ): Promise<unknown> {
   const payload = (job.payload ?? {}) as Record<string, unknown>;
+  // Pessimistic until the dispatch returns: a `finally` that runs because
+  // something threw must not read as "the handler finished".
+  const outcome: JobOutcome = { threw: true };
   try {
-    return await dispatch(job.type, payload, options);
+    const result = await dispatch(job.type, payload, options);
+    outcome.threw = false;
+    outcome.result = result;
+    return result;
   } finally {
     // In `finally` on purpose: a planner that threw has already written
     // `failed` on the document, and — on the attempt that is the last one —
     // that is exactly the state a client most wants to be told about.
-    await announce(job.type, payload, options).catch((err: unknown) => {
+    await announce(job.type, payload, options, outcome).catch((err: unknown) => {
       logger.warn("Announcing a job's outcome failed", {
         type: job.type,
         error: err instanceof Error ? err.message : String(err),
@@ -188,6 +273,10 @@ async function dispatch(
   // error rather than a silent success.
   if (!entry) throw new Error(`no handler for job type "${type}"`);
   const handler = await entry.load();
+  if (entry.prepare) {
+    const { skip } = await entry.prepare(payload);
+    if (skip) return undefined;
+  }
   const budgetMs = await entry.budgetMs?.(payload);
   if (budgetMs === undefined) return handler(payload as never, options.signal);
   return withBudget(budgetMs, options.signal, (signal) => handler(payload as never, signal));
@@ -253,11 +342,87 @@ export function resetAnnouncedEvents(): void {
   announced.clear();
 }
 
+/**
+ * The generation of a document's processing run, as a component of an event id.
+ *
+ * **Why an event id needs one.** The id is derived from the facts so that two
+ * workers noticing the same thing produce one event (see
+ * `events/publish.ts`) — and "this document, in this terminal state" looked
+ * like the whole of the facts. It is not: a document can reach `completed`
+ * twice. `POST /v1/kbs/:id/documents/:docId/include` re-runs the pipeline over
+ * a document that already ingested, and the second `document.ingested` had the
+ * same id as the first, so `claimAnnouncedEvent` dropped it in-process and
+ * `webhook_delivery_hook_event_unique` dropped it in the ledger — *forever*.
+ * A client that re-included a document was told nothing, and the row said
+ * `completed` with no event to explain when.
+ *
+ * `processingStartedAt` is the generation, because it is stamped once per run
+ * and not once per attempt: every path that starts a document over writes it
+ * (`knowledge/documents/service.ts`, `embed-pipeline.ts`), and nothing writes
+ * it between the attempts of one job. That is exactly the line the dedupe
+ * wants — five attempts of one ingest are one event, two includes are two —
+ * where `processingCompletedAt` moves on every attempt and would have made the
+ * dedupe a no-op.
+ *
+ * It falls back to `processingCompletedAt` for a row that has no start stamp (a
+ * document that was never included and then failed), and to the status alone
+ * for a row with neither, which is the id this function used to return.
+ */
+export function documentEventGeneration(row: {
+  processingStartedAt: Date | null;
+  processingCompletedAt: Date | null;
+}): string {
+  const stamp = row.processingStartedAt ?? row.processingCompletedAt;
+  return stamp ? String(stamp.getTime()) : "none";
+}
+
+/**
+ * The id for a document event. One scheme, because three places announce one:
+ * this file, the worker's failure handler, and the timeout sweep's
+ * announcement below.
+ */
+export function documentEventId(
+  name: "document.ingested" | "document.failed",
+  documentId: string,
+  row: {
+    processingStatus: string;
+    processingStartedAt: Date | null;
+    processingCompletedAt: Date | null;
+  },
+): string {
+  return searchEventId(name, documentId, row.processingStatus, documentEventGeneration(row));
+}
+
 async function announce(
   type: string,
   payload: Record<string, unknown>,
   options: RunSearchJobOptions,
+  outcome: JobOutcome,
 ): Promise<void> {
+  /**
+   * The sweep names no document in its payload — it has none, it goes looking
+   * for them — so the documents it reconciled come back in its *result*.
+   *
+   * Without this a `document.failed` was simply lost for the two failures the
+   * sweep exists to catch: a worker killed mid-job, and a job that exceeded
+   * `maxStalledCount`. Both leave the row non-terminal with no live job, so
+   * neither this file's ordinary path nor the worker's failure handler ever
+   * runs again for it; the sweep flipped the row to `failed` and the client was
+   * never told.
+   */
+  if (type === "kb.document.timeout-sweep") {
+    if (outcome.threw) return;
+    const swept = outcome.result as { failedDocumentIds?: unknown } | undefined;
+    const ids = Array.isArray(swept?.failedDocumentIds) ? swept.failedDocumentIds : [];
+    for (const id of ids) {
+      if (typeof id !== "string") continue;
+      // `timeout` is the typed reason, the same vocabulary the worker's key
+      // failures use (ADR 0010 D3): the operator's sentence is on the row.
+      await announceDocumentState(id, "timeout");
+    }
+    return;
+  }
+
   if (type === "kb.clusters.validate") {
     const kbId = typeof payload.kbId === "string" ? payload.kbId : undefined;
     if (!kbId) return;
@@ -307,16 +472,27 @@ async function announce(
   if (row.processingStatus !== "completed" && row.processingStatus !== "failed") return;
 
   /**
-   * A failure with attempts left is not a failure yet.
+   * A failure with attempts left is not a failure yet — **when this dispatch is
+   * what failed**.
    *
-   * The engine marks the document `failed` as soon as *this* attempt gave up —
-   * it has no idea the transport will run the job again — so announcing from
-   * here unconditionally published `document.failed` for a resolver that was
-   * away for half a minute, and Studio's trigger would have acted on it. The id
-   * is deliberately **not** claimed on the way out, so the attempt that really
-   * is the last one can still announce it.
+   * The engine marks the document `failed` as soon as *an attempt* gave up, and
+   * on attempt one of five that is routinely a resolver that will answer on the
+   * next one, which Studio's trigger must not act on. The id is deliberately
+   * not claimed on the way out, so the attempt that really is the last one can
+   * still announce it.
+   *
+   * **The outcome is half the question, and it was missing.** `attemptsMade + 1`
+   * subtracted from the queue's `attempts` is `2` on a first attempt of three,
+   * whether that attempt threw or returned — and `finalizeDocumentEmbedding`
+   * *returns normally* after marking a document `failed` for batches that have
+   * exhausted their own attempts. So the announcement was held back, the job
+   * completed, BullMQ's `failed` handler never ran, nothing ever re-read the
+   * row, and `document.failed` was never sent on the ordinary path. (The
+   * fixture suites are green because the inline runner passes `0`.) A handler
+   * that returned has finished: whatever the attempt counter says, the row is
+   * the truth.
    */
-  if (row.processingStatus === "failed" && (options.attemptsRemaining ?? 0) > 0) {
+  if (row.processingStatus === "failed" && outcome.threw && (options.attemptsRemaining ?? 0) > 0) {
     logger.debug("A document is failed but its job has attempts left; not announcing yet", {
       documentId,
       type,
@@ -325,11 +501,31 @@ async function announce(
     return;
   }
 
+  await announceDocumentState(documentId, undefined, row);
+}
+
+/**
+ * Publish whatever terminal state a document's row is in, once.
+ *
+ * Takes the row when the caller has just read it and re-reads it when the
+ * caller has not (the sweep, which reconciled a list of ids). Everything about
+ * the event comes off the row — which is what makes this correct for every path
+ * into a terminal state, including ones added later.
+ */
+async function announceDocumentState(
+  documentId: string,
+  reason?: string,
+  known?: AnnounceableDocument,
+): Promise<void> {
+  const row = known ?? (await documentRow(documentId));
+  if (!row) return;
+  if (row.processingStatus !== "completed" && row.processingStatus !== "failed") return;
+
   const kb = await kbOwner(row.knowledgeBaseId);
   if (!kb) return;
 
   const name = row.processingStatus === "completed" ? "document.ingested" : "document.failed";
-  const id = searchEventId(name, documentId, row.processingStatus);
+  const id = documentEventId(name, documentId, row);
   if (!claimAnnouncedEvent(id)) return;
 
   const event: SearchEvent = {
@@ -343,6 +539,7 @@ async function announce(
     ...(name === "document.failed" && row.processingError
       ? { error: row.processingError.slice(0, 2000) }
       : {}),
+    ...(name === "document.failed" && reason ? { reason } : {}),
   };
   await publishSearchEvent(kb.pairedClientId, event);
 }
@@ -367,6 +564,9 @@ export type AnnounceableDocument = {
   chunkCount: number;
   processingStatus: string;
   processingError: string | null;
+  /** The generation of this processing run — see {@link documentEventGeneration}. */
+  processingStartedAt: Date | null;
+  processingCompletedAt: Date | null;
 };
 
 /**
@@ -384,6 +584,8 @@ export async function documentRow(documentId: string): Promise<AnnounceableDocum
       chunkCount: document.chunkCount,
       processingStatus: document.processingStatus,
       processingError: document.processingError,
+      processingStartedAt: document.processingStartedAt,
+      processingCompletedAt: document.processingCompletedAt,
     })
     .from(document)
     .where(eq(document.id, documentId))

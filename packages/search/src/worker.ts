@@ -53,7 +53,7 @@ import {
   queuePrefix,
   type JobType,
 } from './queue/index.ts'
-import { publishSearchEvent, searchEventId } from './events/publish.ts'
+import { publishSearchEvent } from './events/publish.ts'
 import { assertEncryptionKeyConfigured } from './core/security/encryption.ts'
 import {
   isEndpointKeyUnavailable,
@@ -61,6 +61,7 @@ import {
 } from './models/endpoint-key-errors.ts'
 import {
   claimAnnouncedEvent,
+  documentEventId,
   documentRow,
   isKnownJobName,
   runSearchJob,
@@ -71,7 +72,8 @@ import type { KbIngestDocumentPayload } from './jobs/types.ts'
 const logger = createLogger('Worker')
 
 /**
- * The lock a knowledge job holds, and how long the stall scan waits.
+ * The lock a knowledge job holds, how often it is renewed, and how long the
+ * stall scan waits.
  *
  * Studio's numbers for its knowledge queue, and its reasoning: BullMQ's default
  * `lockDuration` is 30 seconds, and a document parse plus an embed batch
@@ -80,9 +82,27 @@ const logger = createLogger('Worker')
  * working. `maxStalledCount: 2` keeps a genuinely dead worker's jobs recoverable
  * — every job here is idempotent and resumable, so a re-run is cheap and a
  * permanent loss is not.
+ *
+ * **The lock is shorter than the longest job, and that is deliberate.** A
+ * `kb.embed.batch` may run for fifteen minutes and a
+ * `knowledge-process-document` for up to an hour (`jobs/run.ts`'s budgets), so
+ * a `lockDuration` that *covered* the longest budget would be an hour — which
+ * is how long a dead worker's job would then be unrecoverable. What covers a
+ * long job is the renewal: BullMQ extends the lock of every job it is running
+ * on a timer, and `lockRenewTime` is that timer. It is set explicitly and well
+ * under half the lock (the default is exactly half, which gives a job **one**
+ * chance to renew before its lock expires); at thirty seconds a job has ten,
+ * so a momentary stall of the event loop no longer costs it the lock.
+ *
+ * When renewal cannot happen at all — a worker that was killed, an event loop
+ * blocked for minutes — the job *is* re-run, and what makes that safe rather
+ * than duplicating work is the job layer: `jobs/run.ts` short-circuits a
+ * document that is already `completed` and drops what a previous attempt wrote
+ * before re-running one that is not.
  */
 export const WORKER_LOCK_TUNING = {
   lockDuration: 5 * 60 * 1000,
+  lockRenewTime: 30 * 1000,
   stalledInterval: 5 * 60 * 1000,
   maxStalledCount: 2,
 } as const
@@ -332,9 +352,21 @@ async function failDocument(job: Job, error: Error, reason?: string): Promise<vo
           inArray(document.processingStatus, NON_TERMINAL_PROCESSING_STATUSES)
         )
       )
-      .returning({ id: document.id })
+      /**
+       * The stamps come back because the event id carries the *generation* of
+       * the processing run (`documentEventId`): a document that fails, is
+       * re-included and fails again is two events, and five attempts of one
+       * run are one. `processing_started_at` is not touched by this update, so
+       * what is returned is this run's own generation.
+       */
+      .returning({
+        id: document.id,
+        processingStartedAt: document.processingStartedAt,
+        processingCompletedAt: document.processingCompletedAt,
+      })
 
-    if (updated.length === 0) {
+    let generation = updated[0]
+    if (!generation) {
       /**
        * Nothing to write — but possibly something still to say.
        *
@@ -348,9 +380,14 @@ async function failDocument(job: Job, error: Error, reason?: string): Promise<vo
        */
       const row = await documentRow(target.documentId)
       if (row?.processingStatus !== 'failed') return
+      generation = row
     }
 
-    const id = searchEventId('document.failed', target.documentId, 'failed')
+    const id = documentEventId('document.failed', target.documentId, {
+      processingStatus: 'failed',
+      processingStartedAt: generation.processingStartedAt ?? null,
+      processingCompletedAt: generation.processingCompletedAt ?? null,
+    })
     if (!claimAnnouncedEvent(id)) return
     const pairedClientId = await pairedClientOfKb(target.knowledgeBaseId)
     // No paired client is no addressee: the KB was deleted under the job, and

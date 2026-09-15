@@ -31,7 +31,12 @@ const handlers = vi.hoisted(() => ({
   finalizeDocumentEmbedding: vi.fn(async () => 'finalized'),
   handleKeywordsExtract: vi.fn(async () => 'keyworded'),
   handleClustersValidate: vi.fn(async () => 'clustered'),
-  runDocumentTimeoutSweep: vi.fn(async () => ({ candidates: 0, reconciled: 0 })),
+  runDocumentTimeoutSweep: vi.fn(async () => ({
+    candidates: 0,
+    reconciled: 0,
+    failedDocumentIds: [] as string[],
+  })),
+  prepareIngestDocument: vi.fn(async () => ({ skip: false })),
   ingestDocument: vi.fn(async () => ({ documentId: 'doc-new', chunkCount: 3 })),
   update: vi.fn(),
   select: vi.fn(),
@@ -89,6 +94,18 @@ vi.mock('./kb/jobs/document-timeout-sweep.ts', () => ({
   runDocumentTimeoutSweep: handlers.runDocumentTimeoutSweep,
 }))
 vi.mock('./kb/ingest.ts', () => ({ ingestDocument: handlers.ingestDocument }))
+/**
+ * The ingest job's idempotency step, mocked.
+ *
+ * It reads a document row and deletes from a KB's *partition* — a hashed table
+ * name and a transaction, neither of which a fake `db` of two methods can
+ * answer. What it does is asserted for real against Postgres in
+ * `worker.integration.test.ts`; what is asserted here is that the dispatch
+ * consults it and honours a `skip`.
+ */
+vi.mock('./jobs/ingest-idempotency.ts', () => ({
+  prepareIngestDocument: handlers.prepareIngestDocument,
+}))
 /**
  * The publish seam, not the emitter under it.
  *
@@ -163,6 +180,8 @@ beforeEach(() => {
    */
   handlers.select.mockReset()
   handlers.update.mockReset()
+  handlers.prepareIngestDocument.mockReset()
+  handlers.prepareIngestDocument.mockResolvedValue({ skip: false })
   // Event ids are derived from the facts, so two tests about the same document
   // would otherwise be one announcement and one silent no-op.
   resetAnnouncedEvents()
@@ -228,6 +247,8 @@ describe('kb.ingest.document', () => {
         chunkCount: 3,
         processingStatus: 'completed',
         processingError: null,
+        processingStartedAt: new Date('2026-09-15T10:00:00Z'),
+        processingCompletedAt: new Date('2026-09-15T10:00:30Z'),
         ...overrides,
       },
     ])
@@ -260,7 +281,9 @@ describe('kb.ingest.document', () => {
         filename: 'handbook.md',
         tags: { tag_1: 'people' },
       }),
-      undefined
+      // The ingest job has a size-scaled budget now, so it is handed the
+      // signal the other long jobs are handed (`jobs/run.ts`).
+      expect.any(AbortSignal)
     )
     expect(published()).toEqual([
       [
@@ -273,6 +296,32 @@ describe('kb.ingest.document', () => {
         }),
       ],
     ])
+  })
+
+  it('asks the idempotency step first, and does not re-ingest a completed document', async () => {
+    /**
+     * `kb/ingest.ts` has no `completed` short-circuit and no
+     * delete-before-insert, and the partition has no `(document_id,
+     * chunk_index)` uniqueness — so a second run of one job is a second copy of
+     * every chunk. The job layer is what stops that (`jobs/ingest-idempotency.ts`,
+     * asserted against a real partition in the integration suite); what is
+     * asserted here is that the dispatch honours it.
+     */
+    handlers.prepareIngestDocument.mockResolvedValueOnce({ skip: true })
+    queueDocument()
+
+    const result = await processSearchJob(
+      job('kb.ingest.document', {
+        kbId: 'kb-1',
+        documentId: 'doc-new',
+        filename: 'handbook.md',
+        text: '# Handbook',
+      })
+    )
+
+    expect(result).toBeUndefined()
+    expect(handlers.prepareIngestDocument).toHaveBeenCalledOnce()
+    expect(handlers.ingestDocument).not.toHaveBeenCalled()
   })
 
   it('refuses a payload with no knowledge base, and one with no text', async () => {
@@ -307,6 +356,8 @@ describe('a document that is failed but not finished', () => {
         chunkCount: 0,
         processingStatus: 'failed',
         processingError: 'the resolver was not answering',
+        processingStartedAt: new Date('2026-09-15T10:00:00Z'),
+        processingCompletedAt: new Date('2026-09-15T10:00:30Z'),
       },
     ])
     queueSelect([{ pairedClientId: 'pc-1', kmeansUpdatedAt: null }])
@@ -351,6 +402,8 @@ describe('a document that is failed but not finished', () => {
         chunkCount: 2,
         processingStatus: 'completed',
         processingError: null,
+        processingStartedAt: new Date('2026-09-15T10:00:00Z'),
+        processingCompletedAt: new Date('2026-09-15T10:00:30Z'),
       },
     ])
     queueSelect([{ pairedClientId: 'pc-1', kmeansUpdatedAt: null }])
@@ -359,6 +412,188 @@ describe('a document that is failed but not finished', () => {
     expect(publishedEvents()).toEqual([
       expect.objectContaining({ event: 'document.ingested', documentId: 'doc-7' }),
     ])
+  })
+})
+
+/**
+ * The failure the *ordinary* path lost, and the id that made a second success
+ * disappear. Both are about what an announcement is derived from.
+ */
+describe('a handler that returned, and what it leaves on the row', () => {
+  /** A document row in a terminal state, with the stamps an event id reads. */
+  function queueRow(overrides: Record<string, unknown> = {}) {
+    queueSelect([
+      {
+        id: 'doc-9',
+        knowledgeBaseId: 'kb-1',
+        filename: 'handbook.md',
+        chunkCount: 0,
+        processingStatus: 'failed',
+        processingError: 'Embedding incomplete: 12 chunk(s) unembedded',
+        processingStartedAt: new Date('2026-09-15T10:00:00Z'),
+        processingCompletedAt: new Date('2026-09-15T10:05:00Z'),
+        ...overrides,
+      },
+    ])
+    queueSelect([{ pairedClientId: 'pc-1', kmeansUpdatedAt: null }])
+  }
+
+  const payload = { documentId: 'doc-9', knowledgeBaseId: 'kb-1' }
+
+  /**
+   * The blocker. `finalizeDocumentEmbedding` marks a document `failed` when its
+   * batches have exhausted *their* attempts and then **returns normally** — so
+   * the job completes, BullMQ's `failed` handler never runs, and nothing ever
+   * re-reads the row. The announcement was nonetheless held back, because
+   * `attemptsRemaining` on a first attempt of three is `2` whatever the handler
+   * did. Studio therefore never heard `document.failed` on the ordinary BullMQ
+   * path at all; the fixture suites are green because the inline runner passes
+   * `0`.
+   */
+  it('announces a failed row the finalizer wrote, with attempts still on the job', async () => {
+    queueRow()
+
+    await processSearchJob(job('kb.embed.finalize', payload, { attempts: 3, attemptsMade: 0 }))
+
+    expect(handlers.finalizeDocumentEmbedding).toHaveBeenCalledOnce()
+    expect(publishedEvents()).toEqual([
+      expect.objectContaining({
+        event: 'document.failed',
+        documentId: 'doc-9',
+        kbId: 'kb-1',
+        error: expect.stringContaining('unembedded'),
+      }),
+    ])
+    // Exactly one event, and not the ingested one: the row is what is read.
+    expect(publishedEvents()).toHaveLength(1)
+  })
+
+  it('still holds a failed row back while the dispatch itself is retrying', async () => {
+    // The distinction the fix turns on: this one threw, so the transport may
+    // run it again and the `failed` row is not news yet.
+    queueRow()
+    handlers.finalizeDocumentEmbedding.mockRejectedValueOnce(new Error('the resolver went away'))
+
+    await expect(
+      processSearchJob(job('kb.embed.finalize', payload, { attempts: 3, attemptsMade: 0 }))
+    ).rejects.toThrow(/went away/)
+
+    expect(published()).toEqual([])
+  })
+
+  /**
+   * The event id carries the generation of the processing run, so the dedupe
+   * covers the attempts of one run and nothing else. Without it a re-include of
+   * a completed document produced a second `document.ingested` with the *same*
+   * id, which `claimAnnouncedEvent` dropped in-process and the ledger's
+   * `(webhook, event)` unique index dropped for good.
+   */
+  it('gives the attempts of one run one event id', async () => {
+    queueRow({ processingStatus: 'completed', chunkCount: 4, processingError: null })
+    await processSearchJob(job('kb.embed.finalize', payload, { attempts: 3, attemptsMade: 0 }))
+    // The same run, announced again — a second job visiting the same document.
+    queueRow({ processingStatus: 'completed', chunkCount: 4, processingError: null })
+    await processSearchJob(job('kb.document.finalize', payload, { attempts: 3, attemptsMade: 1 }))
+
+    expect(publishedEvents()).toHaveLength(1)
+  })
+
+  it('gives a second run its own event, because it is a second event', async () => {
+    queueRow({ processingStatus: 'completed', chunkCount: 4, processingError: null })
+    await processSearchJob(job('kb.embed.finalize', payload, { attempts: 3, attemptsMade: 0 }))
+
+    // `POST …/documents/:docId/include` over a document that already ingested:
+    // the pipeline re-stamps `processingStartedAt`, which is the generation.
+    queueRow({
+      processingStatus: 'completed',
+      chunkCount: 6,
+      processingError: null,
+      processingStartedAt: new Date('2026-09-16T08:00:00Z'),
+      processingCompletedAt: new Date('2026-09-16T08:01:00Z'),
+    })
+    await processSearchJob(job('kb.embed.finalize', payload, { attempts: 3, attemptsMade: 0 }))
+
+    const events = publishedEvents()
+    expect(events).toHaveLength(2)
+    expect(events[0]!.event).toBe('document.ingested')
+    expect(events[1]!.event).toBe('document.ingested')
+    expect(events[0]!.id).not.toBe(events[1]!.id)
+    expect(events[1]).toMatchObject({ chunkCount: 6 })
+  })
+})
+
+describe('the stranded-document sweep says what it reconciled', () => {
+  /**
+   * The third path to `failed`, and the one that was silent. A worker killed
+   * mid-job — or a job past `maxStalledCount` — leaves the row non-terminal
+   * with nothing running, so neither the ordinary announcement nor the failure
+   * handler ever sees that document again. The sweep flips the row; until now
+   * it told nobody.
+   */
+  function queueSweptDocument(id: string, overrides: Record<string, unknown> = {}) {
+    queueSelect([
+      {
+        id,
+        knowledgeBaseId: 'kb-1',
+        filename: `${id}.pdf`,
+        chunkCount: 0,
+        processingStatus: 'failed',
+        processingError: 'Processing timed out. Please retry or re-sync the connector.',
+        processingStartedAt: new Date('2026-09-15T09:00:00Z'),
+        processingCompletedAt: new Date('2026-09-15T09:30:00Z'),
+        ...overrides,
+      },
+    ])
+    queueSelect([{ pairedClientId: 'pc-1', kmeansUpdatedAt: null }])
+  }
+
+  it('announces document.failed, with the timeout reason, for every row it flipped', async () => {
+    handlers.runDocumentTimeoutSweep.mockResolvedValueOnce({
+      candidates: 2,
+      reconciled: 2,
+      failedDocumentIds: ['doc-a', 'doc-b'],
+    })
+    queueSweptDocument('doc-a')
+    queueSweptDocument('doc-b')
+
+    await processSearchJob(job('kb.document.timeout-sweep'))
+
+    expect(publishedEvents()).toEqual([
+      expect.objectContaining({
+        event: 'document.failed',
+        documentId: 'doc-a',
+        kbId: 'kb-1',
+        reason: 'timeout',
+      }),
+      expect.objectContaining({
+        event: 'document.failed',
+        documentId: 'doc-b',
+        reason: 'timeout',
+      }),
+    ])
+  })
+
+  it('announces the state the row is in, not the one the sweep assumed', async () => {
+    // `markDocumentAsFailedTimeout`'s UPDATE is narrowed to a non-terminal
+    // status and still reports success, so the row — not the sweep's list — is
+    // what decides. This is that check.
+    handlers.runDocumentTimeoutSweep.mockResolvedValueOnce({
+      candidates: 1,
+      reconciled: 1,
+      failedDocumentIds: ['doc-c'],
+    })
+    queueSweptDocument('doc-c', { processingStatus: 'completed', chunkCount: 9 })
+
+    await processSearchJob(job('kb.document.timeout-sweep'))
+
+    expect(publishedEvents()).toEqual([
+      expect.objectContaining({ event: 'document.ingested', documentId: 'doc-c' }),
+    ])
+  })
+
+  it('announces nothing when the sweep found nothing', async () => {
+    await processSearchJob(job('kb.document.timeout-sweep'))
+    expect(published()).toEqual([])
   })
 })
 

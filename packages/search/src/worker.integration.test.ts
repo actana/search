@@ -64,7 +64,14 @@ import { HASH_NGRAM_DIMS } from '@actana/search-shared/testing/hash-ngram-embedd
 import { generateShortId } from '@actana/search-shared/short-id'
 import { resetConfig } from './config.ts'
 import { db } from './db/client.ts'
-import { document, knowledgeBase, modelEndpoint, pairedClient } from './db/schema.ts'
+import {
+  document,
+  documentEmbedBatch,
+  embedding,
+  knowledgeBase,
+  modelEndpoint,
+  pairedClient,
+} from './db/schema.ts'
 import { runMigrations } from './db/migrate.ts'
 import { dropKbPartition, provisionKbPartition } from './kb/ddl.ts'
 import { kbPartitionRef } from './kb/partition.ts'
@@ -76,7 +83,7 @@ import {
   queuePrefix,
 } from './queue/index.ts'
 import { onSearchEvent, resetSearchEventListeners } from './events/emitter.ts'
-import { resetAnnouncedEvents } from './jobs/run.ts'
+import { resetAnnouncedEvents, runSearchJob } from './jobs/run.ts'
 import { setEndpointSource } from './models/endpoint-registry.ts'
 import { clearResolvedKeyCache } from './models/mirrored-endpoint-source.ts'
 import { startWorkers, type SearchWorkers } from './worker.ts'
@@ -126,6 +133,15 @@ const ids = {
   clientFlaky: `${PREFIX}-client-flaky`,
   endpointFlaky: `${PREFIX}-ep-flaky`,
   kbFlaky: `${PREFIX}-kb-flaky`,
+  /**
+   * Three more knowledge bases on the first client's local endpoint, one per
+   * fix round finding: an ingest run twice, a finalizer that fails a document
+   * and returns, and a document the sweep has to reconcile. Separate KBs so
+   * each assertion can count rows without seeing another test's documents.
+   */
+  kbTwice: `${PREFIX}-kb-twice`,
+  kbFinalize: `${PREFIX}-kb-finalize`,
+  kbSweep: `${PREFIX}-kb-sweep`,
 }
 
 /**
@@ -318,6 +334,9 @@ describeDb('the worker, end to end', () => {
       [ids.kbMirrored, ids.mirroredEndpoint, ids.client],
       [ids.kb404, ids.endpoint404, ids.client404],
       [ids.kbFlaky, ids.endpointFlaky, ids.clientFlaky],
+      [ids.kbTwice, ids.localEndpoint, ids.client],
+      [ids.kbFinalize, ids.localEndpoint, ids.client],
+      [ids.kbSweep, ids.localEndpoint, ids.client],
     ] as const) {
       await db.insert(knowledgeBase).values({
         id: kbId,
@@ -378,7 +397,15 @@ describeDb('the worker, end to end', () => {
       /* the connection may already be closed by the worker's shutdown */
     }
     await inspector?.close().catch(() => {})
-    for (const kbId of [ids.kbLocal, ids.kbMirrored, ids.kb404, ids.kbFlaky]) {
+    for (const kbId of [
+      ids.kbLocal,
+      ids.kbMirrored,
+      ids.kb404,
+      ids.kbFlaky,
+      ids.kbTwice,
+      ids.kbFinalize,
+      ids.kbSweep,
+    ]) {
       await dropKbPartition({ kbId }).catch(() => {})
     }
     // `paired_client` cascades to endpoints, KBs, documents and chunks.
@@ -625,4 +652,202 @@ describeDb('the worker, end to end', () => {
     expect(announced.some((e) => e.event === 'document.failed')).toBe(false)
     off()
   }, 120_000)
+
+  it('leaves N chunks and not 2N when the same ingest job runs twice', async () => {
+    /**
+     * The fix round's should-fix #4. `kb/ingest.ts` chunks, embeds and then
+     * inserts every chunk into the KB's partition — with no `completed`
+     * short-circuit, no delete of what it is replacing, and no `(document_id,
+     * chunk_index)` uniqueness on the partition to fall back on. So a second
+     * run of one job *added* a second copy of every chunk: the document row
+     * said N and the partition held 2N, and every query over that KB was then
+     * answered twice out of the same text. A re-queued attempt whose worker
+     * lost its lock, or a crash between the chunk commit and
+     * `moveToCompleted`, is all it took.
+     *
+     * The job layer is what makes the frozen handler re-runnable
+     * (`jobs/ingest-idempotency.ts`), and this is the assertion it exists for.
+     * `runSearchJob` rather than the queue, because what is under test is the
+     * second run and a queue would have to be made to produce one.
+     */
+    const documentId = `${PREFIX}-doc-twice`
+    const payload = {
+      kbId: ids.kbTwice,
+      documentId,
+      filename: 'travel.md',
+      includedInKb: true,
+      text:
+        '# Travel\n\nBook through the agent. Economy on anything under six hours. ' +
+        'Receipts within thirty days, and the per-diem is on the intranet.\n',
+    }
+    const partition = kbPartitionRef(ids.kbTwice)
+    const countChunks = async () => {
+      const counted = (await db.execute(
+        sql`SELECT count(*)::int AS c FROM ${sql.raw(partition)} WHERE document_id = ${documentId}`
+      )) as unknown as Array<{ c: number }> | { rows?: Array<{ c: number }> }
+      return Array.isArray(counted)
+        ? Number(counted[0]?.c ?? 0)
+        : Number(counted.rows?.[0]?.c ?? 0)
+    }
+
+    await runSearchJob({ type: 'kb.ingest.document', payload })
+    const first = await countChunks()
+    expect(first).toBeGreaterThan(0)
+
+    // Run two, with the document `completed`: the work is done, so the handler
+    // must not run at all.
+    await runSearchJob({ type: 'kb.ingest.document', payload })
+    expect(await countChunks()).toBe(first)
+
+    /**
+     * Run three, with the row put back the way a lost lock leaves it: still
+     * `pending`, with the first run's chunks already in the partition. This is
+     * the run that used to double the KB.
+     */
+    await db
+      .update(document)
+      .set({ processingStatus: 'pending', processingCompletedAt: null })
+      .where(eq(document.id, documentId))
+    await runSearchJob({ type: 'kb.ingest.document', payload })
+
+    expect(await countChunks()).toBe(first)
+    const rows = await db
+      .select({ id: document.id, status: document.processingStatus, chunks: document.chunkCount })
+      .from(document)
+      .where(eq(document.knowledgeBaseId, ids.kbTwice))
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.status).toBe('completed')
+    expect(rows[0]!.chunks).toBe(first)
+  }, 120_000)
+
+  it('announces the failure a finalizer writes and returns from', async () => {
+    /**
+     * The fix round's blocker #2, end to end against the real
+     * `finalizeDocumentEmbedding`.
+     *
+     * It marks a document `failed` when its batches have exhausted *their*
+     * attempts — and then **returns normally**, so the job completes, BullMQ's
+     * `failed` handler never runs, and nothing re-reads the row. The
+     * announcement was nonetheless held back, because the worker passes
+     * `attempts - (attemptsMade + 1)`, which on a first attempt of three is
+     * `2` whatever the handler did. So Studio never heard `document.failed` on
+     * the ordinary BullMQ path; the fixture suites are green because the inline
+     * runner passes `0`.
+     *
+     * `attemptsRemaining: 2` here is that exact number.
+     */
+    const announced: SearchEvent[] = []
+    const off = onSearchEvent(ids.client, (event) => announced.push(event))
+
+    const documentId = `${PREFIX}-doc-finalize`
+    const now = new Date()
+    await db.insert(document).values({
+      id: documentId,
+      knowledgeBaseId: ids.kbFinalize,
+      filename: 'half-embedded.md',
+      fileUrl: '',
+      fileSize: 0,
+      mimeType: 'text/markdown',
+      chunkCount: 2,
+      processingStatus: 'processing',
+      processingStartedAt: now,
+      includedInKb: true,
+      uploadedAt: now,
+    })
+    // One chunk staged with no vector: what the finalizer counts as unembedded.
+    await db.insert(embedding).values({
+      id: `${PREFIX}-emb-unembedded`,
+      knowledgeBaseId: ids.kbFinalize,
+      documentId,
+      chunkIndex: 0,
+      chunkHash: 'hash-0',
+      content: 'a chunk whose vector never arrived',
+      contentLength: 34,
+      tokenCount: 8,
+      embedding: null,
+      startOffset: 0,
+      endOffset: 34,
+    })
+    await db.insert(documentEmbedBatch).values({
+      id: `${PREFIX}-batch-failed`,
+      documentId,
+      knowledgeBaseId: ids.kbFinalize,
+      startIndex: 0,
+      endIndex: 1,
+      status: 'failed',
+      attempt: 3,
+      error: 'the provider refused the batch three times',
+      createdAt: now,
+      updatedAt: now,
+    })
+
+    await runSearchJob(
+      { type: 'kb.embed.finalize', payload: { knowledgeBaseId: ids.kbFinalize, documentId } },
+      { attemptsRemaining: 2 }
+    )
+
+    const rows = await db
+      .select({ status: document.processingStatus, error: document.processingError })
+      .from(document)
+      .where(eq(document.id, documentId))
+    expect(rows[0]!.status).toBe('failed')
+
+    const mine = announced.filter((e) => e.documentId === documentId)
+    expect(mine.map((e) => e.event)).toEqual(['document.failed'])
+    expect(mine[0]).toMatchObject({ kbId: ids.kbFinalize })
+    off()
+  }, 90_000)
+
+  it('announces document.failed for a document the sweep reconciles', async () => {
+    /**
+     * The fix round's should-fix #6. A worker killed mid-job — or a job past
+     * `maxStalledCount` — leaves the row non-terminal with nothing running, so
+     * neither the ordinary announcement nor the failure handler ever sees that
+     * document again. The sweep flipped it to `failed` and told nobody: its
+     * payload names no document, so `announce` returned before it got as far as
+     * reading a row. It reports what it reconciled now, and the job layer
+     * announces each one with the typed `timeout` reason.
+     */
+    const announced: SearchEvent[] = []
+    const off = onSearchEvent(ids.client, (event) => announced.push(event))
+
+    const documentId = `${PREFIX}-doc-stranded`
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000)
+    await db.insert(document).values({
+      id: documentId,
+      knowledgeBaseId: ids.kbSweep,
+      filename: 'killed-mid-job.pdf',
+      fileUrl: 's3://bucket/killed-mid-job.pdf',
+      fileSize: 0,
+      mimeType: 'application/pdf',
+      processingStatus: 'processing',
+      processingStartedAt: twoHoursAgo,
+      includedInKb: true,
+      uploadedAt: twoHoursAgo,
+    })
+
+    const result = (await runSearchJob({
+      type: 'kb.document.timeout-sweep',
+      payload: {},
+    })) as { failedDocumentIds: string[] }
+
+    expect(result.failedDocumentIds).toContain(documentId)
+    const rows = await db
+      .select({ status: document.processingStatus, error: document.processingError })
+      .from(document)
+      .where(eq(document.id, documentId))
+    expect(rows[0]!.status).toBe('failed')
+    expect(rows[0]!.error ?? '').toMatch(/timed out/i)
+
+    const mine = announced.filter((e) => e.documentId === documentId)
+    expect(mine).toEqual([
+      expect.objectContaining({
+        event: 'document.failed',
+        kbId: ids.kbSweep,
+        documentId,
+        reason: 'timeout',
+      }),
+    ])
+    off()
+  }, 90_000)
 })

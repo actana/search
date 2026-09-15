@@ -28,7 +28,13 @@ import { getEndpointSource } from '../../models/source.ts'
 
 const logger = createLogger('DocumentProcessor')
 
-const TIMEOUTS = {
+/**
+ * lifted: `export` added, nothing else. The job layer has to be able to see
+ * `FILE_DOWNLOAD` — an unknown-size document's per-attempt budget must cover
+ * the download it is about to do, and a copy of the number in `jobs/run.ts`
+ * would be a copy that drifts (see `UNKNOWN_SIZE_DOWNLOAD_ALLOWANCE_MS`).
+ */
+export const TIMEOUTS = {
   FILE_DOWNLOAD: 600000,
   MISTRAL_OCR_API: 120000,
 } as const
