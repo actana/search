@@ -52,7 +52,6 @@ import * as net from "node:net";
 import * as path from "node:path";
 import * as tls from "node:tls";
 
-const role = (process.env.SEARCH_ROLE ?? "").trim().toLowerCase();
 const timeoutMs = Number.parseInt(process.env.SEARCH_HEALTHCHECK_TIMEOUT_MS ?? "4000", 10);
 
 const fail = (why) => {
@@ -60,21 +59,51 @@ const fail = (why) => {
   process.exit(1);
 };
 
-if (role === "worker") {
-  probeRedis();
-} else {
-  probeApi();
+/** Whether `SEARCH_ROLE` selects the worker probe. Anything else is the API. */
+export function isWorkerRole(role) {
+  return (role ?? "").trim().toLowerCase() === "worker";
 }
 
 // ---------------------------------------------------------------------------
 // The worker role
 // ---------------------------------------------------------------------------
 
-/** One RESP bulk-string argument. */
-const bulk = (value) => `$${Buffer.byteLength(value)}\r\n${value}\r\n`;
+/**
+ * One RESP bulk-string argument.
+ *
+ * A `function` declaration and not a `const` arrow, which is the whole of a bug
+ * every worker container this image produced had: the role dispatch used to sit
+ * *above* these two helpers, so `probeRedis()` — hoisted, as a declaration —
+ * ran while `command` was still in its temporal dead zone and the probe died
+ * with `ReferenceError: Cannot access 'command' before initialization`. Docker
+ * reads that as unhealthy, forever, on a worker that is working perfectly. The
+ * dispatch is at the bottom of the file now, and these are declarations too, so
+ * neither half of that can come back on its own.
+ */
+export function bulk(value) {
+  return `$${Buffer.byteLength(value)}\r\n${value}\r\n`;
+}
 
 /** A RESP array command, e.g. `command("PING")`. */
-const command = (...args) => `*${args.length}\r\n` + args.map(bulk).join("");
+export function command(...args) {
+  return `*${args.length}\r\n` + args.map(bulk).join("");
+}
+
+/**
+ * The bytes the worker probe writes: an `AUTH` when the URL carries
+ * credentials, then the `PING`.
+ *
+ * Its own function so the encoding is testable without a socket — the probe
+ * itself ends in `process.exit`, which a unit test cannot call twice.
+ */
+export function respPayload({ username, password }) {
+  const auth = password
+    ? username
+      ? command("AUTH", username, password)
+      : command("AUTH", password)
+    : "";
+  return auth + command("PING");
+}
 
 /**
  * `PING` the queue's Redis and expect `+PONG`.
@@ -87,7 +116,7 @@ const command = (...args) => `*${args.length}\r\n` + args.map(bulk).join("");
  * a password-protected Redis is one round trip like an open one, and a refused
  * password shows up as the absence of `+PONG`.
  */
-function probeRedis() {
+export function probeRedis() {
   let url;
   try {
     url = new URL(process.env.SEARCH_REDIS_URL ?? "redis://localhost:6379");
@@ -98,11 +127,10 @@ function probeRedis() {
   const port = Number.parseInt(url.port || "6379", 10);
   const host = url.hostname || "localhost";
 
-  const password = url.password ? decodeURIComponent(url.password) : "";
-  const username = url.username ? decodeURIComponent(url.username) : "";
-  const payload =
-    (password ? (username ? command("AUTH", username, password) : command("AUTH", password)) : "") +
-    command("PING");
+  const payload = respPayload({
+    username: url.username ? decodeURIComponent(url.username) : "",
+    password: url.password ? decodeURIComponent(url.password) : "",
+  });
 
   const socket = secure
     ? tls.connect({ host, port, servername: host, rejectUnauthorized: false })
@@ -146,7 +174,7 @@ function loadCa(stateDir) {
   }
 }
 
-function probeApi() {
+export function probeApi() {
   const port = Number.parseInt(process.env.SEARCH_PORT ?? "7443", 10);
   const host = process.env.SEARCH_HEALTHCHECK_HOST ?? "localhost";
   const stateDir = process.env.SEARCH_STATE_DIR ?? "/var/lib/actana-search";
@@ -188,4 +216,23 @@ function probeApi() {
   });
   request.on("error", (err) => fail(err.message));
   request.end();
+}
+
+// ---------------------------------------------------------------------------
+// The dispatch
+// ---------------------------------------------------------------------------
+
+/**
+ * Last, so that nothing it calls can be in a temporal dead zone, and guarded so
+ * the module can be imported by a test without probing anything.
+ *
+ * `import.meta.main` is true exactly when this file is the entry point, which
+ * is what `HEALTHCHECK CMD ["node", "/app/deploy/healthcheck.mjs"]` makes it.
+ * A test that imports the module gets the helpers and no exit; the probe's real
+ * behaviour is asserted by spawning this file, because a guard that silently
+ * stopped matching would be a health check that always passes.
+ */
+if (import.meta.main) {
+  if (isWorkerRole(process.env.SEARCH_ROLE)) probeRedis();
+  else probeApi();
 }
