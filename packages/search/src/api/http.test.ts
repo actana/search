@@ -1,13 +1,21 @@
-// The routing and body-reading plumbing, without a server around it.
+// The routing and body-reading plumbing, without a server around it — and, for
+// the body caps, *with* one, because the difference between "the promise
+// rejected" and "the client was told" only shows up over a socket.
+import * as http from "node:http";
+import type { AddressInfo } from "node:net";
 import { PassThrough } from "node:stream";
 import type { IncomingMessage } from "node:http";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   HttpError,
   MAX_JSON_BODY_BYTES,
+  MAX_MULTIPART_BYTES,
+  isMultipart,
   matchPath,
   readJsonBody,
   readMultipartBody,
+  sendError,
+  sendJson,
 } from "./http.ts";
 
 /** An `IncomingMessage` enough for the body readers: headers and a stream. */
@@ -50,6 +58,16 @@ describe("matchPath", () => {
 
   it("decodes a percent-escaped parameter", () => {
     expect(matchPath("/v1/kbs/:kbId", "/v1/kbs/kb%2F1")).toEqual({ kbId: "kb/1" });
+  });
+
+  it("answers `no match` for a malformed escape rather than throwing", () => {
+    // `decodeURIComponent("%E0")` raises `URIError`, and this function is
+    // called from the router's own `routes.find` — outside every try in the
+    // request path — so a throw here was an unhandled rejection and one bad URL
+    // could end the process.
+    expect(matchPath("/v1/kbs/:kbId/query", "/v1/kbs/%E0/query")).toBeNull();
+    expect(matchPath("/v1/kbs/:kbId", "/v1/kbs/%")).toBeNull();
+    expect(matchPath("/v1/kbs/:kbId/documents/:docId", "/v1/kbs/kb_1/documents/%C3%28")).toBeNull();
   });
 });
 
@@ -187,5 +205,111 @@ describe("readMultipartBody", () => {
 describe("the caps", () => {
   it("are what the documentation says, because a client sizes itself by them", () => {
     expect(MAX_JSON_BODY_BYTES).toBe(4 * 1024 * 1024);
+    expect(MAX_MULTIPART_BYTES).toBe(64 * 1024 * 1024);
+  });
+});
+
+/**
+ * The caps over a real socket.
+ *
+ * **The unit tests above cannot see the bug this covers.** A `PassThrough`
+ * standing in for an `IncomingMessage` has no socket, so `req.destroy()` — which
+ * is what this used to do the instant the cap was passed — destroys nothing and
+ * the rejection looks right. Over TCP it meant the connection was gone before
+ * `sendError` had written a byte, and the client got `ECONNRESET` instead of the
+ * `413` the contract promises. Small caps injected here; the production numbers
+ * are asserted above, and both code paths (JSON and multipart) go through the
+ * same `readBody`.
+ */
+describe("a body over the cap, over a real server", () => {
+  const JSON_CAP = 512;
+  const MULTIPART_CAP = 512;
+  let server: http.Server;
+  let port: number;
+
+  beforeAll(async () => {
+    server = http.createServer((req, res) => {
+      void (async () => {
+        try {
+          const body = isMultipart(req)
+            ? await readMultipartBody(req, MULTIPART_CAP)
+            : await readJsonBody(req, JSON_CAP);
+          sendJson(res, 200, { read: true, kind: typeof body });
+        } catch (err) {
+          sendError(res, err);
+        }
+      })();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    port = (server.address() as AddressInfo).port;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  /** POST some bytes and read whatever comes back, write errors included. */
+  function post(
+    headers: Record<string, string>,
+    body: Buffer,
+  ): Promise<{ status: number; body: string }> {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const req = http.request(
+        { host: "127.0.0.1", port, path: "/", method: "POST", headers },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (chunk: Buffer) => chunks.push(chunk));
+          res.on("end", () => {
+            settled = true;
+            resolve({
+              status: res.statusCode ?? 0,
+              body: Buffer.concat(chunks).toString("utf8"),
+            });
+          });
+        },
+      );
+      // The refusal carries `connection: close`, so the write half may fail
+      // *after* the answer arrived. That is the socket closing, not the test
+      // failing.
+      req.on("error", (err) => {
+        if (!settled) reject(err);
+      });
+      req.end(body);
+    });
+  }
+
+  it("answers 413 payload-too-large on a JSON body over the cap", async () => {
+    const answer = await post(
+      { "content-type": "application/json" },
+      Buffer.from(`{"text":"${"x".repeat(16 * 1024)}"}`, "utf8"),
+    );
+    expect(answer.status).toBe(413);
+    expect(JSON.parse(answer.body)).toMatchObject({ code: "payload-too-large" });
+  });
+
+  it("answers 413 payload-too-large on a multipart body over the cap", async () => {
+    const boundary = "----test-boundary-cap";
+    const envelope = Buffer.concat([
+      Buffer.from(
+        `--${boundary}\r\ncontent-disposition: form-data; name="file"; filename="big.txt"\r\n` +
+          "content-type: text/plain\r\n\r\n",
+        "utf8",
+      ),
+      Buffer.alloc(16 * 1024, 0x61),
+      Buffer.from(`\r\n--${boundary}--\r\n`, "utf8"),
+    ]);
+    const answer = await post(
+      { "content-type": `multipart/form-data; boundary=${boundary}` },
+      envelope,
+    );
+    expect(answer.status).toBe(413);
+    expect(JSON.parse(answer.body)).toMatchObject({ code: "payload-too-large" });
+  });
+
+  it("still reads a body under the cap", async () => {
+    const answer = await post({ "content-type": "application/json" }, Buffer.from('{"a":1}'));
+    expect(answer.status).toBe(200);
+    expect(JSON.parse(answer.body)).toMatchObject({ read: true });
   });
 });
