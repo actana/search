@@ -72,9 +72,30 @@ export const ExtractKeywordsResponseSchema = z.object({
 export type ExtractKeywordsResponse = z.infer<typeof ExtractKeywordsResponseSchema>;
 
 /**
- * `PUT|DELETE /v1/kbs/:id/chunks/:chunkId/keywords` — attach a keyword to one
- * chunk by hand. Exactly one of `kbKeywordId` (an existing row) and
- * `displayLabel` (create-or-reuse), which is the lifted route's own rule.
+ * Attach a keyword to one chunk by hand. Exactly one of `kbKeywordId` (an
+ * existing row) and `displayLabel` (create-or-reuse), which is the lifted
+ * route's own rule.
+ *
+ * **Two addresses for one chunk, and both are served.**
+ *
+ *   - `PUT|POST /v1/kbs/:kbId/chunks/:chunkId/keywords`, and
+ *     `DELETE /v1/kbs/:kbId/chunks/:chunkId/keywords/:keywordId` — the chunk by
+ *     its own id, which is what this docstring promised before either existed.
+ *     A chunk id is unique across the instance and the KB in the path is what
+ *     makes it *this* caller's chunk, so the document segment identified
+ *     nothing extra. It is also the only shape some callers can send: Studio's
+ *     manual keyword overlay is
+ *     `POST /api/knowledge/[id]/chunks/[embeddingId]/keywords` and its
+ *     `kb_admin` input is `{ knowledgeBaseId, chunkId }`, so against the
+ *     document-addressed form alone it had no document id to put in the path
+ *     and refused (TASK-009's second round, contract change 10).
+ *   - `PUT /v1/kbs/:kbId/documents/:docId/chunks/:chunkId/keywords`, and its
+ *     `DELETE` — the same thing under the document. Kept: it is what shipped,
+ *     and it is what a caller walking a document's chunks already writes.
+ *
+ * The document-addressed form additionally asserts that the chunk is in *that*
+ * document; the chunk-addressed form asserts that it is in the KB. Otherwise
+ * they are one handler with one behaviour.
  */
 export const AttachChunkKeywordRequestSchema = z
   .object({

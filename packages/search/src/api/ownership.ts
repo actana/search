@@ -24,6 +24,7 @@ import { notFound } from "./http.ts";
 
 export type KbRow = typeof knowledgeBase.$inferSelect;
 export type DocumentRow = typeof document.$inferSelect;
+export type ChunkRow = typeof embedding.$inferSelect;
 
 /**
  * The KB this route names, or a 404.
@@ -82,6 +83,40 @@ export async function requireDocument(kbId: string, documentId: string): Promise
     .limit(1);
   if (!row) throw notFound(`no document ${documentId} in ${kbId}`);
   return row;
+}
+
+/**
+ * The chunk this route names, addressed by its own id inside the KB.
+ *
+ * **For the routes that hold a chunk id and no document id.** A chunk id is
+ * unique across the instance, so the KB in the path is what makes it this
+ * caller's chunk rather than somebody else's — the same check
+ * {@link requireChunk} makes one level down, against a document instead. The
+ * document is joined so that a chunk of an archived or deleted document is as
+ * absent here as its document is on every other route.
+ *
+ * `404` for a chunk outside this KB: whose it is is not something to confirm
+ * (ADR 0009 D5).
+ */
+export async function requireChunkInKb(
+  kbId: string,
+  chunkId: string,
+): Promise<ChunkRow> {
+  const [row] = await db
+    .select()
+    .from(embedding)
+    .innerJoin(document, eq(embedding.documentId, document.id))
+    .where(
+      and(
+        eq(embedding.id, chunkId),
+        eq(embedding.knowledgeBaseId, kbId),
+        isNull(document.archivedAt),
+        isNull(document.deletedAt),
+      ),
+    )
+    .limit(1);
+  if (!row) throw notFound(`no chunk ${chunkId} in ${kbId}`);
+  return row.embedding;
 }
 
 /** The chunk this route names, in that document. */

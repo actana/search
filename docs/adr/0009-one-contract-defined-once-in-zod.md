@@ -90,6 +90,63 @@ collapses the blend to pure semantic similarity, whatever `keywordWeight` says
 wire has to be able to name which one it means. It is not a tuning knob: the
 same request with and without it returns materially different documents.
 
+**D3a — The `topK` ceiling is 100, and it was 50.** A revision, and the only
+number in this contract that has moved. Studio's own public search routes accept
+`topK ≤ 100` (`app/api/knowledge/search/route.ts`,
+`app/api/v1/knowledge/search`), and the frozen engines take it unchanged — it
+reaches SQL as a `LIMIT`. Against a ceiling of 50 a caller asking for 80 had two
+options and both were wrong: clamp, and answer with fewer rows than were asked
+for, or fan out at 50 per KB and merge, which is a *different* result set for a
+single-KB search. So a wired Studio route declined to use this wire at all for
+`topK > 50` — which is the failure D3 exists to prevent, one field further out:
+the wire's field names are Studio's, and so now is its ceiling. Nothing else
+moved. What bounds a caller's cost is the rate limit on the query route, not
+`topK`.
+
+**D4c — `text` is optional exactly where nothing is embedded, and
+`distanceThreshold` is statable exactly where something is thresholded.** Two
+fields, one rule, and it follows from D4: if the request picks the engine, the
+request has to be able to describe what that engine takes.
+
+The tag-only v1 search (`handleTagOnlySearch`) filters by tag and ranks by
+nothing. It is a frozen entry point Studio has always called, and against
+`text: z.string().min(1)` it was unexpressible — `''` is a `400`, and sending
+the tag values as the text is a different ranking — so `text` is optional when
+`mode: 'v1-tags'` and `tags` is non-empty, and required everywhere else.
+Symmetrically `distanceThreshold` is accepted for `v1-tags` and **refused with a
+`400` for `hybrid`**: that path ranks by a blended score whose floor is
+`minScore` and has no distance to threshold, and a field accepted and dropped is
+indistinguishable from a field applied. A caller that states one reads it back
+on `strategy.distanceThreshold`, which reports the threshold that ran rather
+than the one this instance would have computed.
+
+Why the instance cannot simply compute it: the threshold is a property of the
+*call*, and a caller's call may span several knowledge bases while this route
+names one. `getQueryStrategy(kbCount, topK)` answers `0.8` above three KBs and
+`1.0` otherwise, so a fan-out asking one KB at a time can only ever infer
+`1.0` — the single value for which the wired and the unwired path agree by
+accident.
+
+**D10 — A chunk is addressable by its own id as well as through its document.**
+`GET /v1/kbs/:kbId/chunks/:chunkId`, and the keyword attach and detach beside
+it, alongside the document-addressed forms that shipped.
+
+A chunk id is unique across the instance and the `:kbId` is what makes it this
+caller's, so the document segment never identified anything the KB and the chunk
+id did not. It is also unavailable to some callers: Studio's manual keyword
+overlay is `POST /api/knowledge/[id]/chunks/[embeddingId]/keywords` and its
+`kb_admin` tool input is `{ knowledgeBaseId, chunkId }`, so against the
+document-addressed route alone it had nothing to put in the path and no
+chunk-by-id read to recover a document from — and scanning every document's
+chunks is not a lookup. This contract's own docstring for
+`AttachChunkKeywordRequestSchema` had described the chunk-addressed shape since
+before either route existed, which is the other half of why this one was
+missing rather than wrong.
+
+Each addressing is one handler, so they cannot drift into meaning different
+things, and both are kept: a caller walking a document's chunks holds a document
+id and should not have to drop it.
+
 **D5 — A row belonging to another paired client is `404`, not `403`.** A `403`
 on somebody else's knowledge base confirms that the id names something, which
 makes the id space worth walking. A `404` says the same thing to a caller with a
@@ -214,6 +271,26 @@ says, and the row is the truth.
 - Studio's wrapper layer (TASK-009) is a mapper for dates and envelopes and
   nothing else — every field it needs is on the wire under the name it already
   uses.
+- **A route may add a check the frozen function does not make, and the bulk
+  document route is the clearest case.** `bulkDocumentOperation` acts on the ids
+  it recognises and logs the rest, which is right for a caller holding a
+  transaction and wrong for one holding a socket: a mistyped id would be a `200`
+  and a count to diff. So the route proves every id is in the KB first and
+  refuses the whole call with a `404` naming none of them (D5). Its two request
+  forms are the frozen service's two and no more — a list of ids, or an
+  `enabledFilter` — because the by-filter function reads `enabled` and no other
+  column, and a richer filter on the wire would be this contract inventing
+  engine behaviour rather than exposing it (ADR 0005). Filtering by tag is the
+  document listing's job, and its ids can be passed here.
+- **Two tables are visible through the chunk routes, and the contract says so
+  rather than smoothing it over.** `createChunk`, the chunk reads and the keyword
+  attach are v1 code over the shared `embedding` table; the `hybrid` rank reads
+  the KB's own partition. The file pipeline writes both and `ingestDocument`
+  writes only the partition, so a text-ingested document has no chunks on those
+  routes and a hand-written chunk is found by `mode: 'v1-tags'` and not by
+  `hybrid`. That is Studio's behaviour unchanged (ADR 0005) and it is documented
+  on the routes, because the alternative — a route that reconciled the two — is
+  new retrieval behaviour wearing a contract's clothes.
 - `/v1/endpoints` is the one route whose body is not only a request shape but a
   *declaration*: `GET`'s `source` is the object the client last declared,
   `resolverScope` included, because that field is the one Search, the client and

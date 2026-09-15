@@ -66,6 +66,9 @@ const KB = {
   connectorTypes: [],
 };
 
+/** An empty page, for a listing whose rows are not what is being asserted. */
+const EMPTY_PAGE = { total: 0, limit: 50, offset: 0, hasMore: false };
+
 beforeAll(async () => {
   server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -149,6 +152,7 @@ describe("the namespaces", () => {
     await check(() => client.kbs.get("kb_1"), "GET", "/v1/kbs/kb_1");
     await check(() => client.kbs.update("kb_1", { name: "y" }), "PATCH", "/v1/kbs/kb_1");
     await check(() => client.kbs.delete("kb_1"), "DELETE", "/v1/kbs/kb_1");
+    await check(() => client.kbs.restore("kb_1"), "POST", "/v1/kbs/kb_1/restore");
     await check(() => client.kbs.query("kb_1", { text: "q" }), "POST", "/v1/kbs/kb_1/query");
     await check(
       () => client.kbs.ingest("kb_1", { filename: "a.md", text: "hello" }),
@@ -191,6 +195,27 @@ describe("the namespaces", () => {
       () => client.documents.upsert("kb_1", { filename: "a.md", text: "x" }),
       "POST",
       "/v1/kbs/kb_1/documents/upsert",
+    );
+    await check(
+      () => client.documents.bulk("kb_1", { operation: "disable", documentIds: ["d_1"] }),
+      "POST",
+      "/v1/kbs/kb_1/documents/bulk",
+    );
+    await check(
+      () => client.chunks.create("kb_1", "d_1", { content: "x" }),
+      "POST",
+      "/v1/kbs/kb_1/documents/d_1/chunks",
+    );
+    await check(() => client.chunks.get("kb_1", "c_1"), "GET", "/v1/kbs/kb_1/chunks/c_1");
+    await check(
+      () => client.chunks.attachKeyword("kb_1", "c_1", { displayLabel: "Leave" }),
+      "PUT",
+      "/v1/kbs/kb_1/chunks/c_1/keywords",
+    );
+    await check(
+      () => client.chunks.detachKeyword("kb_1", "c_1", "k_1"),
+      "DELETE",
+      "/v1/kbs/kb_1/chunks/c_1/keywords/k_1",
     );
     await check(() => client.keywords.list("kb_1"), "GET", "/v1/kbs/kb_1/keywords");
     await check(
@@ -253,6 +278,67 @@ describe("the namespaces", () => {
   it("unwraps the collection envelopes the routes answer with", async () => {
     canned = { status: 200, json: ListKbsResponseSchema.parse({ knowledgeBases: [KB] }) };
     await expect(client.kbs.list()).resolves.toEqual([KnowledgeBaseSchema.parse(KB)]);
+  });
+
+  it("answers `kbs.restore` with the knowledge base, renamed or not", async () => {
+    // The restore may have had to rename the KB (`generateRestoreName`), so the
+    // route answers with the record rather than an acknowledgement and this
+    // method's return type is the record.
+    const renamed = { ...KB, name: "Handbook_restored", deletedAt: null };
+    canned = { status: 200, json: KnowledgeBaseSchema.parse(renamed) };
+    await expect(client.kbs.restore("kb_1")).resolves.toMatchObject({
+      name: "Handbook_restored",
+      deletedAt: null,
+    });
+    expect(last().body.length).toBe(0);
+  });
+
+  it("addresses a chunk by its own id, with no document in the path", async () => {
+    /**
+     * The whole point of the chunk-by-id family: a caller that holds
+     * `{ knowledgeBaseId, chunkId }` — Studio's chunk editor, its `kb_admin`
+     * tool — can now say what it means. The document-addressed methods are
+     * still there and still take a document.
+     */
+    canned = { status: 200, json: {} };
+    await client.chunks.get("kb/1", "c/1").catch(() => undefined);
+    expect(last().path).toBe("/v1/kbs/kb%2F1/chunks/c%2F1");
+
+    await client.keywords
+      .attachToChunk("kb_1", "d_1", "c_1", { displayLabel: "Leave" })
+      .catch(() => undefined);
+    expect(last().path).toBe("/v1/kbs/kb_1/documents/d_1/chunks/c_1/keywords");
+    await client.chunks.attachKeyword("kb_1", "c_1", { displayLabel: "Leave" }).catch(() => undefined);
+    expect(last().path).toBe("/v1/kbs/kb_1/chunks/c_1/keywords");
+    // Same body either way: one handler, two addresses.
+    expect(JSON.parse(last().body.toString("utf8"))).toEqual({ displayLabel: "Leave" });
+  });
+
+  it("sends `tagFilters` as one JSON parameter and the rest as scalars", async () => {
+    /**
+     * A tag filter is a list of conditions — operator, second bound, several on
+     * one slot — and a query string holds strings, so the SDK encodes the list
+     * once rather than flattening it into `tag1=…` and losing the operators.
+     * The route JSON-decodes exactly this.
+     */
+    canned = { status: 200, json: { documents: [], pagination: EMPTY_PAGE } };
+    await client.documents.list("kb_1", {
+      limit: 25,
+      tagFilters: [
+        { tagSlot: "tag1", fieldType: "text", operator: "eq", value: "handbook" },
+        { tagSlot: "number1", fieldType: "number", operator: "between", value: "1", valueTo: "9" },
+      ],
+    });
+    const query = new URL(last().path, "http://x").searchParams;
+    expect(query.get("limit")).toBe("25");
+    expect(JSON.parse(query.get("tagFilters")!)).toEqual([
+      { tagSlot: "tag1", fieldType: "text", operator: "eq", value: "handbook" },
+      { tagSlot: "number1", fieldType: "number", operator: "between", value: "1", valueTo: "9" },
+    ]);
+
+    // Absent, it is not on the path at all — not as `undefined`, not as `[]`.
+    await client.documents.list("kb_1", { limit: 25 });
+    expect(last().path).toBe("/v1/kbs/kb_1/documents?limit=25");
   });
 });
 
