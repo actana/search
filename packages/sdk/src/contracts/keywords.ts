@@ -113,3 +113,57 @@ export const ChunkKeywordResponseSchema = z.object({
   attached: z.boolean(),
 });
 export type ChunkKeywordResponse = z.infer<typeof ChunkKeywordResponseSchema>;
+
+/**
+ * One `embedding_keyword` link, as `GET …/chunks/:chunkId/keywords` returns it.
+ *
+ * **A link, not a keyword.** {@link KeywordSchema} is the KB's vocabulary row
+ * and it says nothing about which chunks carry it — `usageCount` is a count
+ * across the whole KB. This shape is that row *plus the join*: `source` says
+ * whether the extractor made the link or a person did, and `attachedAt` is
+ * when. Both come off the link row, so they differ between two chunks carrying
+ * the same keyword, which is the whole reason this listing is not
+ * `keywords.list` filtered.
+ *
+ * The keyword half is Studio's own shape
+ * (`GET /api/knowledge/[id]/chunks/[embeddingId]/keywords` answers
+ * `{ id, keyword, displayLabel, usageCount, source }`), so a caller reading
+ * either surface reads the same field names — with `knowledgeBaseId`, the two
+ * vocabulary timestamps and `createdByUserId` carried as well because the row
+ * has them and dropping them would make this the one keyword shape on the wire
+ * that is not a {@link Keyword}.
+ */
+export const ChunkKeywordLinkSchema = KeywordSchema.extend({
+  /** Who made the link: the inference extractor, or a person. */
+  source: z.enum(["llm", "manual"]),
+  /** When the link was made. The link row's own timestamp, not the keyword's. */
+  attachedAt: IsoDateTimeSchema,
+});
+export type ChunkKeywordLink = z.infer<typeof ChunkKeywordLinkSchema>;
+
+/**
+ * `GET /v1/kbs/:kbId/chunks/:chunkId/keywords` — which keywords are attached to
+ * one chunk, ordered by the canonical form.
+ *
+ * **The read half of the chunk-keyword surface.** The attach and the detach
+ * have been chunk-addressed since the first round of these additions, but
+ * nothing read the links back: `keywords.list` answers the KB's vocabulary,
+ * `ChunkSchema` carries no keywords, and a caller that wanted one chunk's
+ * overlay had nowhere to ask. Studio's own overlay route therefore refused on a
+ * wired knowledge base rather than answer from its shadow tables, where a wired
+ * chunk has no links at all — an answer that reads as data loss (TASK-009c,
+ * contract request 10's read half).
+ *
+ * The listing is the **route's** query rather than a lifted one: the keyword
+ * service has no per-chunk read to call (it attaches, detaches and
+ * re-aggregates), so this is a read of `embedding_keyword ⨝ kb_keyword` with
+ * the KB pinned, which is what `keywordById` next to it already does for the
+ * same table and the same reason (ADR 0005 — the engine is not edited to grow
+ * one).
+ *
+ * `read` scope: it is a read, and the two writes beside it are `write`.
+ */
+export const ListChunkKeywordsResponseSchema = z.object({
+  keywords: z.array(ChunkKeywordLinkSchema),
+});
+export type ListChunkKeywordsResponse = z.infer<typeof ListChunkKeywordsResponseSchema>;

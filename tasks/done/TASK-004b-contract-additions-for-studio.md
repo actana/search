@@ -227,3 +227,96 @@ the engine would skip refused with a `404` and then accepted once the row is
 back.
 
 q01–q15 unchanged and green.
+
+## Addendum: the two open halves (2026-09-15)
+
+TASK-009c consumed all ten additions and closed contract requests 1–12 —
+**except two halves**, each of which is one field or one route rather than a
+design question. Both are here. Nothing under `src/{kb,knowledge,v1}/**` was
+touched again; both are additive and neither changes an existing answer's
+meaning.
+
+| # | Half | Addition |
+|---|---|---|
+| 10 | the **read** of the chunk-keyword overlay. The attach and the detach were chunk-addressed in the round above and nothing read the links back, so `GET /api/knowledge/[id]/chunks/[embeddingId]/keywords` was the last surface in Studio still refusing on a wired knowledge base — answering it from the shadow tables would report every wired chunk as having no keywords, which reads as data loss | `GET /v1/kbs/:kbId/chunks/:chunkId/keywords` → `ListChunkKeywordsResponseSchema`, SDK `chunks.keywords(kbId, chunkId)` |
+| 12 | **`documentId` on `ChunkSchema`**. `chunks.get` takes no document, so the wrapper stamped the caller's own `documentId` onto the answer rather than reading one — and the assertion Studio's unwired lookup makes (`embedding.document_id = :documentId`) had nothing on the wire to make it against | `ChunkSchema.documentId`, required, on all four routes that answer with a chunk |
+
+### The listing is a link, not a keyword
+
+`ChunkKeywordLinkSchema` is `KeywordSchema` plus the join's own two fields:
+`source` (`llm` for a link the extractor made, `manual` for one a person made)
+and `attachedAt`. Both come off the `embedding_keyword` row, so two chunks
+carrying the same keyword disagree about them — which is the whole reason this
+is not `keywords.list` filtered. `usageCount` is carried unchanged and still
+means what it always did: chunk links across the **whole KB**, not a count of
+anything about this chunk. It is on the row the join already reads and Studio's
+own answer has it, so leaving it out would have cost a second read and told a
+reader less.
+
+The keyword half is Studio's field names (`{ id, keyword, displayLabel,
+usageCount, source }`), with `knowledgeBaseId`, the two vocabulary timestamps
+and `createdByUserId` carried as well — dropping them would have made this the
+one keyword shape on the wire that is not a `Keyword`, and a caller reading both
+surfaces would have had two shapes for one row.
+
+Ordered by the canonical form, which is Studio's `ORDER BY kb_keyword.keyword`.
+
+### Three decisions inside these two
+
+- **The listing is the route's query, because the engine has none.** The lifted
+  `kb/keywords/service.ts` attaches, detaches, upserts and re-aggregates; there
+  is no per-chunk read in it to call, and adding one would be editing a frozen
+  module (ADR 0005). So `chunkKeywordLinks` reads
+  `embedding_keyword ⨝ kb_keyword` in `routes/chunks.ts` — the same shape, and
+  for the same reason, as the `keywordById` already beside it. It pins
+  `kb_keyword.knowledge_base_id` as well as the chunk: the join row names a
+  keyword by id and nothing in the table binds the two to one knowledge base,
+  so pinning it is what stops one KB's link from putting another KB's
+  vocabulary row on the wire. `source` is narrowed to the two values the engine
+  writes, because the column is plain `text` in the schema rather than an enum.
+- **`documentId` is required, not optional.** The question the brief asked was
+  whether any route that produces a `Chunk` would need a second query to
+  populate it, and none does: the listing, the `POST` and the `PATCH` are all
+  addressed *through* a document and read it off the path, and the chunk-by-id
+  read is handed the whole `embedding` row by `requireChunkInKb`. So
+  `chunkToWire` takes the document id as a **second argument** rather than
+  reading an optional key off the row — the lifted `ChunkData` has no
+  `documentId` and never will, and an argument is what makes "every caller
+  holds this already" checked by the compiler instead of hoped for.
+- **`chunks.keywords` answers the array, not the envelope**, as `keywords.list`
+  does: there is nothing else in it and no paging on it.
+
+### Tests
+
+`contracts.test.ts` — 30 → 34. `ChunkSchema.documentId` required, with the
+issue landing on the field; the link shape round-tripping with both of the
+join's fields; `source` accepting `llm` and `manual` and refusing four things
+that are neither; `attachedAt` required, because it is not the keyword's
+timestamp.
+
+`client.test.ts` — +1 row in the route table, and the unwrapping case now covers
+`chunks.keywords` beside `kbs.list`.
+
+`fixture-suite.rest.test.ts` — +1 test, and two amended:
+
+| Test | What it proves |
+|---|---|
+| lists one chunk's keyword links, and says which of them a person made | Over a file-ingested document whose ingest also enqueued `kb-keywords-extract`: every link the extractor made reports `llm`, and its keyword half is asserted **field for field against `keywords.list`** — so this is the vocabulary row plus the join and not a second shape for it. Then a keyword attached by hand joins the same listing reporting `manual` with the extractor's links untouched, a detach takes it back out, a hand-written chunk no extractor has read is `[]` rather than a `404`, and another client's read of the chunk, this client's read of it under the wrong KB and an unknown chunk id are all `404` |
+| writes a chunk by hand (amended) | `documentId` on the create, on every row of the listing, and on the `PATCH` — and each listed row parsed by `ChunkSchema` with the field required |
+| reads a chunk by its own id (amended) | `documentId` on the one route with no document in its path, read off the `embedding` row |
+
+q01–q15 unchanged and green.
+
+### Gate
+
+```sh
+pnpm typecheck && pnpm lint && node scripts/check-strip-types.mjs \
+  && pnpm audit --prod --audit-level high
+SEARCH_TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/search_test pnpm test
+node packages/sdk/scripts/rehearse-npm-pack.mjs
+```
+
+1106 → 1111 passing (358 + 620 + 73 + 60), no reds, no dependency added and no
+version bumped. Five new cases: the four contract ones and the listing over the
+wire — `client.test.ts`'s two additions are rows inside cases that already
+existed.

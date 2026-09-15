@@ -33,6 +33,7 @@ import type {
   BulkDocumentsResponse,
   Capabilities,
   Chunk,
+  ChunkKeywordLink,
   ChunkKeywordResponse,
   ClusteringStatus,
   CreateChunkRequest,
@@ -53,6 +54,7 @@ import type {
   IngestResponse,
   Keyword,
   KnowledgeBase,
+  ListChunkKeywordsResponse,
   ListChunksQuery,
   ListChunksResponse,
   ListClustersQuery,
@@ -518,6 +520,27 @@ export class SearchClient {
     /** `GET /v1/kbs/:id/chunks/:chunkId`. 404 for a chunk outside this KB. */
     get: (kbId: string, chunkId: string): Promise<Chunk> =>
       this.request<Chunk>("GET", chunkPath(kbId, chunkId)),
+
+    /**
+     * `GET /v1/kbs/:id/chunks/:chunkId/keywords` — this chunk's keyword links.
+     *
+     * The **links**, not the KB's vocabulary: each row is the keyword plus the
+     * join, so it carries `source` (`llm` for the extractor's, `manual` for a
+     * person's) and `attachedAt`, neither of which
+     * {@link SearchClient.keywords}`.list` can tell you. Ordered by the
+     * canonical form. `404` for a chunk outside this KB, as
+     * {@link SearchClient.chunks}`.get` is.
+     *
+     * Unwrapped to the array, as `keywords.list` is: there is nothing else in
+     * the envelope and no paging on it.
+     */
+    keywords: async (kbId: string, chunkId: string): Promise<ChunkKeywordLink[]> => {
+      const answer = await this.request<ListChunkKeywordsResponse>(
+        "GET",
+        `${chunkPath(kbId, chunkId)}/keywords`,
+      );
+      return answer.keywords;
+    },
 
     /** `PUT /v1/kbs/:id/chunks/:chunkId/keywords` — attach, by chunk id. */
     attachKeyword: (

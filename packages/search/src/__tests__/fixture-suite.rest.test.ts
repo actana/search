@@ -131,6 +131,8 @@ import type {
   V1TagQueryResponse,
 } from "@actana/search/contracts";
 import {
+  ChunkSchema,
+  ListChunkKeywordsResponseSchema,
   ListDocumentsResponseSchema,
   SEARCH_EVENT_ID_HEADER,
   SEARCH_SIGNATURE_HEADER,
@@ -1738,6 +1740,9 @@ describeDb("KB behaviour freeze, over REST (fixture suite)", () => {
       "Quetzal provisioning is reviewed every Thursday by the platform duty officer.";
     const chunk = await client.chunks.create(sandboxKbId, doc.documentId, { content });
     expect(chunk).toMatchObject({
+      // The document the route was addressed at, off the chunk rather than
+      // assumed by the caller.
+      documentId: doc.documentId,
       chunkIndex: before.chunkCount,
       content,
       contentLength: content.length,
@@ -1772,6 +1777,19 @@ describeDb("KB behaviour freeze, over REST (fixture suite)", () => {
     });
     expect(second.chunkIndex).toBe(chunk.chunkIndex + 1);
     expect(second.enabled).toBe(false);
+
+    // Every route that answers with a chunk carries `documentId`, and the
+    // response satisfies its own schema with the field required.
+    const page = await client.documents.chunks(sandboxKbId, doc.documentId, { limit: 500 });
+    expect(page.chunks.map((c) => c.documentId)).toEqual(page.chunks.map(() => doc.documentId));
+    for (const row of page.chunks) expect(ChunkSchema.parse(row)).toEqual(row);
+    const patched = await client.documents.updateChunk(
+      sandboxKbId,
+      doc.documentId,
+      second.id,
+      { enabled: true },
+    );
+    expect(patched.documentId).toBe(doc.documentId);
 
     // Somebody else's KB, and a document that is not in this one: 404 either
     // way, and the refusal is the KB's rather than the chunk writer's.
@@ -1812,6 +1830,10 @@ describeDb("KB behaviour freeze, over REST (fixture suite)", () => {
 
     const byId = await client.chunks.get(sandboxKbId, chunkId);
     expect(byId).toEqual(listed.chunks[0]);
+    // The one route with no document in its path still says which document the
+    // chunk is in — read off the `embedding` row, not stamped on by the caller
+    // (TASK-009c, contract request 12).
+    expect(byId.documentId).toBe(doc.documentId);
 
     // Somebody else's KB, and a chunk that is in a different KB of this
     // client's: 404 both times, and it says nothing about whose chunk it is.
@@ -1859,6 +1881,126 @@ describeDb("KB behaviour freeze, over REST (fixture suite)", () => {
         json: { kbKeywordId: attached.keyword.id, displayLabel: "Both" },
       }),
     ).rejects.toMatchObject({ status: 400, code: "validation-failed" });
+  }, 180_000);
+
+  it("lists one chunk's keyword links, and says which of them a person made", async () => {
+    /**
+     * The last surface that refused on a wired workspace (TASK-009c, contract
+     * request 10's read half). `keywords.list` answers the KB's *vocabulary*
+     * with a usage count across the whole KB; this answers which of those rows
+     * carry **this chunk**, and with each one the `source` and `attachedAt` off
+     * the join — so a listing that were `keywords.list` filtered could not tell
+     * a link the extractor made from one a person made.
+     *
+     * A file ingest again: the chunk routes read the shared `embedding` table
+     * and the text path does not write it. The ingest also enqueues
+     * `kb-keywords-extract`, so once the inline jobs settle this document's
+     * chunks carry the extractor's `llm` links — which is what makes the
+     * `manual` attach below distinguishable rather than merely present.
+     */
+    const doc = await client.kbs.ingest(sandboxKbId, {
+      filename: "chunk-keyword-links.md",
+      mimeType: "text/markdown",
+      file: Buffer.from(
+        "# Parental leave\n\nParental leave is six weeks at full pay, and the " +
+          "security review of every expense runbook is quarterly.\n",
+        "utf8",
+      ),
+    });
+    expect((await waitForDocument(sandboxKbId, doc.documentId)).processingStatus).toBe("completed");
+    await inlineJobsSettled();
+
+    const page = await client.documents.chunks(sandboxKbId, doc.documentId, { limit: 500 });
+    expect(page.chunks.length).toBeGreaterThan(0);
+
+    // Whichever chunk the extractor reached — the deterministic extractor picks
+    // from `TOPIC_VOCABULARY`, and which chunk carries which topic is the
+    // engine's business, so the test finds one rather than naming one.
+    let chunkId = "";
+    let links: Awaited<ReturnType<typeof client.chunks.keywords>> = [];
+    for (const chunk of page.chunks) {
+      const answer = await client.chunks.keywords(sandboxKbId, chunk.id);
+      if (answer.length > 0) {
+        chunkId = chunk.id;
+        links = answer;
+        break;
+      }
+    }
+    expect(chunkId).not.toBe("");
+
+    // The response is its own contract's, and every link is the extractor's.
+    expect(ListChunkKeywordsResponseSchema.parse({ keywords: links }).keywords).toEqual(links);
+    expect(links.map((l) => l.source)).toEqual(links.map(() => "llm"));
+
+    // The keyword half is the vocabulary's own row, field for field — this is
+    // the KB's keyword *plus* the join, not a second shape for the same thing.
+    const vocabulary = new Map(
+      (await client.keywords.list(sandboxKbId, { limit: 500 })).map((k) => [k.id, k]),
+    );
+    for (const link of links) {
+      expect(link.knowledgeBaseId).toBe(sandboxKbId);
+      const { source: _source, attachedAt, ...keyword } = link;
+      expect(keyword).toEqual(vocabulary.get(link.id));
+      // The link's own timestamp is a real one, and it is read from the join
+      // row rather than from the keyword.
+      expect(Number.isNaN(Date.parse(attachedAt))).toBe(false);
+      expect(link.usageCount).toBeGreaterThan(0);
+    }
+    // Ordered by the canonical form, which is what the route promises.
+    expect(links.map((l) => l.keyword)).toEqual([...links.map((l) => l.keyword)].sort());
+
+    // A keyword attached by hand joins the same listing, reporting `manual` —
+    // the one thing the vocabulary listing cannot say about a chunk.
+    const attached = await client.chunks.attachKeyword(sandboxKbId, chunkId, {
+      // One token: `normalizeKeyword` takes a word or a hyphenated pair, and
+      // refuses anything else with a `400` — which the attach test next door
+      // asserts and this one is not re-asserting.
+      displayLabel: "Quetzal",
+    });
+    expect(attached.attached).toBe(true);
+    const withManual = await client.chunks.keywords(sandboxKbId, chunkId);
+    expect(withManual).toHaveLength(links.length + 1);
+    const manual = withManual.find((l) => l.id === attached.keyword.id);
+    expect(manual).toMatchObject({
+      keyword: "quetzal",
+      displayLabel: "Quetzal",
+      source: "manual",
+      knowledgeBaseId: sandboxKbId,
+    });
+    // The extractor's links are untouched by the attach: `source` is per link.
+    expect(withManual.filter((l) => l.source === "llm").map((l) => l.id).sort()).toEqual(
+      links.map((l) => l.id).sort(),
+    );
+
+    // And the detach takes it out of the listing, which is how a caller sees
+    // that this read and those two writes are about the same rows.
+    await client.chunks.detachKeyword(sandboxKbId, chunkId, attached.keyword.id);
+    expect((await client.chunks.keywords(sandboxKbId, chunkId)).map((l) => l.id)).not.toContain(
+      attached.keyword.id,
+    );
+
+    // A chunk with no links at all is an empty listing, not a 404: a
+    // hand-written chunk is one no extraction has seen.
+    const fresh = await client.chunks.create(sandboxKbId, doc.documentId, {
+      content: "A chunk written by hand, which no extractor has read.",
+    });
+    expect(await client.chunks.keywords(sandboxKbId, fresh.id)).toEqual([]);
+
+    // Scoped exactly as `chunks.get` is. Another client's read of this chunk,
+    // and this client's read of it under the wrong KB, are both 404 — and
+    // neither answer says whose chunk it is (ADR 0009 D5).
+    await expect(clientB.chunks.keywords(sandboxKbId, chunkId)).rejects.toMatchObject({
+      status: 404,
+      code: "not-found",
+    });
+    await expect(client.chunks.keywords(kbIds.sdk, chunkId)).rejects.toMatchObject({
+      status: 404,
+      code: "not-found",
+    });
+    await expect(
+      client.chunks.keywords(sandboxKbId, "c_does_not_exist"),
+    ).rejects.toMatchObject({ status: 404, code: "not-found" });
+    await inlineJobsSettled();
   }, 180_000);
 
   it("refuses a chunk edit a KB has nothing to re-embed with, as the create does", async () => {

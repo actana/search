@@ -16,9 +16,11 @@
 import { describe, expect, it } from "vitest";
 import {
   BulkDocumentsRequestSchema,
+  ChunkSchema,
   CreateChunkRequestSchema,
   IngestMultipartFieldsSchema,
   IngestResponseSchema,
+  ListChunkKeywordsResponseSchema,
   ListDocumentsQuerySchema,
   QueryRequestSchema,
 } from "../contracts.ts";
@@ -406,5 +408,88 @@ describe("ListDocumentsQuerySchema: `tagFilters`", () => {
         tagFilters: [{ tagSlot: "number1", fieldType: "number", operator: "eq", value: 42 }],
       }).success,
     ).toBe(false);
+  });
+});
+
+/** A chunk as the four routes that produce one answer with it. */
+const CHUNK = {
+  id: "c_1",
+  documentId: "d_1",
+  chunkIndex: 0,
+  content: "Six weeks, at full pay.",
+  contentLength: 23,
+  tokenCount: 6,
+  enabled: true,
+  startOffset: 0,
+  endOffset: 23,
+  tag1: "handbook",
+  tag2: null,
+  tag3: null,
+  tag4: null,
+  tag5: null,
+  tag6: null,
+  tag7: null,
+  createdAt: "2026-09-15T00:00:00.000Z",
+  updatedAt: "2026-09-15T00:00:00.000Z",
+};
+
+describe("ChunkSchema: `documentId`", () => {
+  it("is required, because every route that answers with a chunk can say it", () => {
+    // Three of the four are addressed through a document and the fourth reads
+    // the whole `embedding` row, so there is no producer that would need it
+    // optional — and a caller that addressed a chunk by id alone can check
+    // which document it is in rather than assume (TASK-009c, request 12).
+    expect(ChunkSchema.parse(CHUNK).documentId).toBe("d_1");
+    const { documentId: _omitted, ...without } = CHUNK;
+    const result = ChunkSchema.safeParse(without);
+    expect(result.success).toBe(false);
+    expect(result.success ? [] : result.error.issues[0]!.path).toEqual(["documentId"]);
+  });
+});
+
+describe("ListChunkKeywordsResponseSchema", () => {
+  /** One `embedding_keyword` row joined to its vocabulary row. */
+  const LINK = {
+    id: "k_1",
+    knowledgeBaseId: "kb_1",
+    keyword: "parental-leave",
+    displayLabel: "Parental Leave",
+    usageCount: 4,
+    createdAt: "2026-09-15T00:00:00.000Z",
+    updatedAt: "2026-09-15T00:00:00.000Z",
+    createdByUserId: null,
+    source: "manual",
+    attachedAt: "2026-09-15T01:00:00.000Z",
+  };
+
+  it("is a keyword plus the join's own two fields", () => {
+    // `source` and `attachedAt` are the reason this is not `keywords.list`
+    // filtered: they are the *link's*, so two chunks carrying the same keyword
+    // disagree about them.
+    const parsed = ListChunkKeywordsResponseSchema.parse({ keywords: [LINK] });
+    expect(parsed.keywords[0]).toEqual(LINK);
+    expect(ListChunkKeywordsResponseSchema.parse({ keywords: [] }).keywords).toEqual([]);
+  });
+
+  it("takes only the two sources the engine writes", () => {
+    expect(
+      ListChunkKeywordsResponseSchema.safeParse({ keywords: [{ ...LINK, source: "llm" }] }).success,
+    ).toBe(true);
+    for (const source of ["LLM", "imported", "", null]) {
+      expect(
+        ListChunkKeywordsResponseSchema.safeParse({ keywords: [{ ...LINK, source }] }).success,
+      ).toBe(false);
+    }
+  });
+
+  it("requires the link's own timestamp, which is not the keyword's", () => {
+    const { attachedAt: _omitted, ...without } = LINK;
+    const result = ListChunkKeywordsResponseSchema.safeParse({ keywords: [without] });
+    expect(result.success).toBe(false);
+    expect(result.success ? [] : result.error.issues[0]!.path).toEqual([
+      "keywords",
+      0,
+      "attachedAt",
+    ]);
   });
 });
