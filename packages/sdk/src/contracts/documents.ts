@@ -136,6 +136,35 @@ export const IngestMultipartFieldsSchema = TagWritesSchema.extend({
 });
 export type IngestMultipartFields = z.infer<typeof IngestMultipartFieldsSchema>;
 
+/**
+ * `PUT /v1/kbs/:kbId/documents/:docId/blob` — the non-file fields of the attach.
+ *
+ * **The bytes of a document that already exists, without re-ingesting it.**
+ * Every other way of getting bytes onto this instance creates a document and
+ * runs a pipeline over them; this one repoints an existing row at a new object
+ * and touches nothing else — `processingStatus`, the chunks, the embeddings and
+ * the keyword overlay are exactly what they were. That is what makes it usable
+ * as a *migration*: Studio's TASK-013 moves `search.document` rows by SQL, and
+ * the objects those rows name live in Studio's bucket rather than Search's.
+ * Re-ingest would rewrite every chunk id and every vector the fixture suite
+ * froze, so it is not a move.
+ *
+ * There are two fields because there is nothing else to say about bytes that
+ * are already a document's: the tags, the metadata and the `includedInKb` flag
+ * belong to the row, and the row is not being created here.
+ *
+ * `filename` names the **object**, not the document: it is what the bucket key
+ * is built from (`kb/<timestamp>-<random>-<sanitised>`), and `document.filename`
+ * is left alone — a rename is `PATCH …/documents/:docId`.
+ */
+export const AttachBlobMultipartFieldsSchema = z.object({
+  /** The name to build the storage key from. Defaults to the file part's own. */
+  filename: z.string().min(1).max(512).optional(),
+  /** Written to `document.mime_type`. Defaults to the file part's content type. */
+  mimeType: z.string().min(1).max(255).optional(),
+});
+export type AttachBlobMultipartFields = z.infer<typeof AttachBlobMultipartFieldsSchema>;
+
 /** What ingest answers with, before any of the work has happened. */
 export const IngestResponseSchema = z.object({
   documentId: z.string(),

@@ -87,6 +87,7 @@ import type {
   UpdateKbRequest,
   UpsertDocumentRequest,
   UpsertDocumentResponse,
+  Whoami,
 } from "./contracts.ts";
 
 
@@ -293,6 +294,29 @@ export class SearchClient {
     return this.request<SearchPairStatus>("GET", "/v1/pair/status");
   }
 
+  /**
+   * `GET /v1/whoami` — the explicit identity call.
+   *
+   * `clientId` is the `search.paired_client.id` this certificate resolves to,
+   * which is the string `search.knowledge_base.paired_client_id` carries;
+   * `scopes` is every scope this pairing permits rather than the one stored
+   * value, and `schemaVersion` is the instance's, so a caller that must know
+   * both who it is and what version it is talking to makes one call.
+   *
+   * **Neither {@link SearchClient.capabilities} nor the registration blob has
+   * the client id.** `capabilities()` is about the instance, and
+   * `SearchRegistrationBlob` carries an endpoint, a label and three PEMs —
+   * which is why Studio's migration had to be told the id by an operator before
+   * this route existed. {@link SearchClient.pairStatus} does answer one, under
+   * `id`, beside the pairing lifecycle; this is the same fact named for the
+   * question, and it is the one the contracts define (`WhoamiSchema`).
+   *
+   * Any paired client may call it, at any scope.
+   */
+  whoami(): Promise<Whoami> {
+    return this.request<Whoami>("GET", "/v1/whoami");
+  }
+
   // ── The namespaces ────────────────────────────────────────────────────────
   //
   // Every signature below is `z.infer`red from `@actana/search/contracts`,
@@ -417,6 +441,38 @@ export class SearchClient {
     /** `DELETE /v1/kbs/:id/documents/:docId`. */
     delete: (kbId: string, documentId: string): Promise<DeleteDocumentResponse> =>
       this.request<DeleteDocumentResponse>("DELETE", documentPath(kbId, documentId)),
+
+    /**
+     * `PUT /v1/kbs/:id/documents/:docId/blob` — attach or replace the stored
+     * bytes of a document that already exists, with **no re-ingest**.
+     *
+     * The row is repointed at a new object in the instance's bucket and
+     * `fileUrl`, `mimeType` and `fileSize` are rewritten; `processingStatus`,
+     * the chunks, their vectors and the keyword overlay are untouched. That is
+     * the difference between this and {@link SearchClient.kbs.ingest}, which
+     * creates a document and runs a pipeline: here the document is the one that
+     * is already there, and what it says about itself does not change.
+     *
+     * **This is the migration's blob path.** Studio's TASK-013 moves
+     * `search.document` rows by SQL and streams their bytes through here, and
+     * it is safe to retry: attaching the same bytes twice leaves the row in the
+     * same state (a second object is written and the row points at it — the key
+     * scheme is ingest's, so the previous object is superseded rather than
+     * overwritten, and it is left in the bucket).
+     *
+     * `404` for a document that is not this client's or does not exist, like
+     * every other document route, and `409 conflict` while the document's
+     * `processingStatus` says a run is reading its current bytes — poll
+     * {@link SearchClient.documents.get} until it settles.
+     */
+    attachBlob: (
+      kbId: string,
+      documentId: string,
+      input: AttachBlobInput,
+    ): Promise<SearchDocument> =>
+      this.request<SearchDocument>("PUT", `${documentPath(kbId, documentId)}/blob`, {
+        multipart: attachBlobFormData(input),
+      }),
 
     /** `GET …/documents/:docId/chunks`. */
     chunks: (
@@ -824,6 +880,46 @@ function ingestFormData(
   for (const [slot, value] of Object.entries(input.tags ?? {})) {
     if (value !== undefined) form.append(slot, String(value));
   }
+  return form;
+}
+
+/**
+ * What {@link SearchClient.documents.attachBlob} takes: the bytes, and what to
+ * call them.
+ *
+ * `filename` names the **object** — it is what the bucket key is built from —
+ * and not the document, whose `filename` the attach leaves alone. Required
+ * rather than optional because a key built from a name nobody chose is a key
+ * nobody can recognise in a bucket listing.
+ */
+export type AttachBlobInput = {
+  /** The bytes. A `Blob`, a `Buffer`, or any `Uint8Array`. */
+  file: Blob | Uint8Array;
+  /** The name the storage key is built from. */
+  filename: string;
+  /** Written to `document.mime_type`. Defaults to the blob's own type. */
+  mimeType?: string;
+};
+
+/**
+ * Build the multipart body for a blob attach.
+ *
+ * The same encoding {@link ingestFormData} produces and the same hand-written
+ * `encodeMultipart` writes out — `undici.request` takes no `FormData` — with
+ * three parts instead of twenty: there is nothing to say about bytes that are
+ * already a document's beyond what to call them and what they are.
+ */
+function attachBlobFormData(input: AttachBlobInput): FormData {
+  const form = new FormData();
+  const blob =
+    input.file instanceof Blob
+      ? input.file
+      : new Blob([new Uint8Array(input.file)], {
+          type: input.mimeType ?? "application/octet-stream",
+        });
+  form.append("file", blob, input.filename);
+  form.append("filename", input.filename);
+  if (input.mimeType !== undefined) form.append("mimeType", input.mimeType);
   return form;
 }
 

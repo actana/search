@@ -132,10 +132,12 @@ import type {
 } from "@actana/search/contracts";
 import {
   ChunkSchema,
+  DocumentSchema,
   ListChunkKeywordsResponseSchema,
   ListDocumentsResponseSchema,
   SEARCH_EVENT_ID_HEADER,
   SEARCH_SIGNATURE_HEADER,
+  WhoamiSchema,
 } from "@actana/search/contracts";
 import { generateShortId } from "@actana/search-shared/short-id";
 import {
@@ -155,7 +157,12 @@ import { TOPIC_VOCABULARY } from "../kb/testing/deterministic-keywords.ts";
 import { inlineJobFailures, inlineJobsSettled, resetQueueConnection } from "../queue/index.ts";
 import { onSearchEvent } from "../events/emitter.ts";
 import { resetAnnouncedEvents, runSearchJob } from "../jobs/run.ts";
-import { resetStorageClient } from "../blob/index.ts";
+import {
+  downloadFile,
+  isInternalFileUrl,
+  parseInternalFileUrl,
+  resetStorageClient,
+} from "../blob/index.ts";
 import { verifyWebhookSignature } from "../events/webhook-signature.ts";
 import { startSearchServer, type SearchServer } from "../api/server.ts";
 import { registerSearchRoutes } from "../api/routes/index.ts";
@@ -2196,6 +2203,213 @@ describeDb("KB behaviour freeze, over REST (fixture suite)", () => {
       clientB.documents.bulk(kb.id, { operation: "delete", enabledFilter: "all" }),
     ).rejects.toMatchObject({ status: 404, code: "not-found" });
     expect(await idsOf("all")).toHaveLength(2);
+    await inlineJobsSettled();
+  }, 300_000);
+  it("says who the caller is, on `whoami`, without being told", async () => {
+    /**
+     * The call Studio's data migration needs: `capabilities()` is about the
+     * instance and has no client id in it, and the sealed registration blob has
+     * none either, so before this route a migration had to be handed
+     * `--paired-client-id` by an operator (its own `PAIRED_CLIENT_ID_GAP`).
+     */
+    const me = await client.whoami();
+    expect(me.clientId).toBe(ids.pairedClient);
+    expect(me.label).toBe(`${PREFIX} client`);
+    expect(me.schemaVersion).toBe((await client.capabilities()).schemaVersion);
+    expect(Date.parse(me.createdAt)).not.toBeNaN();
+
+    // `admin` implies `write` implies `read`, expanded rather than left for the
+    // caller to work out — this pairing was seeded `admin`.
+    expect(me.scopes).toEqual(["read", "write", "admin"]);
+
+    // No certificate on this connection: the insecure mode reads a header, so
+    // there is no serial to report and the field is absent rather than faked
+    // from the row. (`pairing.e2e.test.ts` asserts the mTLS half.)
+    expect(me.serialNumber).toBeUndefined();
+
+    // The id is the caller's own, and the second client gets its own answer
+    // from the same route: this is identity, not a constant.
+    expect((await clientB.whoami()).clientId).toBe(ids.pairedClientB);
+
+    // The whole body, against the contract it is defined by.
+    expect(
+      WhoamiSchema.safeParse(await client.request("GET", "/v1/whoami")).success,
+    ).toBe(true);
+  });
+
+  it("attaches new bytes to a document without re-ingesting it", async () => {
+    /**
+     * `PUT …/documents/:docId/blob`, and what it must **not** do is the point:
+     * the migration moves `search.document` rows by SQL with the chunk ids and
+     * embeddings they already had, and the bytes those rows name are in
+     * Studio's bucket. A re-ingest would rewrite every one of those ids, so
+     * this route repoints the row and runs nothing.
+     */
+    const original = Buffer.from(
+      "# Parental leave\n\nSix weeks at full pay, from day one.\n",
+      "utf8",
+    );
+    const doc = await client.kbs.ingest(sandboxKbId, {
+      filename: "attach-me.md",
+      mimeType: "text/markdown",
+      file: original,
+      tags: { tag1: "handbook" },
+    });
+    const settled = await waitForDocument(sandboxKbId, doc.documentId);
+    expect(settled.processingStatus).toBe("completed");
+    await inlineJobsSettled();
+
+    const before = await client.documents.get(sandboxKbId, doc.documentId);
+    const chunksBefore = await client.documents.chunks(sandboxKbId, doc.documentId, { limit: 500 });
+    expect(chunksBefore.chunks.length).toBeGreaterThan(0);
+
+    // ── The attach ────────────────────────────────────────────────────────
+    const replacement = Buffer.from(
+      "# Parental leave\n\nThe very same policy, as a different object.\n",
+      "utf8",
+    );
+    const attached = await client.documents.attachBlob(sandboxKbId, doc.documentId, {
+      file: replacement,
+      filename: "attach-me.md",
+      mimeType: "text/markdown",
+    });
+    expect(DocumentSchema.safeParse(attached).success).toBe(true);
+
+    // Three columns move, and they are the three that describe the object.
+    expect(attached.fileUrl).not.toBe(before.fileUrl);
+    expect(isInternalFileUrl(attached.fileUrl)).toBe(true);
+    expect(attached.fileSize).toBe(replacement.length);
+    expect(attached.mimeType).toBe("text/markdown");
+    // The ingest key scheme, so a migrated object needs no rename.
+    const { key } = parseInternalFileUrl(attached.fileUrl);
+    expect(key).toMatch(/^kb\/\d+-[a-z0-9]+-attach-me\.md$/);
+    // And the bytes in the bucket are the ones that were sent.
+    expect((await downloadFile({ key })).equals(replacement)).toBe(true);
+
+    // Nothing the pipeline owns moved: no chunker ran, no vector was rewritten.
+    expect(attached).toMatchObject({
+      processingStatus: before.processingStatus,
+      chunkCount: before.chunkCount,
+      processedChunks: before.processedChunks,
+      tokenCount: before.tokenCount,
+      characterCount: before.characterCount,
+      keywordStatus: before.keywordStatus,
+      uploadedAt: before.uploadedAt,
+      processingCompletedAt: before.processingCompletedAt,
+      // The row's name is the document's, not the object's: a rename is PATCH.
+      filename: before.filename,
+      tag1: "handbook",
+    });
+    const chunksAfter = await client.documents.chunks(sandboxKbId, doc.documentId, { limit: 500 });
+    expect(chunksAfter.chunks.map((c) => c.id)).toEqual(chunksBefore.chunks.map((c) => c.id));
+    expect(chunksAfter.chunks.map((c) => c.content)).toEqual(
+      chunksBefore.chunks.map((c) => c.content),
+    );
+    // No work was enqueued, so there is nothing for the queue to have settled.
+    expect(inlineJobFailures()).toEqual([]);
+
+    // ── Idempotent in the row, not in the bucket ──────────────────────────
+    const again = await client.documents.attachBlob(sandboxKbId, doc.documentId, {
+      file: replacement,
+      filename: "attach-me.md",
+      mimeType: "text/markdown",
+    });
+    // Same bytes twice is fine, which is what a retried stream needs: the row
+    // ends in the same state, and only the object's key is new.
+    expect({ ...again, fileUrl: "" }).toEqual({ ...attached, fileUrl: "" });
+    expect(again.fileUrl).not.toBe(attached.fileUrl);
+    // The superseded object is left in place — a job may still hold its URL.
+    expect((await downloadFile({ key })).equals(replacement)).toBe(true);
+
+    // ── 409 while a run is reading the current bytes ──────────────────────
+    for (const status of ["processing", "chunking", "embedding", "clustering", "keywording"]) {
+      await db.update(document).set({ processingStatus: status }).where(
+        eq(document.id, doc.documentId),
+      );
+      await expect(
+        client.documents.attachBlob(sandboxKbId, doc.documentId, {
+          file: replacement,
+          filename: "attach-me.md",
+        }),
+      ).rejects.toMatchObject({ status: 409, code: "conflict" });
+    }
+    // `pending` is not refused: an upload made with `includedInKb: false` rests
+    // there with no job at all, and attaching its bytes is the obvious move.
+    await db
+      .update(document)
+      .set({ processingStatus: "pending" })
+      .where(eq(document.id, doc.documentId));
+    expect(
+      (
+        await client.documents.attachBlob(sandboxKbId, doc.documentId, {
+          file: replacement,
+          filename: "attach-me.md",
+        })
+      ).processingStatus,
+    ).toBe("pending");
+    await db
+      .update(document)
+      .set({ processingStatus: "completed" })
+      .where(eq(document.id, doc.documentId));
+
+    // ── 404, and it says nothing about whose document it is ───────────────
+    await expect(
+      clientB.documents.attachBlob(sandboxKbId, doc.documentId, {
+        file: replacement,
+        filename: "attach-me.md",
+      }),
+    ).rejects.toMatchObject({ status: 404, code: "not-found" });
+    await expect(
+      client.documents.attachBlob(kbIds.sdk, doc.documentId, {
+        file: replacement,
+        filename: "attach-me.md",
+      }),
+    ).rejects.toMatchObject({ status: 404, code: "not-found" });
+    await expect(
+      client.documents.attachBlob(sandboxKbId, "d_does_not_exist", {
+        file: replacement,
+        filename: "attach-me.md",
+      }),
+    ).rejects.toMatchObject({ status: 404, code: "not-found" });
+
+    // ── The body has to be a multipart one carrying a `file` part ─────────
+    const noFile = new FormData();
+    noFile.append("filename", "attach-me.md");
+    await expect(
+      client.request("PUT", `/v1/kbs/${sandboxKbId}/documents/${doc.documentId}/blob`, {
+        multipart: noFile,
+      }),
+    ).rejects.toMatchObject({ status: 400, code: "bad-request" });
+    await expect(
+      client.request("PUT", `/v1/kbs/${sandboxKbId}/documents/${doc.documentId}/blob`, {
+        json: { file: "no" },
+      }),
+    ).rejects.toMatchObject({ status: 415, code: "unsupported-media-type" });
+    // And the two fields are validated, not swallowed.
+    const emptyName = new FormData();
+    emptyName.append("file", new Blob([new Uint8Array(replacement)]), "attach-me.md");
+    emptyName.append("filename", "");
+    await expect(
+      client.request("PUT", `/v1/kbs/${sandboxKbId}/documents/${doc.documentId}/blob`, {
+        multipart: emptyName,
+      }),
+    ).rejects.toMatchObject({ status: 400, code: "validation-failed" });
+
+    // A document ingested as text has no stored bytes at all, and this is how
+    // it gets some — the `include`-with-no-bytes 409 has an answer now.
+    const textDoc = await client.kbs.ingest(sandboxKbId, {
+      filename: "text-then-bytes.md",
+      text: "Six weeks at full pay.",
+    });
+    await waitForDocument(sandboxKbId, textDoc.documentId);
+    await inlineJobsSettled();
+    expect((await client.documents.get(sandboxKbId, textDoc.documentId)).fileUrl).toBe("");
+    const filled = await client.documents.attachBlob(sandboxKbId, textDoc.documentId, {
+      file: replacement,
+      filename: "text-then-bytes.md",
+      mimeType: "text/markdown",
+    });
+    expect(isInternalFileUrl(filled.fileUrl)).toBe(true);
     await inlineJobsSettled();
   }, 300_000);
 });

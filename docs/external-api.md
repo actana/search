@@ -40,7 +40,41 @@ path, …)` is the escape hatch for a route with no method yet.
 | Route | Scope | Request | Response |
 |---|---|---|---|
 | `GET /v1/capabilities` | read | — | `CapabilitiesSchema` |
+| `GET /v1/whoami` | any | — | `WhoamiSchema` |
 | `GET /v1/pair/status` | read | — | `SearchPairStatus` (`@actana/search/pairing-wire`) |
+
+**`GET /v1/whoami` is the explicit identity call, and `GET /v1/capabilities`
+does not answer it.** Capabilities is about the *instance* — protocol, schema
+version, feature list, public host — and carries no client id; the registration
+blob a pairing produces carries none either. So it is `whoami` that answers
+*which* `search.paired_client` row the certificate on this connection resolves
+to, which is the same string `search.knowledge_base.paired_client_id` holds, and
+therefore the id a caller writing rows of its own has to know.
+
+It is the only route whose scope is **any** — `scope: null` in the router, which
+means any paired client at any scope. A caller too weakly scoped to do anything
+else can still ask who it is, and the answer is about the caller, so it
+discloses nothing a certificate holder did not already have.
+
+`scopes` is **every** scope the pairing permits, weakest first: a client paired
+`admin` reads `["read", "write", "admin"]`. Like `features`, it is a list so a
+caller tests membership rather than re-implementing the `admin` ⊃ `write` ⊃
+`read` rank the router enforces — it is derived from that same predicate, so the
+two cannot disagree. `GET /v1/pair/status` still answers the single stored value
+under `scope`.
+
+`serialNumber` is the serial of the certificate presented **on this
+connection**, read off the socket rather than copied from the row, and it is
+absent on the plain-HTTP development path (`SEARCH_DEV_INSECURE=1`) where there
+is no certificate — the same reason `SearchPairStatus.certNotAfter` is null
+there. `createdAt` is `paired_client.created_at`, the instant the pairing was
+redeemed. `schemaVersion` repeats what capabilities reports, so that *who am I*
+and *is this the version I was written against* are one round trip observed at
+one instant.
+
+`GET /v1/pair/status` is not superseded: it is the pairing surface's own shape
+(`platform`, `kbIds`, `certNotAfter` — the pairing lifecycle), typed in
+`@actana/search/pairing-wire` rather than in the zod contracts.
 
 `features` is the closed `SEARCH_FEATURES` list — `hybrid`, `v1-tags`,
 `clusters`, `keywords`, `webhooks`, `sse`, `mirrored-endpoints`. Test membership
@@ -148,6 +182,7 @@ request stated one. The rest of `strategy` is still what ran.
 | `PATCH /v1/kbs/:kbId/documents/:docId` | write | `UpdateDocumentRequestSchema` | `DocumentSchema` |
 | `DELETE /v1/kbs/:kbId/documents/:docId` | write | — | `DeleteDocumentResponseSchema` |
 | `POST /v1/kbs/:kbId/documents/:docId/include` | write | `IncludeDocumentRequestSchema` | `IncludeDocumentResponseSchema` |
+| `PUT /v1/kbs/:kbId/documents/:docId/blob` | write | multipart (`AttachBlobMultipartFieldsSchema` + a `file` part) | `DocumentSchema` |
 
 **Ingest is asynchronous and the two encodings are two pipelines.** A file (or a
 `url` the instance fetches) goes through parse → chunk → plan → embed → finalize
@@ -237,6 +272,48 @@ base:
 both are given and by `filename` otherwise, and answers
 `outcome: created | replaced | skipped` — `skipped` when `contentHash` is
 unchanged.
+
+### `PUT …/documents/:docId/blob` — bytes without an ingest
+
+**Every other route here creates a document and runs a pipeline over its bytes;
+this one hands bytes to a document that already exists and runs nothing.** The
+file part is stored in this instance's bucket under ingest's own key scheme
+(`kb/<timestamp>-<random>-<sanitised>`) and the row is repointed at it: exactly
+`file_url`, `mime_type` and `file_size` change. `processingStatus`,
+`chunkCount`, the chunk rows, their vectors and the keyword overlay are what
+they were — nothing is re-parsed, re-chunked, re-embedded or re-keyworded, and
+nothing is enqueued.
+
+It exists for the migration out of Studio (Studio's TASK-013). Those rows move
+into `search.*` by SQL, carrying the chunk ids and embeddings they already had,
+and the objects they name are in *Studio's* bucket. A re-ingest would rewrite
+every one of those ids and vectors, which is not a move — and Studio must not
+write into Search's bucket directly (ADR 0006). So the rows go by SQL and the
+bytes stream through this route.
+
+`filename` and `mimeType` mean what they mean on the ingest form, with one
+difference worth stating: **`filename` names the object, not the document.** It
+is what the storage key is built from; `document.filename` is left alone,
+because a rename is `PATCH …/documents/:docId`. The file-part cap is ingest's
+50 MB (`413`) inside the same 64 MB multipart envelope.
+
+**It is idempotent in the row and not in the bucket.** Attaching the same bytes
+twice is fine and is the normal case for a retried stream: the second attach
+writes a second object and points the row at it, so the row ends in the same
+state and the document still says the same things about itself. The superseded
+object is **left in place** — a job holding the old `fileUrl` in its payload may
+still be reading it, and a migration re-run after a partial failure should not
+find its source deleted.
+
+`404` for a document that is not this client's or does not exist, as on every
+other document route (ADR 0009 D5). `409 conflict` while a run is reading the
+current bytes — `processing`, `chunking`, `embedding`, `clustering` or
+`keywording`: swapping the object underneath a worker would leave the chunks
+describing one object and the row naming another. `pending` is **not** refused,
+because a document uploaded with `includedInKb: false` rests there with no job
+enqueued and attaching its bytes is the obvious next thing to do; `completed`
+and `failed` are settled. Poll `GET …/documents/:docId` until the status leaves
+that set.
 
 ## Chunks
 

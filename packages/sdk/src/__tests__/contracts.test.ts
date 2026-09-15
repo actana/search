@@ -15,6 +15,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  AttachBlobMultipartFieldsSchema,
   BulkDocumentsRequestSchema,
   ChunkSchema,
   CreateChunkRequestSchema,
@@ -23,6 +24,8 @@ import {
   ListChunkKeywordsResponseSchema,
   ListDocumentsQuerySchema,
   QueryRequestSchema,
+  SEARCH_SCOPES,
+  WhoamiSchema,
 } from "../contracts.ts";
 
 /** The one tag filter every tag-only case below is asked with. */
@@ -491,5 +494,77 @@ describe("ListChunkKeywordsResponseSchema", () => {
       0,
       "attachedAt",
     ]);
+  });
+});
+
+describe("AttachBlobMultipartFieldsSchema", () => {
+  it("has exactly the two things a caller can say about bytes already owned", () => {
+    // Neither field is required — the file part declares both — and there is no
+    // `documentId`, no `tags`, no `metadata` and no `includedInKb`, because the
+    // row this attaches to exists already and the attach does not touch it.
+    expect(AttachBlobMultipartFieldsSchema.parse({})).toEqual({});
+    expect(
+      AttachBlobMultipartFieldsSchema.parse({ filename: "handbook.md", mimeType: "text/markdown" }),
+    ).toEqual({ filename: "handbook.md", mimeType: "text/markdown" });
+
+    const extras = AttachBlobMultipartFieldsSchema.parse({
+      filename: "handbook.md",
+      documentId: "d_1",
+      includedInKb: "true",
+      tag1: "handbook",
+    });
+    expect(Object.keys(extras)).toEqual(["filename"]);
+  });
+
+  it("refuses an empty name or media type rather than storing under one", () => {
+    expect(AttachBlobMultipartFieldsSchema.safeParse({ filename: "" }).success).toBe(false);
+    expect(AttachBlobMultipartFieldsSchema.safeParse({ mimeType: "" }).success).toBe(false);
+    expect(AttachBlobMultipartFieldsSchema.safeParse({ filename: 7 }).success).toBe(false);
+  });
+});
+
+describe("WhoamiSchema", () => {
+  const WHOAMI = {
+    clientId: "pc_1",
+    label: "actanastudio",
+    scopes: ["read", "write"] as const,
+    createdAt: "2026-09-15T00:00:00.000Z",
+    serialNumber: "0a1b2c",
+    schemaVersion: 2,
+  };
+
+  it("names the paired client id, the scopes it holds and the schema version", () => {
+    expect(WhoamiSchema.parse(WHOAMI)).toEqual(WHOAMI);
+  });
+
+  it("makes `serialNumber` the only optional field — the insecure path has none", () => {
+    const { serialNumber: _omitted, ...withoutSerial } = WHOAMI;
+    expect(WhoamiSchema.parse(withoutSerial).serialNumber).toBeUndefined();
+
+    // Everything else is a fact the row always carries, so leaving one out is a
+    // body that does not satisfy the contract rather than a partial answer.
+    for (const field of ["clientId", "label", "scopes", "createdAt", "schemaVersion"] as const) {
+      const { [field]: _dropped, ...without } = WHOAMI;
+      const result = WhoamiSchema.safeParse(without);
+      expect(result.success, field).toBe(false);
+      expect(result.success ? [] : result.error.issues[0]!.path).toEqual([field]);
+    }
+  });
+
+  it("takes `scopes` as a list of the three scopes and nothing else", () => {
+    expect(SEARCH_SCOPES).toEqual(["read", "write", "admin"]);
+    expect(WhoamiSchema.parse({ ...WHOAMI, scopes: [...SEARCH_SCOPES] }).scopes).toEqual([
+      "read",
+      "write",
+      "admin",
+    ]);
+    // A single string is not a list of one: `scope` is `/v1/pair/status`.
+    expect(WhoamiSchema.safeParse({ ...WHOAMI, scopes: "admin" }).success).toBe(false);
+    expect(WhoamiSchema.safeParse({ ...WHOAMI, scopes: ["owner"] }).success).toBe(false);
+  });
+
+  it("takes `schemaVersion` as an integer, as capabilities reports it", () => {
+    expect(WhoamiSchema.safeParse({ ...WHOAMI, schemaVersion: 2.5 }).success).toBe(false);
+    expect(WhoamiSchema.safeParse({ ...WHOAMI, schemaVersion: "2" }).success).toBe(false);
   });
 });

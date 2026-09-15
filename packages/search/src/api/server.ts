@@ -37,7 +37,13 @@ import { generateShortId } from "@actana/search-shared/short-id";
 import type { PairedClient } from "@actana/search-shared/pairing/pairing-code-digest";
 import type { SearchHealth, SearchPairStatus } from "@actana/search/pairing-wire";
 import { SEARCH_PROTOCOL_VERSION } from "@actana/search";
-import { SEARCH_FEATURES, type Capabilities } from "@actana/search/contracts";
+import {
+  SEARCH_FEATURES,
+  SEARCH_SCOPES,
+  type Capabilities,
+  type SearchScope,
+  type Whoami,
+} from "@actana/search/contracts";
 import { inATestEnvironment } from "../config.ts";
 import { SCHEMA_VERSION } from "../db/schema.ts";
 import {
@@ -382,6 +388,19 @@ export function scopeAllows(held: string, needed: "read" | "write" | "admin"): b
 }
 
 /**
+ * Every scope `held` permits, weakest first — the implication above, enumerated.
+ *
+ * `GET /v1/whoami` answers this rather than the stored value so that a caller
+ * asks `scopes.includes("write")` instead of re-implementing {@link scopeAllows}
+ * on its own side, where it could disagree with the router about what this
+ * client may do. Derived from {@link scopeAllows}, not from a second table, so
+ * the two cannot drift: what is listed is what the router would let through.
+ */
+export function scopesHeldBy(held: string): SearchScope[] {
+  return SEARCH_SCOPES.filter((scope) => scopeAllows(held, scope));
+}
+
+/**
  * The paired client the certificate on this connection names, or `null`.
  *
  * By serial, then by fingerprint: Node reports the serial off the socket, and
@@ -522,6 +541,47 @@ function registerBuiltinRoutes(router: SearchRouter, opts: SearchServerOptions):
         certSerial: client.certSerial,
         certNotAfter: client.certNotAfter ? new Date(client.certNotAfter).toISOString() : null,
         pairedAt: new Date(client.pairedAt).toISOString(),
+      };
+      sendJson(res, 200, body);
+    },
+  });
+
+  /**
+   * `GET /v1/whoami` — which paired client this certificate is.
+   *
+   * **`scope: null` is the grant it asks for: any paired client, at any
+   * scope.** A caller that cannot ask who it is cannot find out that it is
+   * scoped too low to do anything else, and the answer is about the caller
+   * itself — it discloses nothing a certificate holder did not already hold.
+   *
+   * It overlaps `/v1/pair/status` above and does not replace it. That route is
+   * the *pairing surface's* shape — `platform`, `kbIds`, `certNotAfter`, the
+   * pairing lifecycle — typed in `@actana/search/pairing-wire` rather than in
+   * the zod contracts, and it spells the id `id`. This one is the identity read
+   * a caller asks for by name: `clientId` spelled as the thing it is (the
+   * string `search.knowledge_base.paired_client_id` carries), the scopes
+   * expanded to what they permit, and `schemaVersion` beside them so that the
+   * two preconditions a writer checks — *who am I*, *is this the version I was
+   * written against* — are one round trip at one instant. `/v1/capabilities`
+   * carries no client id at all; `WhoamiSchema` is the definition of this one.
+   */
+  router.add({
+    method: "GET",
+    path: "/v1/whoami",
+    scope: null,
+    handle: ({ req, res, client }) => {
+      if (!client) return respondClientCertRequired(res);
+      const serial = peerCertSerial(req);
+      const body: Whoami = {
+        clientId: client.id,
+        label: client.label,
+        scopes: scopesHeldBy(client.scope),
+        createdAt: new Date(client.pairedAt).toISOString(),
+        // Off the socket, so the field means "the certificate on *this*
+        // connection". There is none in the insecure development mode, and an
+        // absent field says so where a copy of the row's column would not.
+        ...(serial === null ? {} : { serialNumber: serial }),
+        schemaVersion: SCHEMA_VERSION,
       };
       sendJson(res, 200, body);
     },

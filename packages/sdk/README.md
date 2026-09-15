@@ -45,8 +45,8 @@ const result = await search.kbs.query(kb.id, {
 ```
 
 Namespaces: `kbs`, `documents`, `keywords`, `clusters`, `tags`, `endpoints`,
-`webhooks`, plus `events()`, `capabilities()`, `health()`, `pairStatus()` and
-`request(method, path, …)` for a route with no method yet. Every route on the
+`webhooks`, plus `events()`, `capabilities()`, `health()`, `whoami()`,
+`pairStatus()` and `request(method, path, …)` for a route with no method yet. Every route on the
 instance is reachable through one of them —
 [`docs/external-api.md`](https://github.com/actana/search/blob/main/docs/external-api.md)
 is the table.
@@ -193,7 +193,7 @@ is the instance's own machine-readable reason.
 | `@actana/search/registration-blob` | the credential's storage codec |
 | `@actana/search/errors` | `SearchApiError` |
 | `@actana/search/contracts` | every request, response, error and event schema — one definition, imported by the server too |
-| `@actana/search/contracts/kbs`, `/documents`, `/keywords`, `/clusters`, `/tags`, `/endpoints`, `/webhooks`, `/events`, `/capabilities`, `/common` | one family each, for a caller that wants one |
+| `@actana/search/contracts/kbs`, `/documents`, `/keywords`, `/clusters`, `/tags`, `/endpoints`, `/webhooks`, `/events`, `/capabilities`, `/whoami`, `/common` | one family each, for a caller that wants one |
 
 ## Dependencies
 
