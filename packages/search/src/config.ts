@@ -9,6 +9,7 @@
  */
 
 import { z } from "zod";
+import { adminSocketPathProblem } from "./api/admin-socket.ts";
 
 const booleanish = z
   .union([z.boolean(), z.string()])
@@ -97,7 +98,14 @@ const schema = z.object({
    * up until it was restarted mid-document.
    */
   SEARCH_INLINE_JOBS: booleanish.default(false),
-  /** CA, server certificate, pairing material. The instance's identity. */
+  /**
+   * CA, server certificate, pairing material. The instance's identity.
+   *
+   * Its **length** is checked as well as its presence — see
+   * {@link assertStateDirSocketPathFits}. The admin listener binds
+   * `$SEARCH_STATE_DIR/admin.sock`, and a Unix socket path longer than
+   * `sun_path` is refused by the kernel with `EINVAL`.
+   */
   SEARCH_STATE_DIR: z.string().optional(),
   SEARCH_LOG_LEVEL: z.enum(["debug", "info", "warn", "error", "silent"]).default("info"),
 
@@ -147,6 +155,26 @@ function assertNotInlineJobs(): never {
   );
 }
 
+/**
+ * Refuse a state directory whose `admin.sock` the kernel would not bind.
+ *
+ * **At configuration time, because the alternative was step 5 of `boot()`.** The
+ * proof run pointed `SEARCH_STATE_DIR` at a 130-byte path; the migrations ran,
+ * the identity was minted, the API listener came up and answered
+ * `GET /v1/health` with `{"ok":true}`, and *then* the admin listener died with
+ * `listen EINVAL … /admin.sock`. Two defects in one, and this is the half that
+ * makes the failure legible: `EINVAL` on a bind says nothing about a length
+ * limit, and the limit is not where an operator would look for it.
+ *
+ * Only when the variable is set. The default (`~/.actana-search`) is short
+ * everywhere, and inventing a home directory to measure would make `config()`
+ * depend on one.
+ */
+function assertStateDirSocketPathFits(stateDir: string): void {
+  const problem = adminSocketPathProblem(stateDir);
+  if (problem) throw new Error(`Invalid Search configuration:\n  SEARCH_STATE_DIR: ${problem}`);
+}
+
 let cached: SearchConfig | undefined;
 
 /** The parsed configuration. Throws with every offending variable named. */
@@ -163,6 +191,9 @@ export function config(): SearchConfig {
   // process is in rather than about the value, and a reader of the error wants
   // the sentence rather than a zod issue path.
   if (parsed.data.SEARCH_INLINE_JOBS && !inATestEnvironment()) assertNotInlineJobs();
+  if (parsed.data.SEARCH_STATE_DIR !== undefined) {
+    assertStateDirSocketPathFits(parsed.data.SEARCH_STATE_DIR);
+  }
   cached = parsed.data;
   return cached;
 }

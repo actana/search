@@ -662,6 +662,72 @@ export async function drainAndClose(
 }
 
 /**
+ * One step of a boot: something to open, and how to close it again.
+ *
+ * `open` returning `null` is a step that opened nothing and needs no closing —
+ * the workers under `SEARCH_WORKERS=off`, for instance.
+ */
+export interface BootStep {
+  /** What a log line and a failure message call it. */
+  name: string
+  open(): Promise<ShutdownCloser | null>
+}
+
+/** A boot that could not finish, naming the step that stopped it. */
+export class BootStepFailedError extends Error {
+  override readonly name = 'BootStepFailedError'
+  /** The failing step's name — `api`, `admin`, `workers`. */
+  readonly step: string
+
+  // A field and an assignment, not a parameter property: Node strips types
+  // rather than compiling them (`scripts/check-strip-types.mjs`).
+  constructor(step: string, cause: unknown) {
+    super(
+      `boot step "${step}" failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+      { cause }
+    )
+    this.step = step
+  }
+}
+
+/**
+ * Open a boot's steps in order — or close everything that opened and rethrow.
+ *
+ * **A boot is all or nothing, and it was not.** `boot()` opened the API
+ * listener at step 4 and the admin listener at step 5, and a step-5 failure
+ * (`listen EINVAL` on a state directory whose socket path was too long) left
+ * the API answering `GET /v1/health` with `{"ok":true}` while the workers had
+ * never started and no operator could mint a pairing code. The process stayed
+ * alive because the listener kept the loop alive, so a container probe called
+ * it healthy and the deployment looked up. Half a Search is not a Search.
+ *
+ * The unwind runs in reverse — the last thing opened is the first thing closed
+ * — and through {@link drainAndClose}, so every close is best-effort and one
+ * listener that will not shut down cannot stop the next from closing or mask
+ * the error that started this. Exported so the ordering can be asserted against
+ * fakes rather than against a real listener.
+ */
+export async function openInOrder(steps: readonly BootStep[]): Promise<ShutdownCloser[]> {
+  const opened: ShutdownCloser[] = []
+  for (const step of steps) {
+    let closer: ShutdownCloser | null
+    try {
+      closer = await step.open()
+    } catch (err) {
+      logger.error('Boot step failed; closing what this process had already opened', {
+        step: step.name,
+        error: err instanceof Error ? err.message : String(err),
+        closing: opened.map((o) => o.name),
+      })
+      await drainAndClose(null, [...opened].reverse())
+      throw new BootStepFailedError(step.name, err)
+    }
+    if (closer) opened.push(closer)
+  }
+  return opened
+}
+
+/**
  * Install SIGTERM/SIGINT handlers that drain rather than kill.
  *
  * A worker killed mid-job leaves a document in `processing` until the sweep

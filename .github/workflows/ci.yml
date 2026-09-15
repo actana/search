@@ -243,6 +243,21 @@ jobs:
         env:
           SEARCH_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/search_boot
         run: node packages/search/src/db/migrate-cli.ts
+      # Every other runtime module, loaded the same way — and then asked to run.
+      #
+      # The migrator proves one entry point loads. This proves all 166 of them
+      # do, and it calls `url-guard.validateExternalUrl`, which is the check
+      # that catches the class of defect the test suite structurally cannot:
+      # vitest applies CJS/ESM interop shims, so `import * as ipaddr from
+      # 'ipaddr.js'` was a working namespace under the runner and a namespace
+      # with nothing on it under `node`. Every URL-validating write on a live
+      # instance answered `400 ipaddr.isValid is not a function` with a green
+      # 1057-test gate. `pnpm test` runs this script too (through
+      # `__tests__/plain-node-imports.test.ts`); it is here as well because this
+      # is the job that runs things the way the image does, and it needs no
+      # database.
+      - name: Import every runtime module with plain node
+        run: node --experimental-strip-types scripts/import-runtime-modules.mjs
 
   # `--prod`: the gate is about what ships. A check that goes red for reasons
   # unrelated to the change in front of it is a check everyone learns to click

@@ -61,7 +61,7 @@ import { chargeQuery } from "../rate-limit.ts";
 import { ownerIdFor, requireKb, requireKbIncludingArchived } from "../ownership.ts";
 import { listEndpoints } from "../../models/endpoint-registry.ts";
 import type { SearchRouter } from "../routes.ts";
-import { iso, kbToWire } from "../serialize.ts";
+import { iso, kbToWire, type KbWireColumns } from "../serialize.ts";
 
 /** A request id for the lifted service functions' log lines. */
 const requestId = (): string => `rest-${generateShortId(8)}`;
@@ -115,9 +115,18 @@ export function registerKbRoutes(router: SearchRouter): void {
     route("GET", "/v1/kbs", "read", async ({ res, client, url }) => {
       const query = parseWith(ListKbsQuerySchema, queryOf(url));
       const rows = await getKnowledgeBases(client!.id, client!.id, query.scope ?? "active");
-      const languages = await languagesFor(client!.id, rows.map((r) => r.id));
+      const columns = await searchColumnsFor(client!.id, rows.map((r) => r.id));
       sendJson(res, 200, {
-        knowledgeBases: rows.map((kb) => kbToWire(kb, { language: languages.get(kb.id) })),
+        /**
+         * A KB with no row is a KB that was hard-deleted between the lifted
+         * listing and the read beside it, and it is left out rather than
+         * answered with invented columns — which is what reporting
+         * `embeddingEndpointId: null` for a KB that has one amounts to.
+         */
+        knowledgeBases: rows.flatMap((kb) => {
+          const own = columns.get(kb.id);
+          return own ? [kbToWire(kb, own)] : [];
+        }),
       });
     }),
   );
@@ -189,21 +198,35 @@ export function registerKbRoutes(router: SearchRouter): void {
        * also what the in-process fixture suite does, so the two replays start
        * from the same database.
        */
+      /**
+       * The **whole** row, and it is what the response is built from.
+       *
+       * `createKnowledgeBase` hands back an object it assembles itself, and
+       * that object names none of Search's own columns — not the endpoint ids
+       * it just wrote, not `kmeans_k`, not `language` (`api/serialize.ts` says
+       * why the lifted shape cannot). Serialising it alone is what made
+       * `POST /v1/kbs` persist `embedding_endpoint_id` and answer
+       * `embeddingEndpointId: null`, so a wired Studio saw no embedding
+       * endpoint on a KB that had one. This read is the row as it was
+       * persisted, `language` update above included.
+       */
       const [row] = await db
-        .select({
-          embeddingDimension: knowledgeBase.embeddingDimension,
-          language: knowledgeBase.language,
-        })
+        .select()
         .from(knowledgeBase)
         .where(eq(knowledgeBase.id, created.id))
         .limit(1);
+      if (!row) {
+        // The insert succeeded a few statements ago, so the only way here is a
+        // concurrent hard delete of the row this request just created.
+        throw new HttpError(500, "core-error", `knowledge base ${created.id} vanished`);
+      }
       await provisionKbPartition({
         kbId: created.id,
-        dim: row?.embeddingDimension ?? DEFAULT_EMBEDDING_DIMENSION,
-        language: row?.language ?? language,
+        dim: row.embeddingDimension,
+        language: row.language,
       });
 
-      sendJson(res, 201, kbToWire(created, { language: row?.language ?? language }));
+      sendJson(res, 201, kbToWire(created, row));
     }),
   );
 
@@ -212,7 +235,7 @@ export function registerKbRoutes(router: SearchRouter): void {
       const owned = await requireKb(client, kbId!);
       const kb = await getKnowledgeBaseById(kbId!);
       if (!kb) throw notFound(`no knowledge base ${kbId}`);
-      sendJson(res, 200, kbToWire(kb, { language: owned.language }));
+      sendJson(res, 200, kbToWire(kb, owned));
     }),
   );
 
@@ -239,8 +262,11 @@ export function registerKbRoutes(router: SearchRouter): void {
         }
         throw err;
       }
+      // Re-read after the update: the row is what the patch actually left
+      // behind, including the endpoint ids and the cluster count the lifted
+      // update's own select leaves out.
       const owned = await requireKb(client, kbId!);
-      sendJson(res, 200, kbToWire(updated, { language: owned.language }));
+      sendJson(res, 200, kbToWire(updated, owned));
     }),
   );
 
@@ -300,7 +326,9 @@ export function registerKbRoutes(router: SearchRouter): void {
       }
       const restored = await getKnowledgeBaseById(kbId!);
       if (!restored) throw notFound(`no knowledge base ${kbId}`);
-      sendJson(res, 200, kbToWire(restored, { language: archived.language }));
+      // The un-archived row, not the archived one this route started from: the
+      // restore may have had to rename the KB.
+      sendJson(res, 200, kbToWire(restored, await requireKb(client, kbId!)));
     }),
   );
 
@@ -488,20 +516,34 @@ function matchToWire(row: V1SearchResult): V1TagQueryResponse["matches"][number]
 }
 
 /**
- * The `language` column for a batch of KBs, which the lifted type omits.
+ * Search's own columns for a batch of KBs — the ones the lifted listing does
+ * not select (`api/serialize.ts`).
+ *
+ * It read `language` alone until the endpoint ids turned out to be missing from
+ * the listing for the same reason, and one read of the same rows answers both.
  *
  * Restricted to the ids asked for **and** to the calling client: this read used
  * to select every `knowledge_base` row on the instance and filter in memory,
  * which is one `GET /v1/kbs` reading every other client's rows to answer with
- * four of its own.
+ * four of its own. No `deleted_at` predicate, because `?scope=archived` asks
+ * for exactly the rows one would exclude.
  */
-async function languagesFor(
+async function searchColumnsFor(
   pairedClientId: string,
   kbIds: string[],
-): Promise<Map<string, string>> {
+): Promise<Map<string, KbWireColumns>> {
   if (kbIds.length === 0) return new Map();
   const rows = await db
-    .select({ id: knowledgeBase.id, language: knowledgeBase.language })
+    .select({
+      id: knowledgeBase.id,
+      language: knowledgeBase.language,
+      embeddingEndpointId: knowledgeBase.embeddingEndpointId,
+      inferenceEndpointId: knowledgeBase.inferenceEndpointId,
+      inferenceModelId: knowledgeBase.inferenceModelId,
+      kmeansK: knowledgeBase.kmeansK,
+      kmeansSilhouette: knowledgeBase.kmeansSilhouette,
+      kmeansUpdatedAt: knowledgeBase.kmeansUpdatedAt,
+    })
     .from(knowledgeBase)
     .where(
       and(
@@ -509,5 +551,5 @@ async function languagesFor(
         inArray(knowledgeBase.id, kbIds),
       ),
     );
-  return new Map(rows.map((r) => [r.id, r.language]));
+  return new Map(rows.map(({ id, ...columns }) => [id, columns]));
 }

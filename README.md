@@ -58,6 +58,14 @@ On first start Search mints its identity into `SEARCH_STATE_DIR` (default
 `~/.actana-search`) and logs the CA fingerprint. Pairing a client takes two
 commands: mint a code on the instance, redeem it on the client.
 
+> **Keep `SEARCH_STATE_DIR` short.** The admin listener binds a Unix domain
+> socket at `$SEARCH_STATE_DIR/admin.sock`, and a socket path is capped by
+> `sun_path` — 104 bytes on macOS, 108 on Linux. A longer one is refused by the
+> kernel with `EINVAL`, so Search refuses the variable at startup with the
+> length and the limit rather than failing halfway through its boot. Somewhere
+> with no room to spare can put the admin surface on a loopback port instead
+> (`SEARCH_ADMIN_PORT`).
+
 ```bash
 # On the machine that is the instance. The admin surface listens on a unix
 # socket under SEARCH_STATE_DIR at mode 0600 — the filesystem is what guards it,
