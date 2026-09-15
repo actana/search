@@ -83,6 +83,17 @@ import { generateId } from "@actana/search-shared/short-id";
 import type { SearchPairingStore } from "../pairing/pairing-store.ts";
 import type { PairingRevocations } from "../pairing/pairing-revocation.ts";
 import { sendJson, sendRefusal } from "../pairing/pairing-routes.ts";
+import { ADMIN_SOCKET_FILENAME, adminSocketPath, socketPathProblem } from "./admin-socket.ts";
+
+/**
+ * Re-exported from `admin-socket.ts`, which `config.ts` also reads.
+ *
+ * They lived here until `SEARCH_STATE_DIR` needed validating before anything
+ * was opened; `config.ts` cannot import this module (it is imported by half the
+ * tree, this one starts an HTTP server), so the two constants moved down to a
+ * leaf and the old spelling stayed.
+ */
+export { ADMIN_SOCKET_FILENAME, adminSocketPath };
 
 const logger = createLogger("api/admin");
 
@@ -91,14 +102,6 @@ const LOOPBACK = new Set(["127.0.0.1", "::1", "localhost"]);
 
 /** The most an admin request body may weigh. Nothing here is large. */
 const MAX_ADMIN_BODY_BYTES = 16 * 1024;
-
-/** The socket's name inside `SEARCH_STATE_DIR`. */
-export const ADMIN_SOCKET_FILENAME = "admin.sock";
-
-/** Where the admin socket lives for a given state directory. */
-export function adminSocketPath(stateDir: string): string {
-  return path.join(stateDir, ADMIN_SOCKET_FILENAME);
-}
 
 export type AdminServerOptions = {
   store: SearchPairingStore;
@@ -146,6 +149,18 @@ export async function startAdminServer(opts: AdminServerOptions): Promise<AdminS
     );
   }
   const socketPath = opts.socketPath === undefined ? null : opts.socketPath;
+  /**
+   * The path length, before the bind rather than after it.
+   *
+   * `config.ts` already refuses a `SEARCH_STATE_DIR` whose socket path is too
+   * long, so this catches the other caller: a `socketPath` passed straight in.
+   * `listen EINVAL … /admin.sock` is what the kernel says instead, and it took
+   * a proof run to work out what it meant.
+   */
+  if (socketPath) {
+    const problem = socketPathProblem(socketPath);
+    if (problem) throw new Error(`the admin listener cannot bind: ${problem}`);
+  }
   if (!socketPath && !wantsTcp) {
     throw new Error(
       "the admin listener was given neither a socket path nor a port, so no operator could " +
@@ -377,56 +392,67 @@ export async function startAdminServer(opts: AdminServerOptions): Promise<AdminS
       target();
     });
 
-  if (socketPath) {
-    // A socket left behind by a process that was killed rather than stopped
-    // would make `listen` fail with `EADDRINUSE` on a path nothing is serving.
-    // Removing it is safe: a live one belongs to a process that is already
-    // answering, and starting a second instance against one state directory is
-    // an operator error the database would catch anyway.
-    try {
-      fs.rmSync(socketPath, { force: true });
-    } catch {
-      /* a path we cannot remove is one `listen` will report properly */
-    }
-    fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
-    await listen(() => server.listen(socketPath));
-    // 0600 after the bind rather than a umask around it: a umask is process
-    // state that every other file in this boot would also be written under.
-    // There is a window between the two, and it is bounded by the 0700
-    // directory the socket sits in.
-    fs.chmodSync(socketPath, 0o600);
-    logger.info("Admin listening (unix socket, 0600)", { socketPath });
-  }
+  /**
+   * Close the listener and take the socket file with it.
+   *
+   * The caller's `close()` is this, and so is the failure path below: a boot
+   * that bound the socket and then could not bind its port used to throw with
+   * the socket still bound and the file still there, which is the same
+   * half-open state `openInOrder` exists to prevent, one level down.
+   */
+  const closeServer = (): Promise<void> =>
+    new Promise<void>((resolve) => {
+      server.closeAllConnections?.();
+      server.close(() => {
+        if (socketPath) {
+          try {
+            fs.rmSync(socketPath, { force: true });
+          } catch {
+            /* best effort — a stale socket is removed on the next start */
+          }
+        }
+        resolve();
+      });
+    });
 
   let port: number | null = null;
-  if (wantsTcp) {
-    await listen(() => server.listen(opts.port ?? 0, host));
-    port = (server.address() as AddressInfo).port;
-    logger.warn(
-      "Admin also listening on loopback TCP. Any process on this host can reach it, including " +
-        "every container sharing the network namespace. Prefer the unix socket.",
-      { host, port },
-    );
+  try {
+    if (socketPath) {
+      // A socket left behind by a process that was killed rather than stopped
+      // would make `listen` fail with `EADDRINUSE` on a path nothing is
+      // serving. Removing it is safe: a live one belongs to a process that is
+      // already answering, and starting a second instance against one state
+      // directory is an operator error the database would catch anyway.
+      try {
+        fs.rmSync(socketPath, { force: true });
+      } catch {
+        /* a path we cannot remove is one `listen` will report properly */
+      }
+      fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
+      await listen(() => server.listen(socketPath));
+      // 0600 after the bind rather than a umask around it: a umask is process
+      // state that every other file in this boot would also be written under.
+      // There is a window between the two, and it is bounded by the 0700
+      // directory the socket sits in.
+      fs.chmodSync(socketPath, 0o600);
+      logger.info("Admin listening (unix socket, 0600)", { socketPath });
+    }
+
+    if (wantsTcp) {
+      await listen(() => server.listen(opts.port ?? 0, host));
+      port = (server.address() as AddressInfo).port;
+      logger.warn(
+        "Admin also listening on loopback TCP. Any process on this host can reach it, including " +
+          "every container sharing the network namespace. Prefer the unix socket.",
+        { host, port },
+      );
+    }
+  } catch (err) {
+    await closeServer();
+    throw err;
   }
 
-  return {
-    socketPath,
-    port,
-    close: () =>
-      new Promise<void>((resolve) => {
-        server.closeAllConnections?.();
-        server.close(() => {
-          if (socketPath) {
-            try {
-              fs.rmSync(socketPath, { force: true });
-            } catch {
-              /* best effort — a stale socket is removed on the next start */
-            }
-          }
-          resolve();
-        });
-      }),
-  };
+  return { socketPath, port, close: closeServer };
 }
 
 /**

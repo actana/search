@@ -123,11 +123,14 @@ vi.mock('./events/publish.ts', async (importOriginal) => {
 import { EndpointKeyUnavailableError } from './models/endpoint-key-errors.ts'
 import { resetAnnouncedEvents } from './jobs/run.ts'
 import {
+  BootStepFailedError,
   drainAndClose,
   handleJobFailure,
   isTerminalJobFailure,
   NotRunnableJobError,
+  openInOrder,
   processSearchJob,
+  type BootStep,
   type SearchWorkers,
 } from './worker.ts'
 
@@ -960,5 +963,103 @@ describe('shutdown', () => {
     // The admin socket is still unlinked: one listener that will not shut down
     // must not leave the next one open.
     expect(order).toEqual(['workers', 'api', 'admin'])
+  })
+})
+
+/**
+ * A boot is all or nothing.
+ *
+ * The proof run's `SEARCH_STATE_DIR` made the admin listener's socket path
+ * longer than `sun_path`, so step 5 of `boot()` died with `listen EINVAL` —
+ * and step 4's API listener stayed open, answering `GET /v1/health` with
+ * `{"ok":true}`, with no admin socket to mint a pairing code on and no worker
+ * to ingest anything. The container probe called that healthy.
+ *
+ * Asserted against fakes for the same reason `drainAndClose` is: the property
+ * under test is the order and the unwinding, not what a real listener does.
+ */
+describe('a boot that cannot finish', () => {
+  /** A step that opens successfully and records both halves. */
+  const step = (name: string, order: string[]): BootStep => ({
+    name,
+    open: async () => {
+      order.push(`open:${name}`)
+      return { name, close: async () => void order.push(`close:${name}`) }
+    },
+  })
+
+  /** The listener that rejects — the admin socket, as the proof run had it. */
+  const rejecting = (name: string, order: string[]): BootStep => ({
+    name,
+    open: async () => {
+      order.push(`open:${name}`)
+      throw Object.assign(new Error(`listen EINVAL /very/long/path/admin.sock`), {
+        code: 'EINVAL',
+      })
+    },
+  })
+
+  it('closes the listener it had already opened, and names the step that failed', async () => {
+    const order: string[] = []
+    const failure = await openInOrder([
+      step('api', order),
+      rejecting('admin', order),
+      step('workers', order),
+    ]).catch((err: unknown) => err)
+
+    expect(failure).toBeInstanceOf(BootStepFailedError)
+    expect((failure as BootStepFailedError).step).toBe('admin')
+    // The reason travels: `EINVAL` is all the operator has to go on.
+    expect((failure as Error).message).toContain('listen EINVAL')
+    // The API listener is closed, and the step after the failure never ran.
+    expect(order).toEqual(['open:api', 'open:admin', 'close:api'])
+  })
+
+  it('unwinds in reverse — the last thing opened is the first thing closed', async () => {
+    const order: string[] = []
+    await expect(
+      openInOrder([
+        step('api', order),
+        step('admin', order),
+        rejecting('workers', order),
+      ])
+    ).rejects.toThrow(/boot step "workers" failed/)
+    expect(order).toEqual([
+      'open:api',
+      'open:admin',
+      'open:workers',
+      'close:admin',
+      'close:api',
+    ])
+  })
+
+  it('still fails the boot when the unwind itself cannot close something', async () => {
+    const order: string[] = []
+    const stubborn: BootStep = {
+      name: 'api',
+      open: async () => ({
+        name: 'api',
+        close: async () => {
+          order.push('close:api')
+          throw new Error('a request would not finish')
+        },
+      }),
+    }
+    await expect(openInOrder([stubborn, rejecting('admin', order)])).rejects.toBeInstanceOf(
+      BootStepFailedError
+    )
+    // Attempted, and the original failure is what the caller sees.
+    expect(order).toContain('close:api')
+  })
+
+  it('hands back the closers when every step opened, skipping the steps that opened nothing', async () => {
+    const order: string[] = []
+    const opened = await openInOrder([
+      step('api', order),
+      // `SEARCH_WORKERS=off`: a step that opens nothing and needs no closing.
+      { name: 'workers', open: async () => null },
+    ])
+    expect(opened.map((c) => c.name)).toEqual(['api'])
+    expect(order).toEqual(['open:api'])
   })
 })

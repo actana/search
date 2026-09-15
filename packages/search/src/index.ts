@@ -36,14 +36,19 @@ import { defaultStateDir } from "@actana/search-shared/pairing/material-store";
 import { config, databaseUrl } from "./config.ts";
 import { createDatabase } from "./db/client.ts";
 import { runMigrations } from "./db/migrate.ts";
-import { adminSocketPath, startAdminServer } from "./api/admin-server.ts";
-import { startSearchServer } from "./api/server.ts";
+import { adminSocketPath, startAdminServer, type AdminServer } from "./api/admin-server.ts";
+import { startSearchServer, type SearchServer } from "./api/server.ts";
 import { registerSearchRoutes } from "./api/routes/index.ts";
 import { SearchPairingStore } from "./pairing/pairing-store.ts";
 import { PairingRevocations, startPairingRevocationSweep } from "./pairing/pairing-revocation.ts";
 import { ensureMaterial } from "./pairing/self-register.ts";
 import { assertEncryptionKeyConfigured } from "./core/security/encryption.ts";
-import { installShutdownHandlers, startWorkers } from "./worker.ts";
+import {
+  installShutdownHandlers,
+  openInOrder,
+  startWorkers,
+  type SearchWorkers,
+} from "./worker.ts";
 
 const logger = createLogger("search");
 
@@ -78,26 +83,6 @@ export async function boot(): Promise<void> {
   await revocations.refresh();
   startPairingRevocationSweep({ revocations, onRevoked: () => {} });
 
-  const api = await startSearchServer({
-    material,
-    store,
-    revocations,
-    port: cfg.SEARCH_PORT,
-    publicHosts,
-    devInsecure: cfg.SEARCH_DEV_INSECURE,
-    registerRoutes: registerSearchRoutes,
-  });
-
-  const admin = await startAdminServer({
-    store,
-    revocations,
-    bearerSecret: material.bearerSecret,
-    caFingerprint,
-    endpoint: api.origin,
-    socketPath: adminSocketPath(stateDir),
-    ...(cfg.SEARCH_ADMIN_PORT === undefined ? {} : { port: cfg.SEARCH_ADMIN_PORT }),
-  });
-
   /**
    * The workers, in this process unless a deployment has split them out.
    *
@@ -114,7 +99,61 @@ export async function boot(): Promise<void> {
    */
   const workersOff =
     cfg.SEARCH_INLINE_JOBS || /^(off|0|false|no)$/i.test(process.env.SEARCH_WORKERS ?? "");
-  const workers = workersOff ? null : await startWorkers();
+
+  /**
+   * Steps 4, 5 and 6 — **together or not at all** (`openInOrder`).
+   *
+   * They used to be three awaits in a row, and a failure at step 5 left the
+   * API listener from step 4 open: the process went on answering
+   * `GET /v1/health` with `{"ok":true}` with no admin socket to mint a pairing
+   * code on and no worker to ingest anything, and a container probe called that
+   * healthy. Now a failure closes what opened, in reverse, and the rejection
+   * reaches the entry point below, which exits non-zero.
+   */
+  let api!: SearchServer;
+  let admin!: AdminServer;
+  let workers: SearchWorkers | null = null;
+
+  await openInOrder([
+    {
+      name: "api",
+      open: async () => {
+        api = await startSearchServer({
+          material,
+          store,
+          revocations,
+          port: cfg.SEARCH_PORT,
+          publicHosts,
+          devInsecure: cfg.SEARCH_DEV_INSECURE,
+          registerRoutes: registerSearchRoutes,
+        });
+        return { name: "api", close: () => api.close() };
+      },
+    },
+    {
+      name: "admin",
+      open: async () => {
+        admin = await startAdminServer({
+          store,
+          revocations,
+          bearerSecret: material.bearerSecret,
+          caFingerprint,
+          endpoint: api.origin,
+          socketPath: adminSocketPath(stateDir),
+          ...(cfg.SEARCH_ADMIN_PORT === undefined ? {} : { port: cfg.SEARCH_ADMIN_PORT }),
+        });
+        return { name: "admin", close: () => admin.close() };
+      },
+    },
+    {
+      name: "workers",
+      open: async () => {
+        if (workersOff) return null;
+        workers = await startWorkers();
+        return { name: "workers", close: () => workers!.close() };
+      },
+    },
+  ]);
 
   /**
    * One set of handlers for everything this process owns.
@@ -147,6 +186,17 @@ export async function boot(): Promise<void> {
 if (process.argv[1]?.endsWith("index.ts")) {
   boot().catch((err: unknown) => {
     logger.error("Boot failed", err);
-    process.exitCode = 1;
+    /**
+     * `process.exit`, not `process.exitCode`.
+     *
+     * Setting the code and returning asks the event loop to run dry, and a
+     * half-finished boot is precisely the state where it does not: a listener
+     * that opened before the failing step keeps the process alive, with the
+     * exit code set and nobody to read it. That is what the proof run saw — a
+     * logged `Boot failed` beside a process still answering
+     * `GET /v1/health`. `openInOrder` closes the listeners first, so by here
+     * there is nothing to drain and nothing to wait for.
+     */
+    process.exit(1);
   });
 }
