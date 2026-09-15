@@ -34,10 +34,16 @@ import {
   getKnowledgeBaseById,
   getKnowledgeBases,
   KnowledgeBaseConflictError,
+  restoreKnowledgeBase,
   updateKnowledgeBase,
 } from "../../knowledge/service.ts";
 import type { ChunkingConfig } from "../../knowledge/types.ts";
-import { getQueryStrategy, handleTagAndVectorSearch } from "../../v1/knowledge-search-utils.ts";
+import {
+  getQueryStrategy,
+  handleTagAndVectorSearch,
+  handleTagOnlySearch,
+  type SearchResult as V1SearchResult,
+} from "../../v1/knowledge-search-utils.ts";
 import type { StructuredFilter } from "../../knowledge/types.ts";
 import {
   badRequest,
@@ -51,7 +57,7 @@ import {
   sendJson,
 } from "../http.ts";
 import { chargeQuery } from "../rate-limit.ts";
-import { ownerIdFor, requireKb } from "../ownership.ts";
+import { ownerIdFor, requireKb, requireKbIncludingArchived } from "../ownership.ts";
 import { listEndpoints } from "../../models/endpoint-registry.ts";
 import type { SearchRouter } from "../routes.ts";
 import { iso, kbToWire } from "../serialize.ts";
@@ -246,6 +252,46 @@ export function registerKbRoutes(router: SearchRouter): void {
   );
 
   router.add(
+    /**
+     * `POST /v1/kbs/:kbId/restore` — the other half of the soft delete.
+     *
+     * **The one KB route whose subject is an archived row**, so it is the one
+     * that asks `requireKbIncludingArchived` rather than `requireKb`: every
+     * other route treats `deleted_at IS NULL` as part of the KB's identity,
+     * which is exactly right for them and would make this route's subject
+     * invisible to it. Ownership is checked the same way and the refusal is the
+     * same `404` (ADR 0009 D5) — a KB that is somebody else's, and one that
+     * never existed, are the same answer.
+     *
+     * The response is the knowledge base and not `{ restored: true }` because
+     * the restore may have had to rename it: the lifted
+     * `restoreKnowledgeBase` un-archives under `generateRestoreName`, so a KB
+     * whose name was taken while it was archived comes back as
+     * `…_restored`. A caller that cannot read the name it got is a caller whose
+     * next `PATCH` names a KB that is not there.
+     */
+    route("POST", "/v1/kbs/:kbId/restore", "write", async ({ res, client }, { kbId }) => {
+      const archived = await requireKbIncludingArchived(client, kbId!);
+      if (archived.deletedAt === null) {
+        throw conflict(`knowledge base ${kbId} is not archived`);
+      }
+      try {
+        await restoreKnowledgeBase(kbId!, requestId());
+      } catch (err) {
+        if (err instanceof KnowledgeBaseConflictError) throw conflict(err.message);
+        if (err instanceof Error && /not found|not archived/i.test(err.message)) {
+          // Lost a race with a concurrent restore or delete of the same KB.
+          throw conflict(err.message);
+        }
+        throw err;
+      }
+      const restored = await getKnowledgeBaseById(kbId!);
+      if (!restored) throw notFound(`no knowledge base ${kbId}`);
+      sendJson(res, 200, kbToWire(restored, { language: archived.language }));
+    }),
+  );
+
+  router.add(
     route("POST", "/v1/kbs/:kbId/query", "read", async ({ req, res, client }, { kbId }) => {
       // The one route a caller can loop at no cost to itself. `api/rate-limit.ts`
       // says why this and not everything.
@@ -258,7 +304,9 @@ export function registerKbRoutes(router: SearchRouter): void {
       }
       const engineArgs = {
         kbId: kbId!,
-        text: body.text,
+        // Not optional on this branch: `QueryRequestSchema` only lets `text`
+        // be absent for the tag-only v1 search, which returned above.
+        text: body.text!,
         ...(body.topK === undefined ? {} : { topK: body.topK }),
         ...(body.keywordWeight === undefined ? {} : { keywordWeight: body.keywordWeight }),
         ...(body.neighborClusters === undefined
@@ -299,20 +347,54 @@ export function registerKbRoutes(router: SearchRouter): void {
 }
 
 /**
- * The v1 tag+vector path, over the shared `embedding` table.
+ * The v1 path, over the shared `embedding` table. Two engines, and which one
+ * runs is read off the request rather than decided here.
  *
- * The query vector is produced by the KB's own embedding endpoint, which is
- * what the v1 route did; `getQueryStrategy` then decides the distance
- * threshold. One KB per request here — the v1 route could search several, and
- * an instance of Search answers for one KB per call because the route names
- * one. That is the only difference, and it puts `kbCount` at 1, which is the
- * `singleQueryOptimized` branch.
+ * With `text`, it is `handleTagAndVectorSearch`: the query vector comes from
+ * the KB's own embedding endpoint, which is what the v1 route did, and the tag
+ * filter runs first. Without `text` — which the contract permits only when
+ * `tags` is non-empty — it is `handleTagOnlySearch`, the one v1 shape that
+ * ranks by nothing: tag filter, then whatever survives, and **no embedding
+ * call at all**. That is not an optimisation of the other path, it is the
+ * function Studio's own tag-only search has always called, and a route that
+ * embedded the tag values instead would be a different ranking (ADR 0005).
+ *
+ * `getQueryStrategy` decides the distance threshold unless the caller stated
+ * one. One KB per request here — the v1 route could search several, and Search
+ * answers for the one its route names — which puts `kbCount` at 1 and picks
+ * the `singleQueryOptimized` branch. That is also why the threshold has to be
+ * statable: a caller fanning out over its own several KBs computed one
+ * threshold for the whole call, and from one KB this instance can only ever
+ * infer `1.0`.
  */
 async function runV1TagQuery(
   kbId: string,
   embeddingEndpointId: string | null,
   body: QueryRequest,
 ): Promise<V1TagQueryResponse> {
+  const topK = body.topK ?? 5;
+  const structuredFilters = (body.tags ?? []) as StructuredFilter[];
+  /**
+   * The caller's threshold wins, and the response reports the one that ran —
+   * `strategy` is the record of what happened, not of what would have.
+   */
+  const computed = getQueryStrategy(1, topK);
+  const strategy = {
+    ...computed,
+    distanceThreshold: body.distanceThreshold ?? computed.distanceThreshold,
+  };
+  const noUsage = {
+    embed: { promptTokens: 0, totalTokens: 0 },
+    keywords: { promptTokens: 0, totalTokens: 0 },
+  };
+
+  if (body.text === undefined) {
+    // Tag-only. No endpoint is resolved and no vector is asked for, so a KB
+    // with no embedding endpoint answers this request rather than refusing it.
+    const rows = await handleTagOnlySearch({ knowledgeBaseIds: [kbId], topK, structuredFilters });
+    return { mode: "v1-tags", matches: rows.map(matchToWire), strategy, usage: noUsage };
+  }
+
   if (!embeddingEndpointId) {
     throw new HttpError(
       400,
@@ -320,29 +402,22 @@ async function runV1TagQuery(
       `knowledge base ${kbId} has no embedding endpoint configured`,
     );
   }
-  const topK = body.topK ?? 5;
   const endpoint = await resolveKbEmbeddingEndpoint(embeddingEndpointId);
   const embedded = await executeWorkspaceEmbedding({ endpoint, input: body.text });
   const vector = embedded.embeddings[0];
   if (!vector) throw new HttpError(500, "core-error", "the embedding provider returned nothing");
 
-  const strategy = getQueryStrategy(1, topK);
   const results = await handleTagAndVectorSearch({
     knowledgeBaseIds: [kbId],
     topK,
-    structuredFilters: (body.tags ?? []) as StructuredFilter[],
+    structuredFilters,
     queryVector: `[${vector.join(",")}]`,
     distanceThreshold: strategy.distanceThreshold,
   });
 
   return {
     mode: "v1-tags",
-    matches: results.map((row) => ({
-      ...row,
-      date1: iso(row.date1),
-      date2: iso(row.date2),
-      distance: Number(row.distance),
-    })),
+    matches: results.map(matchToWire),
     strategy,
     usage: {
       embed: {
@@ -351,6 +426,16 @@ async function runV1TagQuery(
       },
       keywords: { promptTokens: 0, totalTokens: 0 },
     },
+  };
+}
+
+/** One v1 row as the contract describes it: dates as ISO, `distance` a number. */
+function matchToWire(row: V1SearchResult): V1TagQueryResponse["matches"][number] {
+  return {
+    ...row,
+    date1: iso(row.date1),
+    date2: iso(row.date2),
+    distance: Number(row.distance),
   };
 }
 

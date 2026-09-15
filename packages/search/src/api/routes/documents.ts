@@ -19,6 +19,7 @@
 
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import {
+  BulkDocumentsRequestSchema,
   IngestJsonRequestSchema,
   IngestMultipartFieldsSchema,
   IncludeDocumentRequestSchema,
@@ -27,7 +28,12 @@ import {
   UpdateDocumentRequestSchema,
   UpsertDocumentRequestSchema,
 } from "@actana/search/contracts";
-import type { TagWrites, UpsertDocumentResponse } from "@actana/search/contracts";
+import type {
+  IngestMultipartFields,
+  IngestResponse,
+  TagWrites,
+  UpsertDocumentResponse,
+} from "@actana/search/contracts";
 import { generateId, generateShortId } from "@actana/search-shared/short-id";
 import { db } from "../../db/client.ts";
 import { document } from "../../db/schema.ts";
@@ -37,6 +43,8 @@ import { stageIngestedDocument } from "../../kb/ingest.ts";
 import { getJobQueue } from "../../queue/index.ts";
 import type { KbIngestDocumentPayload } from "../../jobs/types.ts";
 import {
+  bulkDocumentOperation,
+  bulkDocumentOperationByFilter,
   deleteDocument,
   getDocuments,
   updateDocument,
@@ -47,6 +55,7 @@ import {
   conflict,
   HttpError,
   isMultipart,
+  notFound,
   parseWith,
   queryOf,
   readJsonBody,
@@ -80,9 +89,56 @@ export function registerDocumentRoutes(router: SearchRouter): void {
   );
 
   router.add(
+    /**
+     * `POST /v1/kbs/:kbId/documents/bulk` — one request, many documents.
+     *
+     * Two forms, because the frozen service has two: a list of ids
+     * (`bulkDocumentOperation`) and an `enabledFilter` over the whole KB
+     * (`bulkDocumentOperationByFilter`). The contract permits exactly one of
+     * them and nothing else, because nothing else exists behind it.
+     *
+     * **The route's own check is that every id is in this KB**, before a single
+     * row is written. The frozen function is tolerant — it acts on the ids it
+     * recognises and logs the rest — which for a wire is the wrong shape: a
+     * caller that mistyped an id, or named another KB's document, would get a
+     * `200` and a count it has to diff against what it asked for. So the
+     * refusal is a `404` that names *none* of the ids: which of them is not
+     * yours is not something to confirm (ADR 0009 D5).
+     */
+    route("POST", "/v1/kbs/:kbId/documents/bulk", "write", async (ctx, { kbId }) => {
+      await requireKb(ctx.client, kbId!);
+      const body = parseWith(BulkDocumentsRequestSchema, await readJsonBody(ctx.req));
+
+      if (body.enabledFilter !== undefined) {
+        const byFilter = await bulkDocumentOperationByFilter(
+          kbId!,
+          body.operation,
+          body.enabledFilter,
+          requestId(),
+        );
+        sendJson(ctx.res, 200, { affected: byFilter.successCount });
+        return;
+      }
+
+      const ids = body.documentIds!;
+      await requireEveryDocument(kbId!, ids);
+      const result = await bulkDocumentOperation(kbId!, body.operation, ids, requestId());
+      sendJson(ctx.res, 200, { affected: result.successCount });
+    }),
+  );
+
+  router.add(
     route("GET", "/v1/kbs/:kbId/documents", "read", async ({ res, client, url }, { kbId }) => {
       await requireKb(client, kbId!);
       const query = parseWith(ListDocumentsQuerySchema, queryOf(url));
+      /**
+       * Handed over whole, `tagFilters` included: the lifted `getDocuments`
+       * already takes `TagFilterCondition[]` under that name and the contract's
+       * shape is that type field for field, so there is nothing here to map.
+       * The parameter arrives JSON-encoded because a list of conditions cannot
+       * be spelled `tag1=…` without losing the operator and the second bound —
+       * `ListDocumentsQuerySchema` says so at length.
+       */
       const listed = await getDocuments(kbId!, query, requestId());
       const rows = await rowsById(listed.documents.map((d) => d.id));
       sendJson(res, 200, {
@@ -207,7 +263,7 @@ export function registerDocumentRoutes(router: SearchRouter): void {
 async function ingestMultipart(
   req: import("node:http").IncomingMessage,
   kbId: string,
-): Promise<{ documentId: string; processingStatus: string }> {
+): Promise<IngestResponse> {
   const body = await readMultipartBody(req);
   const file = body.files.find((f) => f.field === "file") ?? body.files[0];
   if (!file) throw badRequest("the multipart body carries no `file` part");
@@ -243,7 +299,7 @@ async function ingestMultipart(
   // Before the upload: a `documentId` that belongs to another knowledge base is
   // refused rather than answered after this instance has stored the bytes.
   const reused = await documentForSuppliedId(kbId, fields.documentId);
-  if (reused) return { documentId: reused.id, processingStatus: reused.processingStatus };
+  if (reused) return reused;
   const documentId = fields.documentId ?? generateId();
 
   const stored = await StorageService.uploadFile({
@@ -261,7 +317,15 @@ async function ingestMultipart(
     fileUrl: stored.path,
     fileSize: file.bytes.length,
     includedInKb,
-    tags: coerceTags(tagWritesFrom(body.fields)),
+    /**
+     * The same call the JSON path makes, over the same seventeen values:
+     * `IngestMultipartFieldsSchema` now *declares* the tag slots (it extends
+     * `TagWritesSchema`), so they are read off the validated fields rather
+     * than off the raw form — one definition of what a tag part is, and the
+     * SDK's typed `tags` reaches the staged row by the contract rather than by
+     * the shape of the form it happens to build.
+     */
+    tags: coerceTags(tagWritesFrom(fields)),
   });
 
   /**
@@ -280,19 +344,19 @@ async function ingestMultipart(
     fileSize: file.bytes.length,
     mimeType,
   });
-  return { documentId, processingStatus: "pending" };
+  return settledAnswer(documentId);
 }
 
 /** JSON: `text` takes the `ingestDocument` path, `url` takes the file one. */
 async function ingestJson(
   req: import("node:http").IncomingMessage,
   kbId: string,
-): Promise<{ documentId: string; processingStatus: string }> {
+): Promise<IngestResponse> {
   const body = parseWith(IngestJsonRequestSchema, await readJsonBody(req));
   const includedInKb = body.includedInKb ?? true;
   const mimeType = body.mimeType ?? "application/octet-stream";
   const reused = await documentForSuppliedId(kbId, body.documentId);
-  if (reused) return { documentId: reused.id, processingStatus: reused.processingStatus };
+  if (reused) return reused;
   const documentId = body.documentId ?? generateId();
   const tags = coerceTags(body.tags);
 
@@ -312,7 +376,7 @@ async function ingestJson(
       fileSize: 0,
       mimeType,
     });
-    return { documentId, processingStatus: "pending" };
+    return settledAnswer(documentId);
   }
 
   /**
@@ -345,7 +409,7 @@ async function ingestJson(
     ...(tags === undefined ? {} : { tags }),
   };
   await queue.enqueue("kb.ingest.document", payload);
-  return { documentId, processingStatus: "pending" };
+  return settledAnswer(documentId);
 }
 
 /**
@@ -481,13 +545,14 @@ async function enqueueFileProcessing(
 async function documentForSuppliedId(
   kbId: string,
   suppliedId: string | undefined,
-): Promise<{ id: string; processingStatus: string } | null> {
+): Promise<IngestResponse | null> {
   if (suppliedId === undefined) return null;
   const [row] = await db
     .select({
       id: document.id,
       knowledgeBaseId: document.knowledgeBaseId,
       processingStatus: document.processingStatus,
+      chunkCount: document.chunkCount,
     })
     .from(document)
     .where(eq(document.id, suppliedId))
@@ -496,7 +561,44 @@ async function documentForSuppliedId(
   if (row.knowledgeBaseId !== kbId) {
     throw conflict(`document ${suppliedId} already exists in another knowledge base`);
   }
-  return { id: row.id, processingStatus: row.processingStatus };
+  return {
+    documentId: row.id,
+    processingStatus: row.processingStatus as IngestResponse["processingStatus"],
+    ...(row.chunkCount > 0 ? { chunkCount: row.chunkCount } : {}),
+  };
+}
+
+/**
+ * The answer a just-enqueued ingest gets, with `chunkCount` if there already is
+ * one.
+ *
+ * **One read, never a wait.** Ingest is asynchronous and this route answers
+ * `202`, so on a first ingest there is usually nothing to report and this
+ * costs one indexed read to find that out. What it is for is the case where
+ * the count *is* already there — the idempotent re-ingest of an id, and any
+ * ingest whose work landed before the answer did. Studio's `ingestDocument`
+ * returns a count and `kb_add_file` surfaces it as a block output, so a wire
+ * with no field for it leaves that caller reporting `0` (TASK-009, contract
+ * change 5).
+ *
+ * Zero is reported as *absent* rather than as `0`: a document mid-pipeline has
+ * no count yet, and "not known" and "no chunks" are different claims. The
+ * count for a document still being processed arrives on `document.ingested` or
+ * from `GET …/documents/:docId`.
+ */
+async function settledAnswer(documentId: string): Promise<IngestResponse> {
+  const [row] = await db
+    .select({ processingStatus: document.processingStatus, chunkCount: document.chunkCount })
+    .from(document)
+    .where(eq(document.id, documentId))
+    .limit(1);
+  const chunkCount = row?.chunkCount ?? 0;
+  return {
+    documentId,
+    // `pending` when the row has somehow gone: the work was enqueued either way.
+    processingStatus: (row?.processingStatus ?? "pending") as IngestResponse["processingStatus"],
+    ...(chunkCount > 0 ? { chunkCount } : {}),
+  };
 }
 
 /**
@@ -525,6 +627,35 @@ function metadataField(raw: string | undefined): Record<string, unknown> | undef
   return parseWith(MetadataSchema, parsed);
 }
 
+/**
+ * Every one of these ids has to be a live document in this KB, or nothing
+ * happens.
+ *
+ * One `IN` read, and the refusal names none of the ids: a `404` that said
+ * *which* one is not yours would confirm that the others are (ADR 0009 D5), and
+ * a bulk call is exactly where a caller could walk an id space cheaply. The
+ * count is safe to state — the caller sent the list.
+ */
+async function requireEveryDocument(kbId: string, ids: string[]): Promise<void> {
+  const rows = await db
+    .select({ id: document.id })
+    .from(document)
+    .where(
+      and(
+        eq(document.knowledgeBaseId, kbId),
+        inArray(document.id, ids),
+        isNull(document.deletedAt),
+      ),
+    );
+  const found = new Set(rows.map((row) => row.id));
+  const missing = new Set(ids.filter((id) => !found.has(id))).size;
+  if (missing > 0) {
+    throw notFound(
+      `${missing} of the ${new Set(ids).size} documents named are not in knowledge base ${kbId}`,
+    );
+  }
+}
+
 /** The document rows for a page of ids, indexed by id. */
 async function rowsById(
   ids: string[],
@@ -534,10 +665,19 @@ async function rowsById(
   return new Map(rows.map((row) => [row.id, row]));
 }
 
-/** Pull the tag parts out of a multipart form's string fields. */
-function tagWritesFrom(fields: Record<string, string>): TagWrites {
+/**
+ * The tag parts of a validated multipart form, as the JSON encoding's `tags`.
+ *
+ * `IngestMultipartFieldsSchema` extends `TagWritesSchema`, so the seventeen
+ * slots are declared parts rather than whatever the form happened to carry —
+ * which is what lets this read the *parsed* fields and hand the result to the
+ * same `coerceTags` the JSON path uses. The other keys of the form
+ * (`filename`, `documentId`, …) are not tag slots and are not picked up.
+ */
+function tagWritesFrom(fields: IngestMultipartFields): TagWrites {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(fields)) {
+    if (value === undefined) continue;
     if (/^(tag[1-7]|number[1-5]|date[12]|boolean[123])$/.test(key)) out[key] = value;
   }
   return out as TagWrites;
