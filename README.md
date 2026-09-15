@@ -240,6 +240,7 @@ knowing before reading it:
 | [0008](docs/adr/0008-the-pairing-code-is-copied-from-control.md) | The pairing code is copied from Control, and will be lifted into a package |
 | [0009](docs/adr/0009-one-contract-defined-once-in-zod.md) | One contract, defined once in zod, served and consumed |
 | [0010](docs/adr/0010-the-worker-is-searchs-own-and-a-missing-key-fails-a-job-cleanly.md) | The worker is Search's own, and a missing key fails a job cleanly |
+| [0011](docs/adr/0011-the-one-engine-edit-replacing-a-documents-chunks-under-a-lock.md) | The one engine edit: replacing a document's chunks under a lock |
 
 ## Moving data out of Studio
 

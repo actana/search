@@ -366,6 +366,27 @@ metadata-only re-push safe, and it is what the CLI's `endpoint add` relies on:
 pushes the whole thing back with everybody else's keys unmentioned. An empty
 string is a `400` rather than a blanked key.
 
+**`config.apiKeyEndpointId` shares one endpoint's key with another, and it may
+name the other endpoint by either spelling** — Search's `id` for it, as `GET
+/v1/endpoints` answers, or that endpoint's own `externalId`, which is the id a
+client holding only its own catalog has. Three targets are legal and nothing
+else is:
+
+| The link names | Accepted as |
+|---|---|
+| an endpoint this client already has | its `id`, or its `externalId` |
+| an endpoint declared elsewhere in the same body | that declaration's `externalId` |
+| anything else — another client's endpoint, or an unknown string | **`400`**, naming the value |
+
+An `externalId` is **stored translated**: the row comes back from `GET` with
+`config.apiKeyEndpointId` set to Search's `id` for the endpoint it names, which
+is the only form the key resolution follows. So a client that reads its
+endpoints back and pushes them again is pushing ids, and a re-push of an
+already-translated body changes nothing. Where one string is somehow both an
+`id` and an `externalId`, the `id` wins. A link that leads to an endpoint
+holding a sealed key makes the borrower `hasKey: true`; one that leads to an
+endpoint with no key of its own does not.
+
 `GET`'s `source` is the **declaration**, as an object rather than an enum:
 `{ kind: 'local' }`, or `{ kind: 'mirrored', resolverUrl, resolverScope }`
 (`EndpointSourceSummarySchema`). `resolverScope` is there because it is the

@@ -64,6 +64,38 @@ function runProbe(env: Record<string, string>): Promise<Run> {
   });
 }
 
+/**
+ * The same probe, **imported rather than run** — `node -e` loading it as an
+ * ordinary module, which is the one thing a spawned entry point cannot be.
+ *
+ * Both halves of the guard are false here, and for the two different reasons
+ * it has two halves: `import.meta.main` because this module is not the entry
+ * point, and `process.argv[1] === import.meta.filename` because `-e` leaves
+ * `process.argv[1]` unset.
+ */
+function runImported(env: Record<string, string>): Promise<Run> {
+  const wrapper =
+    "import(process.env.PROBE_URL).then(" +
+    "() => process.stdout.write('imported-and-did-not-probe'), " +
+    "(err) => { process.stderr.write(String(err)); process.exit(3) })";
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, ["-e", wrapper], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        PROBE_URL: pathToFileURL(PROBE).href,
+        SEARCH_HEALTHCHECK_TIMEOUT_MS: "2000",
+        ...env,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString("utf8")));
+    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString("utf8")));
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
 /** Sockets opened by a test, closed whatever it did. */
 const servers: net.Server[] = [];
 
@@ -198,5 +230,52 @@ describe("every other role probes the API", () => {
     expect(run.stderr).not.toMatch(/ReferenceError/);
     expect(run.stderr).toMatch(/unhealthy: .*ECONNREFUSED/);
     expect(run.code).toBe(1);
+  });
+});
+
+/**
+ * The guard on the dispatch, from the other side.
+ *
+ * Every case above spawns the file, so every case above has
+ * `import.meta.main === true` and exercises one branch of
+ * `import.meta.main ?? process.argv[1] === import.meta.filename`. This is the
+ * other branch: the module imported, as the encoding half of this suite
+ * imports it, and as anything that ever wants `respPayload` will. A guard that
+ * stopped holding would turn that import into a live Redis probe and an
+ * `process.exit()` in the middle of somebody's test run.
+ *
+ * **What is still not asserted, and cannot be here.** The `??` exists because
+ * `import.meta.main` does not exist below Node 24.2 — and `engines` admits
+ * 24.0 — where the property is `undefined` and the `process.argv[1]`
+ * comparison is the whole of the answer. There is no way to make a real
+ * `import.meta.main` undefined on a runtime that has it, short of rewriting
+ * the module's source through a loader hook, which would be a test of the
+ * rewrite. So the fallback's *true* branch is covered only by running this
+ * suite on such a runtime.
+ */
+describe("the dispatch runs only when the file is the entry point", () => {
+  it("does nothing at all when the module is imported instead of run", async () => {
+    // The environment of a worker container that is one dispatch away from
+    // dialling: if the guard let go, this is an ECONNREFUSED and an exit 1.
+    const port = await closedPort();
+    const run = await runImported({
+      SEARCH_ROLE: "worker",
+      SEARCH_REDIS_URL: `redis://127.0.0.1:${port}`,
+    });
+    expect(run.stdout).toBe("imported-and-did-not-probe");
+    expect(run.stderr).toBe("");
+    expect(run.code).toBe(0);
+  });
+
+  it("does nothing on the API branch either", async () => {
+    const port = await closedPort();
+    const run = await runImported({
+      SEARCH_PORT: String(port),
+      SEARCH_HEALTHCHECK_HOST: "127.0.0.1",
+      SEARCH_STATE_DIR: path.join(import.meta.dirname, "no-such-state-dir"),
+    });
+    expect(run.stdout).toBe("imported-and-did-not-probe");
+    expect(run.stderr).toBe("");
+    expect(run.code).toBe(0);
   });
 });

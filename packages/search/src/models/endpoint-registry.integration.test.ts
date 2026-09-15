@@ -740,17 +740,30 @@ describeDb('the endpoint registry', () => {
     })
 
     /**
-     * The same check, order-independent (the fix round's NIT #1).
+     * The same check, order-independent (the fix round's NIT #1) — **and the
+     * link actually leading to the key afterwards** (the follow-up round's
+     * SHOULD-FIX #1).
      *
-     * The linkable set used to be grown *as* the write loop created rows, so a
-     * body whose first endpoint was keyed on its second was refused and the
-     * same body in the other order was accepted — a declaration answered by
-     * the order the client happened to serialise it in. Both halves are now
-     * collected before the first row is written, and the endpoint below names
-     * a sibling that comes *after* it in the body.
+     * Two things used to be wrong here and only the first was fixed. The
+     * linkable set was grown *as* the write loop created rows, so a body whose
+     * first endpoint was keyed on its second was refused and the same body in
+     * the other order was accepted — a declaration answered by the order the
+     * client happened to serialise it in. Both halves are now collected before
+     * the first row is written, and the endpoint below names a sibling that
+     * comes *after* it in the body.
+     *
+     * The acceptance was then only half an answer. `externalId` was stored in
+     * `config.apiKeyEndpointId` exactly as it arrived, and nothing reads it
+     * that way: `resolveEndpointApiKey` selects `model_endpoint.id`, which
+     * `createLocalEndpoint` mints from `generateId()`. So the borrower was
+     * written `hasKey: false` and resolved to an empty key — a `200` that
+     * failed on the first embed, minutes later, in a job. The last three
+     * assertions are that it resolves.
      */
-    it('accepts a link to an endpoint the same body declares later', async () => {
+    it('accepts a link to an endpoint the same body declares later, and it resolves', async () => {
       const { applyEndpointDeclaration } = await import('../api/routes/endpoints.ts')
+      const { resolveEndpointApiKey } = await import('./endpoint-api-key.ts')
+      const KEY = 'sk-mine-and-declared-here-0123456789'
       const written = await applyEndpointDeclaration(LINKER, {
         source: { kind: 'local' },
         endpoints: [
@@ -770,7 +783,7 @@ describeDb('the endpoint registry', () => {
             model: 'text-embedding-3-small',
             dimensions: 1536,
             label: 'the key this client does own',
-            apiKey: 'sk-mine-and-declared-here-0123456789',
+            apiKey: KEY,
           },
         ],
       })
@@ -778,6 +791,27 @@ describeDb('the endpoint registry', () => {
         'the-borrower',
         'the-keyholder',
       ])
+
+      const idOf = new Map(written.map((row) => [row.externalId, row.id]))
+      const listed = await registry.listEndpoints(LINKER)
+      const borrower = listed.find((row) => row.externalId === 'the-borrower')!
+      const keyholder = listed.find((row) => row.externalId === 'the-keyholder')!
+
+      // The stored link is Search's id for the sibling, not the spelling the
+      // client sent — which is the only form the resolver's `WHERE id = …` can
+      // find.
+      expect(borrower.config).toEqual({ apiKeyEndpointId: idOf.get('the-keyholder') })
+      expect(idOf.get('the-keyholder')).toBe(keyholder.id)
+      // And therefore a reported key rather than the `hasKey: false` that
+      // an untranslated link produced.
+      expect(borrower.hasKey).toBe(true)
+      expect(
+        await resolveEndpointApiKey({
+          keyCiphertext: null,
+          config: borrower.config,
+          pairedClientId: LINKER,
+        }),
+      ).toBe(KEY)
 
       // And a link to an id that is neither owned nor declared is still refused.
       await expect(
@@ -798,6 +832,77 @@ describeDb('the endpoint registry', () => {
 
       // This client's catalog is a fixture the tests around it count, so this
       // one hands it back the way it found it.
+      await db.delete(modelEndpoint).where(eq(modelEndpoint.pairedClientId, LINKER))
+    })
+
+    /**
+     * The other two spellings a client will actually send.
+     *
+     * A link to an endpoint that already exists may be written as Search's id
+     * — which is what a client that read `GET /v1/endpoints` and pushed it
+     * back sends — or as that endpoint's own `externalId`, which is what a
+     * client holding only its own catalog has. Both are accepted and both end
+     * up stored as the id, and a re-push of an already-translated body must
+     * leave it exactly where it is rather than re-resolve it.
+     */
+    it('translates a link to an endpoint that already exists, by either spelling', async () => {
+      const { applyEndpointDeclaration } = await import('../api/routes/endpoints.ts')
+      const holder = {
+        externalId: 'the-standing-keyholder',
+        kind: 'embedding' as const,
+        provider: 'openai',
+        template: 'openai',
+        model: 'text-embedding-3-small',
+        dimensions: 1536,
+        label: 'declared first, on its own',
+        apiKey: 'sk-standing-and-shared-0123456789',
+      }
+      const first = await applyEndpointDeclaration(LINKER, {
+        source: { kind: 'local' },
+        endpoints: [holder],
+      })
+      const holderId = first[0]!.id
+
+      // Spelling one: the sibling's `externalId`, for a row that already has a
+      // Search id of its own.
+      const byExternalId = await applyEndpointDeclaration(LINKER, {
+        source: { kind: 'local' },
+        endpoints: [
+          holder,
+          {
+            externalId: 'the-late-borrower',
+            kind: 'inference',
+            provider: 'openai',
+            model: 'gpt-4o-mini',
+            label: 'keyed on a row that was already there',
+            config: { apiKeyEndpointId: holder.externalId },
+          },
+        ],
+      })
+      const borrowerId = byExternalId.find((row) => row.externalId === 'the-late-borrower')!.id
+      const readBack = async (id: string) =>
+        (await registry.listEndpoints(LINKER)).find((row) => row.id === id)!
+      expect((await readBack(borrowerId)).config).toEqual({ apiKeyEndpointId: holderId })
+      expect((await readBack(borrowerId)).hasKey).toBe(true)
+
+      // Spelling two: Search's id, which the same body must not re-resolve.
+      await applyEndpointDeclaration(LINKER, {
+        source: { kind: 'local' },
+        endpoints: [
+          holder,
+          {
+            externalId: 'the-late-borrower',
+            kind: 'inference',
+            provider: 'openai',
+            model: 'gpt-4o-mini',
+            label: 'keyed on a row that was already there',
+            config: { apiKeyEndpointId: holderId },
+          },
+        ],
+      })
+      expect((await readBack(borrowerId)).config).toEqual({ apiKeyEndpointId: holderId })
+      expect((await readBack(borrowerId)).hasKey).toBe(true)
+
       await db.delete(modelEndpoint).where(eq(modelEndpoint.pairedClientId, LINKER))
     })
 

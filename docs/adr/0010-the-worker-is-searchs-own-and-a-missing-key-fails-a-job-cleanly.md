@@ -71,17 +71,25 @@ for *its* knowledge queue, because these are the same jobs. A stall is tolerated
 rather than fatal: every job here is idempotent and resumable, so a job whose
 worker died is re-run rather than lost.
 
-**Which the job layer has to make true, because the engine does not.** "Every
-job here is idempotent" was a property of most of them and an assumption about
+**Which has to be made true, because it was an assumption.** "Every job here is
+idempotent" was a property of most of them and an assumption about
 `kb.ingest.document`: it chunks, embeds and inserts into the KB's partition with
 no `completed` short-circuit, no delete of what it is replacing, and no
 `(document_id, chunk_index)` uniqueness to fall back on — so a re-run left the
 document reporting N chunks over 2N rows, and every query over that KB answered
-twice out of one text. The engine is frozen (ADR 0005), so
-`jobs/ingest-idempotency.ts` is where the property is added: a document already
-`completed` skips the handler, and anything else has its partition rows and
-their keyword links dropped in one transaction immediately before the engine
-runs.
+twice out of one text.
+
+It is added in **two places, and the split is not arbitrary.**
+`jobs/ingest-idempotency.ts` holds what only a job layer can know: a document
+already `completed` skips the handler entirely, the payload's KB is checked
+against the one its document is actually in, and the `document_keyword` rollup a
+previous attempt left behind is dropped. The chunk rows themselves are replaced
+**inside the engine's own transaction**, under
+`pg_advisory_xact_lock(hashtext(document_id))` — because a job-layer delete
+commits minutes before that transaction opens, so two *live* runs slipped past
+it and still left 2N. That is the one deliberate logic edit to the frozen engine
+(ADR 0005), and it has its own record:
+[ADR 0011](0011-the-one-engine-edit-replacing-a-documents-chunks-under-a-lock.md).
 
 **And the lock is deliberately shorter than the longest job.** A
 `kb.embed.batch` may run fifteen minutes and a `knowledge-process-document` up
