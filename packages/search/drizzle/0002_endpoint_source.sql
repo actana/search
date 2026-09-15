@@ -1,0 +1,1 @@
+ALTER TABLE "search"."paired_client" ADD COLUMN "endpoint_source" jsonb;

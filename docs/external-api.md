@@ -209,13 +209,33 @@ value on every document and chunk that carried it.
 | `GET /v1/endpoints` | read | — | `GetEndpointsResponseSchema` |
 | `PUT /v1/endpoints` | admin | `PutEndpointsRequestSchema` | `PutEndpointsResponseSchema` |
 
-`PUT` upserts by the declaring client's own `externalId`, so a push is
-idempotent (ADR 0004). An endpoint left out of a later push is removed unless a
-KB is bound to it. **No provider key is ever in a response**: a `local`
-declaration may carry `apiKey` and it comes back only as `hasKey: true`; a
-`mirrored` one carries none at all: `resolverUrl` is asked for one per job with
-`resolverKey` as the bearer, and `resolverScope` — an opaque string Search never
-parses — is echoed back verbatim as that request's `workspaceId`.
+`PUT` upserts by the declaring client's own `externalId` — for a `local`
+declaration as well as a `mirrored` one — so a push is idempotent (ADR 0004).
+An endpoint left out of a later push is removed unless a KB is bound to it, and
+a row with no `externalId` (registered before this route existed) is neither
+upserted onto nor reaped.
+
+**No provider key is ever in a response**: a `local` declaration may carry
+`apiKey` and it comes back only as `hasKey: true`; a `mirrored` one carries none
+at all: `resolverUrl` is asked for one per job with `resolverKey` as the bearer,
+and `resolverScope` — an opaque string Search never parses — is echoed back
+verbatim as that request's `workspaceId`.
+
+**`apiKey` omitted from a `local` declaration means "said nothing about it"**
+and the sealed key already on the row stays. That is what makes a client's
+metadata-only re-push safe, and it is what the CLI's `endpoint add` relies on:
+`PUT` is declarative, so that verb reads the current set, appends to it, and
+pushes the whole thing back with everybody else's keys unmentioned. An empty
+string is a `400` rather than a blanked key.
+
+`GET`'s `source` is the **declaration**, as an object rather than an enum:
+`{ kind: 'local' }`, or `{ kind: 'mirrored', resolverUrl, resolverScope }`
+(`EndpointSourceSummarySchema`). `resolverScope` is there because it is the
+field Search, the client and the resolver all have to agree on, and a client
+that has just pushed needs to be able to read back which scope its keys will be
+asked for under. The credential is not in it, sealed or otherwise. The
+declaration is *not* derived from the rows: a client that has declared a
+resolver and pushed nothing yet reads as `mirrored`.
 
 **Every URL in the body goes through the SSRF guard** before anything is
 written: `resolverUrl` and each endpoint's `baseUrl`, which is the address
@@ -237,10 +257,32 @@ One payload, two transports (ADR 0009 D8). The events are
 `document.ingested`, `document.failed` and `clusters.retrained`
 (`SEARCH_EVENT_NAMES`).
 
+`document.failed` may carry `reason` beside `error`: `error` is the operator's
+sentence and must not be parsed, `reason` is the worker's own classification of
+what went wrong — `unknown-endpoint`, `decrypt-failed`, `model-mismatch`,
+`resolver-error`, … (ADR 0010 D3). It is an open string rather than an enum
+because the reasons are Search's vocabulary and a client must not break when one
+is added, and it is absent when there was no typed failure behind the error.
+
+**A `document.failed` means the document will not ingest, not that something
+went wrong once.** The engine marks a document `failed` as soon as an attempt
+gives up, which for a wired client mid-deploy is a resolver that will answer in
+a second — so the announcement is held back while the attempt that wrote it
+*threw* and the queue still has attempts for it. It is **not** held back when the
+job finished: a handler that returned having marked the document failed has
+decided, whatever the attempt counter says. Two other paths reach the same
+event: a failure the engine never recorded (a key that could not be resolved at
+all) is announced by the worker with a `reason`, and a document stranded by a
+worker that was killed is announced by the timeout sweep with `reason:
+"timeout"` (ADR 0010 D4).
+
 A **webhook** delivery is a POST carrying:
 
-- `x-search-event-id: <event.id>` — deterministic, so a redelivery after an
-  ambiguous timeout is recognisably the same event.
+- `x-search-event-id: <event.id>` — deterministic over *what happened*: the
+  document, its terminal state, and which processing run reached it. A
+  redelivery after an ambiguous timeout is recognisably the same event, and so
+  are the retries of one job; a document you **include again** is a new run and
+  therefore a new event id.
 - `x-search-signature: sha256=<hex>` — HMAC-SHA256 over the **raw body**, keyed
   by the registered secret. Verify over the bytes you received, not over a
   re-encoding. `verifyWebhookSignature` in the core does it in constant time;

@@ -7,7 +7,11 @@
  */
 import { beforeAll, describe, expect, it } from 'vitest'
 import { resetConfig } from '../../config.ts'
-import { decryptSecret, encryptSecret } from './encryption.ts'
+import {
+  assertEncryptionKeyConfigured,
+  decryptSecret,
+  encryptSecret,
+} from './encryption.ts'
 
 describe('encryption', () => {
   beforeAll(() => {
@@ -45,5 +49,56 @@ describe('encryption', () => {
 
   it('rejects a malformed envelope', async () => {
     await expect(decryptSecret('nope')).rejects.toThrow(/Invalid encrypted value format/)
+  })
+})
+
+describe('the boot check', () => {
+  /**
+   * The key was validated nowhere. `encryptSecret` threw at the first *use* —
+   * the first `PUT /v1/endpoints`, the first job that needed a mirrored key —
+   * so an instance with no key started, paired, served health, and reported a
+   * cipher error hours later to whoever happened to be adding an endpoint. It
+   * is required in both modes (ADR 0010 D7), so `index.ts` and `bootWorker`
+   * both call this before anything else.
+   */
+  const withKey = async (value: string | undefined, run: () => void) => {
+    const before = process.env.SEARCH_ENCRYPTION_KEY
+    if (value === undefined) delete process.env.SEARCH_ENCRYPTION_KEY
+    else process.env.SEARCH_ENCRYPTION_KEY = value
+    resetConfig()
+    try {
+      run()
+    } finally {
+      if (before === undefined) delete process.env.SEARCH_ENCRYPTION_KEY
+      else process.env.SEARCH_ENCRYPTION_KEY = before
+      resetConfig()
+    }
+  }
+
+  it('passes on 64 hex characters', async () => {
+    await withKey('a'.repeat(64), () => {
+      expect(() => assertEncryptionKeyConfigured()).not.toThrow()
+    })
+  })
+
+  it('fails loudly when the key is absent', async () => {
+    await withKey(undefined, () => {
+      expect(() => assertEncryptionKeyConfigured()).toThrow(/SEARCH_ENCRYPTION_KEY/)
+    })
+  })
+
+  it('fails on the wrong length', async () => {
+    await withKey('a'.repeat(32), () => {
+      expect(() => assertEncryptionKeyConfigured()).toThrow(/SEARCH_ENCRYPTION_KEY/)
+    })
+  })
+
+  it('fails on 64 characters that are not hex', async () => {
+    // The one the length check missed: `Buffer.from(key, 'hex')` stops at the
+    // first character that is not hex and hands back a *short* key without
+    // complaining, so this used to seal everything under two bytes.
+    await withKey(`zz${'a'.repeat(62)}`, () => {
+      expect(() => assertEncryptionKeyConfigured()).toThrow(/hex/)
+    })
   })
 })

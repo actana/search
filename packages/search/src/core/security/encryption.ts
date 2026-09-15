@@ -21,12 +21,34 @@ import { config } from '../../config.ts'
 
 const logger = createLogger('Encryption')
 
+/** What a bad or absent key says, in one place so boot and first use agree. */
+const KEY_REQUIREMENT =
+  'SEARCH_ENCRYPTION_KEY must be set to a 64-character hex string (32 bytes) — generate one with `openssl rand -hex 32`'
+
 function getEncryptionKey(): Buffer {
   const key = config().SEARCH_ENCRYPTION_KEY
-  if (!key || key.length !== 64) {
-    throw new Error('SEARCH_ENCRYPTION_KEY must be set to a 64-character hex string (32 bytes)')
+  // Hex-shaped and not merely 64 characters long: `Buffer.from(key, 'hex')`
+  // stops at the first character that is not hex and hands back a *short* key
+  // without complaining, so a typo would silently seal everything under a
+  // 3-byte key and nothing would ever say so.
+  if (!key || !/^[0-9a-fA-F]{64}$/.test(key)) {
+    throw new Error(KEY_REQUIREMENT)
   }
   return Buffer.from(key, 'hex')
+}
+
+/**
+ * Fail at boot rather than at the first seal.
+ *
+ * Called by `index.ts` and by `worker.ts#bootWorker`. Without it an instance
+ * with no `SEARCH_ENCRYPTION_KEY` starts, serves health, accepts a pairing —
+ * and then fails the first `PUT /v1/endpoints` and the first job that needs a
+ * mirrored key, each with a message about a cipher, hours after the mistake was
+ * made. The key is required in *both* modes (ADR 0010 D7): standalone it seals
+ * the provider keys, wired it seals the resolver credential that fetches them.
+ */
+export function assertEncryptionKeyConfigured(): void {
+  getEncryptionKey()
 }
 
 /**

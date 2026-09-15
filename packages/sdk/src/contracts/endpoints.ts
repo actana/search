@@ -109,8 +109,30 @@ export const EndpointSchema = z.object({
 });
 export type Endpoint = z.infer<typeof EndpointSchema>;
 
+/**
+ * Where this client's keys come from, as a **read**.
+ *
+ * The declaration the client last made, echoed back — not a key, sealed or
+ * otherwise, and not a guess derived from the rows. It is the object rather
+ * than a bare `'local' | 'mirrored'` for one concrete reason: `resolverScope`
+ * is the field Search, Studio and the resolver all have to agree on (ADR 0010,
+ * TASK-008), and a client that has just pushed a catalog needs to be able to
+ * read back which scope its keys will be asked for under. `resolverUrl` comes
+ * with it because it is the client's own URL and the pair is what identifies
+ * the declaration; there is deliberately nothing here about the credential.
+ */
+export const EndpointSourceSummarySchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("local") }),
+  z.object({
+    kind: z.literal("mirrored"),
+    resolverUrl: z.string(),
+    resolverScope: z.string().nullable(),
+  }),
+]);
+export type EndpointSourceSummary = z.infer<typeof EndpointSourceSummarySchema>;
+
 export const GetEndpointsResponseSchema = z.object({
-  source: z.enum(["local", "mirrored"]),
+  source: EndpointSourceSummarySchema,
   endpoints: z.array(EndpointSchema),
 });
 export type GetEndpointsResponse = z.infer<typeof GetEndpointsResponseSchema>;

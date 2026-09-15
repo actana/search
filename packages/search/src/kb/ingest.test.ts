@@ -173,6 +173,28 @@ const insertValues = () =>
     })
   )
 
+/**
+ * The text of a Drizzle `sql` fragment, near enough for an order assertion:
+ * every string chunk and every parameter value, in the order they appear. The
+ * mocked transaction never reaches a dialect, so there is nothing to ask for a
+ * rendered query.
+ */
+function sqlText(query: unknown): string {
+  const chunks = (query as { queryChunks?: unknown[] }).queryChunks ?? []
+  return chunks
+    .map((chunk) => {
+      // A parameter is the bound value itself; a literal is a `StringChunk`,
+      // whose `value` is the array of strings around it.
+      if (chunk === null || chunk === undefined) return ''
+      if (typeof chunk !== 'object') return String(chunk)
+      const value = (chunk as { value?: unknown }).value
+      if (Array.isArray(value)) return value.join('')
+      if (value === undefined || value === null) return ''
+      return typeof value === 'object' ? '' : String(value)
+    })
+    .join(' ')
+}
+
 describe('ingestDocument', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -219,6 +241,54 @@ describe('ingestDocument', () => {
       includedInKb: true,
     })
     expect(res.chunkCount).toBe(3)
+  })
+
+  /**
+   * The replace-before-insert guard (TASK-005 merge review, finding 1).
+   *
+   * What has to be true is *positional*: the advisory lock and the delete are
+   * the first two statements of the transaction the chunks are inserted in. A
+   * lock taken after the insert locks nothing that matters, and a delete after
+   * it deletes the rows this run has just written — so the property is asserted
+   * here, where the statement order is visible, and the concurrency it buys is
+   * asserted against a live Postgres in `ingest-replace.integration.test.ts`.
+   */
+  it('locks the document and clears its chunks as the first statements of the chunk transaction', async () => {
+    mockKbLookup(KB_ROW)
+    const statements: string[] = []
+    ;(db.transaction as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      async (fn: (tx: unknown) => Promise<void>) =>
+        fn({
+          execute: vi.fn(async (query: unknown) => {
+            statements.push(sqlText(query))
+            return { rows: [] }
+          }),
+          insert: vi.fn(() => ({ values: insertValues() })),
+          update: vi.fn(() => ({ set: vi.fn(() => ({ where: vi.fn(async () => undefined) })) })),
+        })
+    )
+
+    await ingestDocument({
+      kbId: 'kb-1',
+      documentId: 'doc-42',
+      text: 'one\ntwo\nthree',
+      filename: 'doc.md',
+      includedInKb: true,
+    })
+
+    expect(statements[0]).toMatch(/SELECT pg_advisory_xact_lock\(hashtext\(/)
+    expect(statements[0]).toContain('doc-42')
+    expect(statements[1]).toMatch(/^\s*DELETE FROM .* WHERE document_id =/)
+    expect(statements[1]).toContain('doc-42')
+    expect(statements[1]).toMatch(/RETURNING id/)
+    // …and only then the chunks.
+    expect(statements[2]).toMatch(/INSERT INTO/)
+    /**
+     * No rows came back from the delete, so the link cleanup — which is keyed
+     * on the ids it returns — does not run at all. A first ingest pays for one
+     * lock and one delete of nothing.
+     */
+    expect(statements.filter((text) => text.includes('embedding_keyword'))).toEqual([])
   })
 
   // lifted: red on Studio's base and left red here, deliberately (the board's

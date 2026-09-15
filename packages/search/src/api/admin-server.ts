@@ -45,11 +45,21 @@
 //     → { sessionId, code, ticket, expiresAt, caFingerprint, endpoint, scope, kbIds }
 //   GET  /admin/pair/clients → { clients: [...] }
 //   POST /admin/pair/revoke  { id } → { revoked }
-//
 // **The code is in the response and nowhere else.** It is hashed before it is
 // stored (ADR 0034 D1), so this body is the only time it exists outside the
 // operator's head — `pair ls` cannot print it because there is nothing to
 // print.
+//
+// **Pairing and nothing else.** This surface carried `GET`/`POST
+// /admin/endpoints` for exactly as long as there was no authenticated way to
+// register a model endpoint: TASK-005 landed the registry before TASK-004
+// landed the route, and an operator standing up a standalone instance had to be
+// able to give it an embedding key. `PUT /v1/endpoints` over mTLS is that way
+// now (ADR 0004, ADR 0009), so the stopgap is gone and `actana-search endpoint`
+// is a client-side verb over the SDK like `kb` and `query`. What is left here
+// is the one thing that genuinely cannot be authenticated over mTLS, because it
+// is what *mints* the credential: the filesystem decides who may, and the 0600
+// socket carries it (ADR 0008 D6).
 
 import * as fs from "node:fs";
 import * as http from "node:http";

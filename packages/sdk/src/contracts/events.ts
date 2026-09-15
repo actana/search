@@ -39,6 +39,20 @@ export const SearchEventSchema = z.object({
   filename: z.string().optional(),
   chunkCount: z.number().int().optional(),
   error: z.string().optional(),
+  /**
+   * The machine-readable half of a `document.failed`, when there was a typed
+   * failure behind it.
+   *
+   * `error` is the operator's sentence and must not be parsed; this is the
+   * classification the worker already had in hand — `unknown-endpoint`,
+   * `decrypt-failed`, `model-mismatch`, `resolver-error`, … (ADR 0010 D3) — and
+   * it is what lets a client's handler tell "your resolver has forgotten this
+   * endpoint" from "that PDF is a picture of a PDF" without reading prose.
+   * Deliberately an open string rather than an enum: the reasons are Search's
+   * own vocabulary and a client must not break when one is added. Absent for an
+   * ordinary failure, and absent from the other two events.
+   */
+  reason: z.string().optional(),
 });
 export type SearchEvent = z.infer<typeof SearchEventSchema>;
 

@@ -65,9 +65,27 @@ inventing language the project does not use, or there is a real gap to record.
 : Where an Endpoint's key comes from. `LocalEndpointSource` reads rows from
   `search.model_endpoint`, whose keys are sealed with `SEARCH_ENCRYPTION_KEY`.
   `MirroredEndpointSource` holds metadata a paired client pushed and asks that
-  client's resolver for the live key per job, keeping it for the life of the
-  job and never writing it down. Ingest and query code never knows which it
-  has.
+  client's **resolver** for the live key per job, holding it for sixty seconds
+  and never writing it down. Ingest and query code never knows which it has:
+  the choice is made **per endpoint row**, from `model_endpoint.source` and the
+  declaration in `paired_client.endpoint_source`, so one instance serves a
+  standalone client and a wired one at once. There is no "wired mode" flag.
+
+**Resolver**
+: The paired client's own route that hands back a key —
+  `POST <resolverUrl>` with `x-api-key`, body `{ workspaceId, externalId }`,
+  answering `{ apiKey, baseUrl?, provider, model }` or 404. `workspaceId` is the
+  **client's** word, not Search's: Search echoes the `resolverScope` that client
+  declared and does not know what it names (rule 5). The url, the credential
+  (sealed) and the scope are what `PUT /endpoints` records. **Only `apiKey` is
+  taken**: the other fields are compared against the mirror row and dropped,
+  because the row is what the client declared and a KB's Partition is sized to
+  the model it was declared with — for an embedding Endpoint a disagreement is
+  refused rather than followed. The url is dialled through the SSRF guard, so a
+  loopback or private-range resolver is refused when it is *declared* and a
+  redirect is never followed (ADR 0010 D9). A key it cannot produce is an
+  `EndpointKeyUnavailableError` — transient reasons retry the job, terminal ones
+  fail the Document (ADR 0010).
 
 **Template**
 : The request shape a provider speaks (`openai`, `cohere`, `voyage`, `google`,
@@ -105,6 +123,14 @@ inventing language the project does not use, or there is a real gap to record.
   later request. The certificate is the identity; nothing in a URL is. The shape
   is Control's `CoreRegistrationBlob`, field for field (ADR 0008).
 
+**Profile**
+: One stored **registration blob** on a client machine, under
+  `~/.actana-search/cli.json` (mode 0600, in a 0700 directory), named so that
+  one machine can hold credentials for several instances. The CLI's
+  `--profile` picks between them; the most recently paired is the default. A
+  profile is a credential and nothing else — no provider key ever reaches it.
+  **Never "context", never "workspace"**: it names a credential, not a place.
+
 **Scope**
 : `read`, `write` or `admin`, plus an optional list of KB ids. Decided by the
   operator when the **pairing code** is minted, copied onto the **paired
@@ -124,6 +150,17 @@ inventing language the project does not use, or there is a real gap to record.
   written chunks are the anchor, and `document_embed_batch` is the ledger that
   says which ranges are done.
 
+**Worker**
+: The process that runs the jobs. One BullMQ worker on one queue,
+  `search-knowledge`, under the prefix `SEARCH_QUEUE_PREFIX` (default
+  `search`) — Search's own, never a client's (ADR 0006). It is in the API
+  process by default and splits out on `SEARCH_WORKERS=off` plus
+  `start:worker`. Every job it runs is idempotent and resumable, which is why a
+  stall is re-run rather than failed, and why a second worker is throughput
+  rather than risk. Its one rule: a job that cannot run **fails cleanly** —
+  retry with backoff, or the Document to `failed` with a reason, never a queue
+  that grows forever (ADR 0010).
+
 **Embed batch**
 : One contiguous chunk-index range of one Document routed to one Endpoint, and
   one row in `document_embed_batch` moving through
@@ -140,7 +177,17 @@ inventing language the project does not use, or there is a real gap to record.
   `document.failed`, `clusters.retrained`. One payload, carrying the KB and —
   where there is one — the document, and a **deterministic id** derived from
   what happened rather than from when it was noticed, so the same event
-  announced twice is recognisably one event.
+  announced twice is recognisably one event. A `document.failed` may also carry
+  a `reason`, which is the **Worker**'s classification of the failure
+  (`unknown-endpoint`, `resolver-error`, …) as distinct from `error`, which is
+  the operator's sentence. A `document.failed` is held back while the attempt
+  that wrote it threw and the queue still has attempts for it — a Document the
+  engine marked `failed` on a retryable attempt is not news — but never once the
+  job has *finished*, whatever the attempt count says. The id carries the
+  processing run the announcement read, so a re-included Document is a new
+  Event — and because at most one attempt of a job ever announces, the attempts
+  of one job are at most one Event, including on the pipeline that re-stamps
+  the run at the top of every attempt.
 
 **Webhook**
 : A URL a paired client asked to be told at. A delivery is signed

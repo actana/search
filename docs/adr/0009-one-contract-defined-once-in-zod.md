@@ -136,11 +136,35 @@ the other, so the service offers both and a client may register both, one, or
 neither.
 
 **D8a — Event ids are derived from what happened, not from when it was
-noticed.** `id` is a digest of the event name and the facts (the document and
-its terminal state; the KB and its fit timestamp). Two workers that both notice
-the same document finished therefore produce the *same* event, and the delivery
-ledger's `(webhook, event)` unique index turns the second into a no-op rather
-than a duplicate POST.
+noticed.** `id` is a digest of the event name and the facts (the document, its
+terminal state and **which processing run reached it**; the KB and its fit
+timestamp). Two workers that both notice the same document finished therefore
+produce the *same* event, and the delivery ledger's `(webhook, event)` unique
+index turns the second into a no-op rather than a duplicate POST.
+
+**The run is part of the facts, and leaving it out lost events.** "This
+document, in this state" is not what happened — a document can reach `completed`
+twice. `POST /v1/kbs/:id/documents/:docId/include` re-runs the pipeline over a
+document that has already ingested, and the second `document.ingested` carried
+the *first one's* id: dropped in-process by the announced-id set, and dropped in
+the ledger by that same unique index, permanently. So the digest includes the
+row's `processing_started_at`, which moves when a document is started over —
+which is what makes two includes two events — where
+`processing_completed_at` moves every time an attempt records a terminal state,
+including the attempts that are not the end of the story, and is therefore no
+name for a run at all.
+
+**The stamp is per run on one path and per attempt on the other, and the dedupe
+survives both.** `kb.ingest.document` stages its document row once
+(`onConflictDoNothing`), so every attempt of one ingest reads the same stamp;
+`knowledge-process-document` re-stamps `processing_started_at` at the top of
+each attempt (`embed-pipeline.ts`), so attempt three of a plan carries a
+different generation from attempt one. Nothing is lost, because at most one
+attempt of a job ever announces: a `document.failed` an attempt wrote is held
+back while the dispatch threw and attempts remain (D9 below, ADR 0010 D4), and
+a document reaches `completed` once. The property the id exists for — two
+workers noticing the same finished document producing one event — holds
+whichever path wrote the stamp, because both read the one row.
 
 **D8b — The signature is over the raw body.** `x-search-signature:
 sha256=<hex>`, an HMAC-SHA256 over the exact bytes sent, keyed by the webhook's
@@ -155,6 +179,29 @@ being diffable against Studio's. `jobs/run.ts` reads the row the engine just
 wrote and publishes from there, which is correct for every path into that state
 including ones added later, and which costs the lifted files nothing.
 
+**Which needs two things from the transport, and ADR 0010 says what.** "The row
+the engine just wrote" is `failed` as soon as an attempt gives up, and under
+ADR 0010 D4 an attempt giving up is usually not the end of the story. So the
+runner is told how many attempts are left **and whether this dispatch is what
+failed**, and a `document.failed` waits for the last attempt only when the
+dispatch threw. A *terminal* failure the engine never recorded is announced by
+the worker's failure handler instead, and a document the **timeout sweep**
+reconciles is announced from the sweep's own result, carrying the typed `reason`
+that ADR 0010 D3 defines and that `SearchEventSchema.reason` exists to hold. All
+three doors derive the event id from the same facts (D8a) and claim it from one
+set, so they cannot produce two events for one document.
+
+**The outcome is half of that, and it was the half that was missing.** The
+attempt count alone says nothing about what the handler did:
+`finalizeDocumentEmbedding` marks a document `failed` when its batches have
+exhausted *their* attempts and then **returns**, so the job completes, the
+worker's failure handler never runs, and nothing re-reads the row — while the
+attempt count still said two were left and the announcement was held back. A
+`document.failed` therefore never went out on the ordinary BullMQ path at all,
+which the fixture suites could not show because the inline runner reports zero
+attempts remaining. A handler that returned has finished, whatever the counter
+says, and the row is the truth.
+
 ## Consequences
 
 - A new field is one edit: the schema. The route gets it validated and the SDK
@@ -167,6 +214,14 @@ including ones added later, and which costs the lifted files nothing.
 - Studio's wrapper layer (TASK-009) is a mapper for dates and envelopes and
   nothing else — every field it needs is on the wire under the name it already
   uses.
+- `/v1/endpoints` is the one route whose body is not only a request shape but a
+  *declaration*: `GET`'s `source` is the object the client last declared,
+  `resolverScope` included, because that field is the one Search, the client and
+  the client's resolver all have to agree on (ADR 0010 D5, D9). The registry
+  behind it is `models/endpoint-registry.ts`, and everything the route adds is
+  the three things a route owes a caller — the contract, the reconciliation of
+  the declared *set*, and a status code for a refusal a module underneath it
+  raised as a plain error.
 - The `v1-tags` mode keeps the older retrieval path alive on the new surface.
   Retiring it is a separate ADR with its own callers to find, which is exactly
   what ADR 0005 asked for.

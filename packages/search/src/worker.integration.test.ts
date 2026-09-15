@@ -1,0 +1,860 @@
+/**
+ * @vitest-environment node
+ *
+ * The worker, for real: a live Redis, a live pgvector Postgres, and a
+ * `kb.ingest.document` job that goes in one end and comes out as chunks with
+ * vectors in a KB's partition (ADR 0006, ADR 0010).
+ *
+ * Three cases, and the last two are the ones this task is about:
+ *
+ *   1. **A local endpoint.** The job is enqueued, the worker picks it up, the
+ *      document is ingested and `document.ingested` is announced. Every line is
+ *      production code except the embedder, which is the deterministic hash
+ *      n-gram one behind `SEARCH_TEST_EMBEDDING=hash-ngram` — the same seam the
+ *      behaviour-freeze fixture uses (ADR 0005), so there is no key and no
+ *      network in this suite.
+ *
+ *   2. **A mirrored endpoint whose resolver is not answering.** This is the
+ *      whole chain: migration 0002's `paired_client.endpoint_source`,
+ *      `setEndpointSource`, the routing source reading the row, the mirrored
+ *      source dialling a resolver that is not there, the typed
+ *      `EndpointKeyUnavailableError`, and the worker retrying rather than
+ *      poisoning the queue. The job exhausts its two attempts and lands in
+ *      `failed` with a reason that names the resolver — and, asserted
+ *      explicitly, with **no key anywhere in it**.
+ *
+ *   4. **A resolver that fails twice and then answers.** The rebase's own
+ *      regression: `kb.ingest.document` used to generate a document id inside
+ *      the job, so every retry inserted *another* row and a transient outage
+ *      left an orphan per attempt. TASK-004's payload carries the id the route
+ *      staged, so three attempts are one row — and because the engine marks a
+ *      document `failed` the moment an attempt gives up, this case is also what
+ *      proves `document.failed` is held back while attempts remain: the client
+ *      sees one `document.ingested` and no failure at all.
+ *
+ *   3. **A mirrored endpoint whose resolver answers 404.** The other half of
+ *      the taxonomy: a stale mirror is terminal however many attempts are left,
+ *      so the job runs *exactly once* against a live loopback resolver that is
+ *      counting its callers, and leaves exactly one document row in `failed`.
+ *      Before `UnrecoverableError` was thrown, this ran a full ingest per
+ *      attempt to arrive at the same 404.
+ *
+ * **`SEARCH_ALLOW_LOCAL_FETCH=1`** — both resolvers here are on loopback, and
+ * the guard the resolver call now goes through refuses loopback without it
+ * (ADR 0010 D9).
+ *
+ * **Its own queue prefix.** `search-test-b`, so this suite cannot see, consume
+ * or obliterate the jobs of a dev instance or of a sibling checkout on the same
+ * Redis. That prefix being settable is what makes that possible
+ * (`SEARCH_QUEUE_PREFIX`).
+ *
+ * Gated on `SEARCH_TEST_DATABASE_URL`; without it the whole suite skips.
+ *
+ *     SEARCH_TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/search_test_b \
+ *       pnpm --filter @actana/search-core test
+ */
+
+import * as http from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { Queue } from 'bullmq'
+import { eq, inArray, sql } from 'drizzle-orm'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import type { SearchEvent } from '@actana/search/contracts'
+import { HASH_NGRAM_DIMS } from '@actana/search-shared/testing/hash-ngram-embedder'
+import { generateShortId } from '@actana/search-shared/short-id'
+import { resetConfig } from './config.ts'
+import { db } from './db/client.ts'
+import {
+  document,
+  documentEmbedBatch,
+  embedding,
+  knowledgeBase,
+  modelEndpoint,
+  pairedClient,
+} from './db/schema.ts'
+import { runMigrations } from './db/migrate.ts'
+import { dropKbPartition, provisionKbPartition } from './kb/ddl.ts'
+import { kbPartitionRef } from './kb/partition.ts'
+import {
+  closeQueue,
+  getJobQueue,
+  getQueueConnection,
+  QUEUE_NAME,
+  queuePrefix,
+} from './queue/index.ts'
+import { onSearchEvent, resetSearchEventListeners } from './events/emitter.ts'
+import { resetAnnouncedEvents, runSearchJob } from './jobs/run.ts'
+import { setEndpointSource } from './models/endpoint-registry.ts'
+import { clearResolvedKeyCache } from './models/mirrored-endpoint-source.ts'
+import { startWorkers, type SearchWorkers } from './worker.ts'
+
+const TEST_DATABASE_URL = process.env.SEARCH_TEST_DATABASE_URL
+
+/**
+ * Set before anything reads the configuration, and before `resetConfig()` drops
+ * the memoised parse.
+ *
+ * Safe at module scope despite the static imports above: nothing in this
+ * package calls `config()` while a module is being evaluated — the parse is
+ * lazy precisely so that it cannot — so the first read of any of these happens
+ * inside a test, long after these three lines.
+ */
+process.env.SEARCH_QUEUE_PREFIX = 'search-test-b'
+process.env.SEARCH_TEST_EMBEDDING = 'hash-ngram'
+/**
+ * The resolvers in this suite are on loopback, and the SSRF guard refuses
+ * loopback unless this is set (`core/security/url-guard.ts`, ADR 0010 D9). It
+ * is the same switch a single-machine deployment sets — Studio and Search on
+ * one host — and it is off unless set, which is what
+ * `endpoint-registry.integration.test.ts` asserts.
+ */
+process.env.SEARCH_ALLOW_LOCAL_FETCH = '1'
+if (TEST_DATABASE_URL) process.env.SEARCH_DATABASE_URL = TEST_DATABASE_URL
+resetConfig()
+
+const describeDb = TEST_DATABASE_URL ? describe : describe.skip
+
+/** Unique per run, so a re-run against a dirty database is clean. */
+const RUN = generateShortId(8)
+const PREFIX = `searchwk-${RUN}`
+const ids = {
+  client: `${PREFIX}-client`,
+  owner: `${PREFIX}-owner`,
+  localEndpoint: `${PREFIX}-ep-local`,
+  mirroredEndpoint: `${PREFIX}-ep-mirrored`,
+  kbLocal: `${PREFIX}-kb-local`,
+  kbMirrored: `${PREFIX}-kb-mirrored`,
+  // A second client, because a source declaration is per client and this one's
+  // resolver answers rather than refusing the connection.
+  client404: `${PREFIX}-client-404`,
+  endpoint404: `${PREFIX}-ep-404`,
+  kb404: `${PREFIX}-kb-404`,
+  // A third client, whose resolver is away for two attempts and then back.
+  clientFlaky: `${PREFIX}-client-flaky`,
+  endpointFlaky: `${PREFIX}-ep-flaky`,
+  kbFlaky: `${PREFIX}-kb-flaky`,
+  /**
+   * Three more knowledge bases on the first client's local endpoint, one per
+   * fix round finding: an ingest run twice, a finalizer that fails a document
+   * and returns, and a document the sweep has to reconcile. Separate KBs so
+   * each assertion can count rows without seeing another test's documents.
+   */
+  kbTwice: `${PREFIX}-kb-twice`,
+  kbFinalize: `${PREFIX}-kb-finalize`,
+  kbSweep: `${PREFIX}-kb-sweep`,
+}
+
+/**
+ * A resolver URL nothing is listening on.
+ *
+ * Port 1 on loopback: reserved, never bound, and refused immediately rather
+ * than after a timeout — so the suite exercises the `unreachable` path in
+ * milliseconds instead of waiting out a ten-second budget.
+ */
+const DEAD_RESOLVER = 'http://127.0.0.1:1/resolve-endpoint'
+/** The credential that must never appear in a log, an error or a job record. */
+const RESOLVER_KEY = 'internal-secret-never-in-a-message'
+
+let workers: SearchWorkers
+let inspector: Queue
+/**
+ * A resolver that *answers* — 404, "I do not know that endpoint any more".
+ *
+ * The other half of the failure taxonomy. A refused connection is weather and
+ * retries; a 404 is the client's mirror being stale, which is terminal however
+ * many attempts are left (ADR 0010 D3), and the job must therefore run exactly
+ * once.
+ */
+let resolver404: http.Server
+/** How many times that resolver was asked. The whole assertion, really. */
+let resolver404Hits = 0
+
+/**
+ * A resolver that is away for two attempts and then answers.
+ *
+ * `resolver-error` is transient (ADR 0010 D3), so the job retries — which is
+ * exactly the shape that used to insert a document row per attempt.
+ */
+let resolverFlaky: http.Server
+let resolverFlakyHits = 0
+
+/** Wait for `check` to hold, or fail with what it last saw. */
+async function until<T>(
+  what: string,
+  check: () => Promise<T | null>,
+  timeoutMs = 25_000
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs
+  let last: unknown
+  while (Date.now() < deadline) {
+    try {
+      const value = await check()
+      if (value !== null && value !== undefined) return value
+    } catch (err) {
+      last = err
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200))
+  }
+  throw new Error(
+    `timed out waiting for ${what}${last ? `: ${last instanceof Error ? last.message : String(last)}` : ''}`
+  )
+}
+
+describeDb('the worker, end to end', () => {
+  beforeAll(async () => {
+    await runMigrations({ url: TEST_DATABASE_URL! })
+
+    resolver404 = http.createServer((req, res) => {
+      resolver404Hits += 1
+      req.resume()
+      res.writeHead(404, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: 'unknown-endpoint' }))
+    })
+    await new Promise<void>((resolve) => resolver404.listen(0, '127.0.0.1', () => resolve()))
+    const resolver404Url = `http://127.0.0.1:${(resolver404.address() as AddressInfo).port}/resolve-endpoint`
+
+    resolverFlaky = http.createServer((req, res) => {
+      resolverFlakyHits += 1
+      req.resume()
+      if (resolverFlakyHits <= 2) {
+        // A 5xx is weather: the client is rolling a deploy, and the next
+        // attempt is expected to work.
+        res.writeHead(503, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: 'try later' }))
+        return
+      }
+      // Only `apiKey`. Everything else the resolver could say is checked
+      // against the row rather than preferred over it (ADR 0010 D9), and the
+      // deterministic embedder never reads the value.
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ apiKey: 'sk-resolved-for-the-third-attempt' }))
+    })
+    await new Promise<void>((resolve) => resolverFlaky.listen(0, '127.0.0.1', () => resolve()))
+    const resolverFlakyUrl = `http://127.0.0.1:${(resolverFlaky.address() as AddressInfo).port}/resolve-endpoint`
+
+    const now = new Date()
+    await db.insert(pairedClient).values([
+      {
+        id: ids.client,
+        label: `${PREFIX} client`,
+        certSerial: `${PREFIX}-serial`,
+        certFingerprint: `${PREFIX}-fingerprint`,
+        scope: 'admin',
+        status: 'active',
+        createdAt: now,
+      },
+      {
+        id: ids.client404,
+        label: `${PREFIX} client 404`,
+        certSerial: `${PREFIX}-serial-404`,
+        certFingerprint: `${PREFIX}-fingerprint-404`,
+        scope: 'admin',
+        status: 'active',
+        createdAt: now,
+      },
+      {
+        id: ids.clientFlaky,
+        label: `${PREFIX} client flaky`,
+        certSerial: `${PREFIX}-serial-flaky`,
+        certFingerprint: `${PREFIX}-fingerprint-flaky`,
+        scope: 'admin',
+        status: 'active',
+        createdAt: now,
+      },
+    ])
+
+    await db.insert(modelEndpoint).values([
+      {
+        id: ids.localEndpoint,
+        pairedClientId: ids.client,
+        kind: 'embedding',
+        provider: 'fixture',
+        template: 'fixture-hash-ngram',
+        model: 'hash-ngram-256',
+        dimension: HASH_NGRAM_DIMS,
+        // No ciphertext: the deterministic embedder answers before any key is
+        // read, which is what lets this suite run with no credential at all.
+        keyCiphertext: null,
+        source: 'local',
+        config: {},
+        createdAt: now,
+        updatedAt: now,
+      },
+      {
+        id: ids.mirroredEndpoint,
+        pairedClientId: ids.client,
+        kind: 'embedding',
+        provider: 'openai',
+        template: 'openai',
+        model: 'text-embedding-3-small',
+        dimension: HASH_NGRAM_DIMS,
+        keyCiphertext: null,
+        source: 'mirrored',
+        externalId: `${PREFIX}-external`,
+        config: {},
+        createdAt: now,
+        updatedAt: now,
+      },
+      {
+        id: ids.endpoint404,
+        pairedClientId: ids.client404,
+        kind: 'embedding',
+        provider: 'openai',
+        template: 'openai',
+        model: 'text-embedding-3-small',
+        dimension: HASH_NGRAM_DIMS,
+        keyCiphertext: null,
+        source: 'mirrored',
+        externalId: `${PREFIX}-external-404`,
+        config: {},
+        createdAt: now,
+        updatedAt: now,
+      },
+      {
+        id: ids.endpointFlaky,
+        pairedClientId: ids.clientFlaky,
+        kind: 'embedding',
+        // The template the deterministic embedder answers for, so the third
+        // attempt genuinely ingests rather than reaching a provider.
+        provider: 'fixture',
+        template: 'fixture-hash-ngram',
+        model: 'hash-ngram-256',
+        dimension: HASH_NGRAM_DIMS,
+        keyCiphertext: null,
+        source: 'mirrored',
+        externalId: `${PREFIX}-external-flaky`,
+        config: {},
+        createdAt: now,
+        updatedAt: now,
+      },
+    ])
+
+    for (const [kbId, endpointId, clientId] of [
+      [ids.kbLocal, ids.localEndpoint, ids.client],
+      [ids.kbMirrored, ids.mirroredEndpoint, ids.client],
+      [ids.kb404, ids.endpoint404, ids.client404],
+      [ids.kbFlaky, ids.endpointFlaky, ids.clientFlaky],
+      [ids.kbTwice, ids.localEndpoint, ids.client],
+      [ids.kbFinalize, ids.localEndpoint, ids.client],
+      [ids.kbSweep, ids.localEndpoint, ids.client],
+    ] as const) {
+      await db.insert(knowledgeBase).values({
+        id: kbId,
+        ownerId: ids.owner,
+        pairedClientId: clientId,
+        name: `${PREFIX} ${kbId.slice(PREFIX.length + 4)}`,
+        embeddingModel: 'hash-ngram-256',
+        embeddingDimension: HASH_NGRAM_DIMS,
+        embeddingEndpointId: endpointId,
+        kmeansK: 8,
+        language: 'english',
+        createdAt: now,
+        updatedAt: now,
+      })
+      await provisionKbPartition({ kbId, dim: HASH_NGRAM_DIMS, language: 'english' })
+    }
+
+    // The declaration migration 0002 added. This is the row the routing source
+    // reads to decide that the mirrored endpoint's key comes from a resolver.
+    await setEndpointSource(ids.client, {
+      kind: 'mirrored',
+      resolverUrl: DEAD_RESOLVER,
+      resolverKey: RESOLVER_KEY,
+      resolverScope: 'workspace-under-test',
+    })
+    await setEndpointSource(ids.client404, {
+      kind: 'mirrored',
+      resolverUrl: resolver404Url,
+      resolverKey: RESOLVER_KEY,
+      resolverScope: 'workspace-that-forgot',
+    })
+    await setEndpointSource(ids.clientFlaky, {
+      kind: 'mirrored',
+      resolverUrl: resolverFlakyUrl,
+      resolverKey: RESOLVER_KEY,
+      resolverScope: 'workspace-mid-deploy',
+    })
+
+    inspector = new Queue(QUEUE_NAME, {
+      connection: getQueueConnection(),
+      prefix: queuePrefix(),
+    })
+    // A previous run that was killed rather than stopped would otherwise leave
+    // its jobs on this prefix for this one to pick up.
+    await inspector.obliterate({ force: true })
+
+    workers = await startWorkers({ concurrency: 2, repeatable: false })
+  }, 120_000)
+
+  afterAll(async () => {
+    resetSearchEventListeners()
+    resetAnnouncedEvents()
+    clearResolvedKeyCache()
+    await workers?.close()
+    try {
+      await inspector?.obliterate({ force: true })
+    } catch {
+      /* the connection may already be closed by the worker's shutdown */
+    }
+    await inspector?.close().catch(() => {})
+    for (const kbId of [
+      ids.kbLocal,
+      ids.kbMirrored,
+      ids.kb404,
+      ids.kbFlaky,
+      ids.kbTwice,
+      ids.kbFinalize,
+      ids.kbSweep,
+    ]) {
+      await dropKbPartition({ kbId }).catch(() => {})
+    }
+    // `paired_client` cascades to endpoints, KBs, documents and chunks.
+    await db
+      .delete(pairedClient)
+      .where(inArray(pairedClient.id, [ids.client, ids.client404, ids.clientFlaky]))
+      .catch(() => {})
+    await closeQueue().catch(() => {})
+    await new Promise<void>((resolve) => resolver404?.close(() => resolve()))
+    await new Promise<void>((resolve) => resolverFlaky?.close(() => resolve()))
+  }, 120_000)
+
+  it('processes a kb.ingest.document job into chunks with vectors', async () => {
+    const announced: SearchEvent[] = []
+    // Per paired client, which is what the SSE fan-out is scoped by: a stream
+    // is an authenticated connection (ADR 0003).
+    const off = onSearchEvent(ids.client, (event) => announced.push(event))
+
+    const documentId = `${PREFIX}-doc-local`
+    const queue = await getJobQueue()
+    // The payload TASK-004's route enqueues: `kbId`, and the id of the row the
+    // route already staged and already answered with.
+    await queue.enqueue('kb.ingest.document', {
+      kbId: ids.kbLocal,
+      documentId,
+      filename: 'parental-leave.md',
+      // Explicit, because the frozen `ingestDocument` defaults it to `false` —
+      // "uploaded but not chunked" — and every route that enqueues this job
+      // says which it means (`jobs/types.ts`).
+      includedInKb: true,
+      text:
+        '# Parental leave\n\n' +
+        'Employees are entitled to sixteen weeks of paid parental leave. ' +
+        'Leave must be requested at least thirty days in advance through the people team. ' +
+        'Unused leave does not carry across calendar years.\n',
+    })
+
+    const row = await until('the document to be written', async () => {
+      const rows = await db
+        .select({ id: document.id, chunkCount: document.chunkCount })
+        .from(document)
+        .where(eq(document.knowledgeBaseId, ids.kbLocal))
+        .limit(1)
+      return rows[0] && rows[0].chunkCount > 0 ? rows[0] : null
+    })
+
+    expect(row.chunkCount).toBeGreaterThan(0)
+
+    /**
+     * The chunks landed in the KB's own partition, with vectors — which is
+     * where a query reads them from.
+     *
+     * The shared `embedding` table is deliberately *not* asserted: this is the
+     * synchronous `ingestDocument` path, which writes the partition directly.
+     * Staging chunks in `embedding` with a NULL vector is the fan-out path's
+     * resume ledger (`planDocumentEmbedding`), and a test that demanded rows in
+     * both would be asserting a pipeline this job does not use.
+     */
+    const partition = kbPartitionRef(ids.kbLocal)
+    const counted = (await db.execute(
+      sql.raw(
+        `SELECT count(*)::int AS c FROM ${partition} ` +
+          `WHERE document_id = '${row.id}' AND embedding IS NOT NULL`
+      )
+    )) as unknown as Array<{ c: number }> | { rows?: Array<{ c: number }> }
+    const inPartition = Array.isArray(counted)
+      ? Number(counted[0]?.c ?? 0)
+      : Number(counted.rows?.[0]?.c ?? 0)
+    expect(inPartition).toBe(row.chunkCount)
+
+    // The id the payload named, not one the job invented.
+    expect(row.id).toBe(documentId)
+
+    expect(announced).toContainEqual(
+      expect.objectContaining({
+        event: 'document.ingested',
+        kbId: ids.kbLocal,
+        documentId,
+      })
+    )
+    off()
+  }, 90_000)
+
+  it('retries and then cleanly fails a job whose endpoint key cannot be resolved', async () => {
+    const queue = await getJobQueue()
+    const jobId = `${PREFIX}-mirrored-job`
+    await queue.enqueue(
+      'kb.ingest.document',
+      {
+        kbId: ids.kbMirrored,
+        documentId: `${PREFIX}-doc-mirrored`,
+        filename: 'unreachable.md',
+        includedInKb: true,
+        text: 'This document is bound to an endpoint whose resolver is not answering.',
+      },
+      // Two attempts rather than the default three: the point is the *shape* of
+      // the failure, and each extra attempt is another second of backoff.
+      { jobId, maxAttempts: 2 }
+    )
+
+    const failed = await until('the job to exhaust its attempts', async () => {
+      const job = await inspector.getJob(jobId)
+      if (!job) return null
+      const state = await job.getState()
+      return state === 'failed' ? job : null
+    })
+
+    // It was retried rather than given up on after one go.
+    expect(failed.attemptsMade).toBe(2)
+    // And the reason is the typed one, naming the resolver by origin.
+    expect(failed.failedReason).toMatch(/resolver/i)
+    expect(failed.failedReason).toContain('http://127.0.0.1:1')
+
+    // The invariant the whole task turns on: not the resolver credential, not
+    // anywhere in what the queue kept about this failure.
+    expect(JSON.stringify(failed)).not.toContain(RESOLVER_KEY)
+    expect(failed.stacktrace?.join('\n') ?? '').not.toContain(RESOLVER_KEY)
+  }, 90_000)
+
+  it('runs a terminally failed job exactly once, and fails the document once', async () => {
+    /**
+     * The regression. `unknown-endpoint` was already classified terminal, the
+     * document was already marked `failed` on the first attempt — and BullMQ,
+     * which has never heard of `retryable`, re-queued the job anyway, because
+     * nothing turned the classification into the one thing it reads. Every
+     * attempt then ran a whole ingest against a stale mirror to arrive at the
+     * same 404: two resolver round trips, two parses, two document rows.
+     *
+     * So: `maxAttempts: 2`, and exactly one of everything.
+     */
+    resolver404Hits = 0
+    const queue = await getJobQueue()
+    const jobId = `${PREFIX}-terminal-job`
+    await queue.enqueue(
+      'kb.ingest.document',
+      {
+        kbId: ids.kb404,
+        documentId: `${PREFIX}-doc-404`,
+        filename: 'forgotten.md',
+        includedInKb: true,
+        text: 'This document is bound to an endpoint the client has forgotten.',
+      },
+      { jobId, maxAttempts: 2 }
+    )
+
+    const failed = await until('the terminal job to be given up on', async () => {
+      const job = await inspector.getJob(jobId)
+      if (!job) return null
+      return (await job.getState()) === 'failed' ? job : null
+    })
+
+    // One attempt of the two it was allowed.
+    expect(failed.attemptsMade).toBe(1)
+    // One resolver round trip, not one per attempt.
+    expect(resolver404Hits).toBe(1)
+    // BullMQ's own record of why it stopped.
+    expect(failed.failedReason).toMatch(/does not know endpoint/i)
+    expect(JSON.stringify(failed)).not.toContain(RESOLVER_KEY)
+
+    // And exactly one document row, `failed`, with a reason that names the
+    // mirror rather than a socket.
+    const rows = await db
+      .select({
+        id: document.id,
+        status: document.processingStatus,
+        error: document.processingError,
+      })
+      .from(document)
+      .where(eq(document.knowledgeBaseId, ids.kb404))
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.status).toBe('failed')
+    expect(rows[0]!.error ?? '').toMatch(/does not know endpoint/i)
+    expect(rows[0]!.error ?? '').not.toContain(RESOLVER_KEY)
+  }, 90_000)
+
+  it('re-uses the staged row across retries, and says nothing until it is over', async () => {
+    /**
+     * Two regressions in one job, both closed by the rebase.
+     *
+     * **One row, not one per attempt.** `kb.ingest.document` used to have no
+     * `documentId`: the job called `ingestDocument`, which generated one, so a
+     * transient failure left a row behind and the next attempt made another.
+     * The payload now carries the id the route staged and
+     * `stageIngestedDocument` is an `onConflictDoNothing`, so three attempts
+     * are three visits to one row.
+     *
+     * **And no `document.failed` while attempts remain.** The engine marks a
+     * document `failed` as soon as *an attempt* gives up — it has no idea there
+     * is a fourth one coming — so announcing from the job's completion
+     * unconditionally published a failure for a resolver that was away for two
+     * seconds. Studio's trigger would have acted on it. What the client sees
+     * here is one `document.ingested` and nothing else.
+     */
+    resolverFlakyHits = 0
+    const announced: SearchEvent[] = []
+    const off = onSearchEvent(ids.clientFlaky, (event) => announced.push(event))
+
+    const documentId = `${PREFIX}-doc-flaky`
+    const queue = await getJobQueue()
+    const jobId = `${PREFIX}-flaky-job`
+    await queue.enqueue(
+      'kb.ingest.document',
+      {
+        kbId: ids.kbFlaky,
+        documentId,
+        filename: 'mid-deploy.md',
+        includedInKb: true,
+        text:
+          '# Expenses\n\nReceipts are submitted within thirty days. ' +
+          'Anything over two hundred needs a manager to countersign it.\n',
+      },
+      // Three: two failures and the attempt that works.
+      { jobId, maxAttempts: 3 }
+    )
+
+    const finished = await until('the flaky job to finish', async () => {
+      const job = await inspector.getJob(jobId)
+      if (!job) return null
+      return (await job.getState()) === 'completed' ? job : null
+    })
+    expect(finished.attemptsMade).toBe(3)
+    // Two refusals and one answer, so the retry really did go back to it.
+    expect(resolverFlakyHits).toBeGreaterThanOrEqual(3)
+
+    // Exactly one document row, and it is the one the payload named.
+    const rows = await db
+      .select({ id: document.id, status: document.processingStatus, chunks: document.chunkCount })
+      .from(document)
+      .where(eq(document.knowledgeBaseId, ids.kbFlaky))
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.id).toBe(documentId)
+    expect(rows[0]!.status).toBe('completed')
+    expect(rows[0]!.chunks).toBeGreaterThan(0)
+
+    /**
+     * And the document's only event is the success. Not an exact list: a
+     * completed ingest also enqueues the cluster validation, which announces
+     * `clusters.retrained` on the same client's stream and is nothing to do
+     * with this.
+     */
+    expect(announced.filter((e) => e.documentId === documentId).map((e) => e.event)).toEqual([
+      'document.ingested',
+    ])
+    expect(announced.some((e) => e.event === 'document.failed')).toBe(false)
+    off()
+  }, 120_000)
+
+  it('leaves N chunks and not 2N when the same ingest job runs twice', async () => {
+    /**
+     * The fix round's should-fix #4. `kb/ingest.ts` chunks, embeds and then
+     * inserts every chunk into the KB's partition — with no `completed`
+     * short-circuit, no delete of what it is replacing, and no `(document_id,
+     * chunk_index)` uniqueness on the partition to fall back on. So a second
+     * run of one job *added* a second copy of every chunk: the document row
+     * said N and the partition held 2N, and every query over that KB was then
+     * answered twice out of the same text. A re-queued attempt whose worker
+     * lost its lock, or a crash between the chunk commit and
+     * `moveToCompleted`, is all it took.
+     *
+     * The job layer is what makes the frozen handler re-runnable
+     * (`jobs/ingest-idempotency.ts`), and this is the assertion it exists for.
+     * `runSearchJob` rather than the queue, because what is under test is the
+     * second run and a queue would have to be made to produce one.
+     */
+    const documentId = `${PREFIX}-doc-twice`
+    const payload = {
+      kbId: ids.kbTwice,
+      documentId,
+      filename: 'travel.md',
+      includedInKb: true,
+      text:
+        '# Travel\n\nBook through the agent. Economy on anything under six hours. ' +
+        'Receipts within thirty days, and the per-diem is on the intranet.\n',
+    }
+    const partition = kbPartitionRef(ids.kbTwice)
+    const countChunks = async () => {
+      const counted = (await db.execute(
+        sql`SELECT count(*)::int AS c FROM ${sql.raw(partition)} WHERE document_id = ${documentId}`
+      )) as unknown as Array<{ c: number }> | { rows?: Array<{ c: number }> }
+      return Array.isArray(counted)
+        ? Number(counted[0]?.c ?? 0)
+        : Number(counted.rows?.[0]?.c ?? 0)
+    }
+
+    await runSearchJob({ type: 'kb.ingest.document', payload })
+    const first = await countChunks()
+    expect(first).toBeGreaterThan(0)
+
+    // Run two, with the document `completed`: the work is done, so the handler
+    // must not run at all.
+    await runSearchJob({ type: 'kb.ingest.document', payload })
+    expect(await countChunks()).toBe(first)
+
+    /**
+     * Run three, with the row put back the way a lost lock leaves it: still
+     * `pending`, with the first run's chunks already in the partition. This is
+     * the run that used to double the KB.
+     */
+    await db
+      .update(document)
+      .set({ processingStatus: 'pending', processingCompletedAt: null })
+      .where(eq(document.id, documentId))
+    await runSearchJob({ type: 'kb.ingest.document', payload })
+
+    expect(await countChunks()).toBe(first)
+    const rows = await db
+      .select({ id: document.id, status: document.processingStatus, chunks: document.chunkCount })
+      .from(document)
+      .where(eq(document.knowledgeBaseId, ids.kbTwice))
+    expect(rows).toHaveLength(1)
+    /**
+     * `completed`, or `keywording` on its way back to it: a completed ingest
+     * enqueues `kb-keywords-extract`, which takes the document through
+     * `keywording` and — with no inference endpoint on this KB — settles it
+     * again. Which of the two a read lands on is a race with the worker running
+     * beside this test, and it is nothing to do with how many chunks there are.
+     */
+    expect(['completed', 'keywording']).toContain(rows[0]!.status)
+    expect(rows[0]!.chunks).toBe(first)
+  }, 120_000)
+
+  it('announces the failure a finalizer writes and returns from', async () => {
+    /**
+     * The fix round's blocker #2, end to end against the real
+     * `finalizeDocumentEmbedding`.
+     *
+     * It marks a document `failed` when its batches have exhausted *their*
+     * attempts — and then **returns normally**, so the job completes, BullMQ's
+     * `failed` handler never runs, and nothing re-reads the row. The
+     * announcement was nonetheless held back, because the worker passes
+     * `attempts - (attemptsMade + 1)`, which on a first attempt of three is
+     * `2` whatever the handler did. So Studio never heard `document.failed` on
+     * the ordinary BullMQ path; the fixture suites are green because the inline
+     * runner passes `0`.
+     *
+     * `attemptsRemaining: 2` here is that exact number.
+     */
+    const announced: SearchEvent[] = []
+    const off = onSearchEvent(ids.client, (event) => announced.push(event))
+
+    const documentId = `${PREFIX}-doc-finalize`
+    const now = new Date()
+    await db.insert(document).values({
+      id: documentId,
+      knowledgeBaseId: ids.kbFinalize,
+      filename: 'half-embedded.md',
+      fileUrl: '',
+      fileSize: 0,
+      mimeType: 'text/markdown',
+      chunkCount: 2,
+      processingStatus: 'processing',
+      processingStartedAt: now,
+      includedInKb: true,
+      uploadedAt: now,
+    })
+    // One chunk staged with no vector: what the finalizer counts as unembedded.
+    await db.insert(embedding).values({
+      id: `${PREFIX}-emb-unembedded`,
+      knowledgeBaseId: ids.kbFinalize,
+      documentId,
+      chunkIndex: 0,
+      chunkHash: 'hash-0',
+      content: 'a chunk whose vector never arrived',
+      contentLength: 34,
+      tokenCount: 8,
+      embedding: null,
+      startOffset: 0,
+      endOffset: 34,
+    })
+    await db.insert(documentEmbedBatch).values({
+      id: `${PREFIX}-batch-failed`,
+      documentId,
+      knowledgeBaseId: ids.kbFinalize,
+      startIndex: 0,
+      endIndex: 1,
+      status: 'failed',
+      attempt: 3,
+      error: 'the provider refused the batch three times',
+      createdAt: now,
+      updatedAt: now,
+    })
+
+    await runSearchJob(
+      { type: 'kb.embed.finalize', payload: { knowledgeBaseId: ids.kbFinalize, documentId } },
+      { attemptsRemaining: 2 }
+    )
+
+    const rows = await db
+      .select({ status: document.processingStatus, error: document.processingError })
+      .from(document)
+      .where(eq(document.id, documentId))
+    expect(rows[0]!.status).toBe('failed')
+
+    const mine = announced.filter((e) => e.documentId === documentId)
+    expect(mine.map((e) => e.event)).toEqual(['document.failed'])
+    expect(mine[0]).toMatchObject({ kbId: ids.kbFinalize })
+    off()
+  }, 90_000)
+
+  it('announces document.failed for a document the sweep reconciles', async () => {
+    /**
+     * The fix round's should-fix #6. A worker killed mid-job — or a job past
+     * `maxStalledCount` — leaves the row non-terminal with nothing running, so
+     * neither the ordinary announcement nor the failure handler ever sees that
+     * document again. The sweep flipped it to `failed` and told nobody: its
+     * payload names no document, so `announce` returned before it got as far as
+     * reading a row. It reports what it reconciled now, and the job layer
+     * announces each one with the typed `timeout` reason.
+     */
+    const announced: SearchEvent[] = []
+    const off = onSearchEvent(ids.client, (event) => announced.push(event))
+
+    const documentId = `${PREFIX}-doc-stranded`
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000)
+    await db.insert(document).values({
+      id: documentId,
+      knowledgeBaseId: ids.kbSweep,
+      filename: 'killed-mid-job.pdf',
+      fileUrl: 's3://bucket/killed-mid-job.pdf',
+      fileSize: 0,
+      mimeType: 'application/pdf',
+      processingStatus: 'processing',
+      processingStartedAt: twoHoursAgo,
+      includedInKb: true,
+      uploadedAt: twoHoursAgo,
+    })
+
+    const result = (await runSearchJob({
+      type: 'kb.document.timeout-sweep',
+      payload: {},
+    })) as { failedDocumentIds: string[] }
+
+    expect(result.failedDocumentIds).toContain(documentId)
+    const rows = await db
+      .select({ status: document.processingStatus, error: document.processingError })
+      .from(document)
+      .where(eq(document.id, documentId))
+    expect(rows[0]!.status).toBe('failed')
+    expect(rows[0]!.error ?? '').toMatch(/timed out/i)
+
+    const mine = announced.filter((e) => e.documentId === documentId)
+    expect(mine).toEqual([
+      expect.objectContaining({
+        event: 'document.failed',
+        kbId: ids.kbSweep,
+        documentId,
+        reason: 'timeout',
+      }),
+    ])
+    off()
+  }, 90_000)
+})

@@ -1,0 +1,684 @@
+/**
+ * `MirroredEndpointSource` — wired mode. The rows are a mirror, the key is not
+ * here, and it is fetched for the life of one job (ADR 0004).
+ *
+ * A paired client pushes catalog metadata through `PUT /v1/endpoints`: provider,
+ * template, model, dimension, base URL, and its own stable id for the endpoint
+ * (`model_endpoint.external_id`). **No key crosses.** The rows carry
+ * `source='mirrored'` and a NULL `key_ciphertext`, and there is nothing in this
+ * file that would write one.
+ *
+ * When a job needs a key, this asks the client's resolver:
+ *
+ *     POST <resolverUrl>
+ *     x-api-key: <resolverKey>
+ *     { "workspaceId": <resolverScope ?? pairedClientId>, "externalId": "<id>" }
+ *     → 200 { apiKey, baseUrl?, provider, model }
+ *     → 404 the client does not know that endpoint
+ *
+ * `workspaceId` is the field name because that is what the client's route reads
+ * (Studio's `POST /api/search/resolve-endpoint`, TASK-008). Search does not know
+ * what a workspace is (CONTEXT rule 5) and does not pretend to: it echoes
+ * whatever scope the client declared beside its resolver, and falls back to the
+ * paired client's own id when it declared none.
+ *
+ * **The key's whole life is a 60-second cache entry.** Not a column, not a file,
+ * not a log line. A document fanned out into forty embed batches would otherwise
+ * be forty resolver round trips inside a second; the TTL is what makes the
+ * resolver a control-plane call rather than a hot-path one, and it is short
+ * enough that a rotation on the client side is picked up within a minute.
+ *
+ * **The call goes through the SSRF guard, and only the key is taken from the
+ * answer.** Two rules that are easy to state and were both wrong here first:
+ *
+ *   * The resolver URL is the one URL in this service a *client* chooses and
+ *     Search dials, carrying an internal credential in a header. A bare `fetch`
+ *     defaults to `redirect: 'follow'`, so a resolver answering `307` to another
+ *     host is handed both the `x-api-key` and the POST body by Node itself. So:
+ *     `secureFetch` (`core/security/url-guard.ts`) — protocol, port and resolved
+ *     address validated, the connection pinned to the address that was
+ *     validated, redirects refused rather than followed, a timeout, and a byte
+ *     cap on the body.
+ *   * Everything the resolver says other than `apiKey` is checked against the
+ *     mirror row and then dropped. See `checkDrift`.
+ *
+ * **Nothing here interpolates a response body into an error.** See
+ * `endpoint-key-errors.ts` for the second half of that rule.
+ */
+
+import { and, eq } from 'drizzle-orm'
+import { createLogger } from '@actana/search-shared/log'
+import { db } from '../db/client.ts'
+import { modelEndpoint } from '../db/schema.ts'
+import { secureFetch, validateExternalUrl } from '../core/security/url-guard.ts'
+import {
+  EndpointKeyUnavailableError,
+  scrubSecret,
+  type EndpointKeyUnavailableReason,
+} from './endpoint-key-errors.ts'
+import type {
+  EmbeddingEndpoint,
+  EndpointBinding,
+  InferenceEndpoint,
+  ModelEndpointSource,
+  ProviderBinding,
+} from './source.ts'
+
+const logger = createLogger('MirroredEndpointSource')
+
+/** How long a resolved key is held in memory. Never longer, never on disk. */
+export const RESOLVED_KEY_TTL_MS = 60_000
+
+/** How long one resolver call may take before it counts as a timeout. */
+export const RESOLVER_TIMEOUT_MS = 10_000
+
+/**
+ * The cap on a resolver's answer.
+ *
+ * A resolution is `{ apiKey, baseUrl?, provider?, model? }` — a few hundred
+ * bytes. The body is read into memory in full before it is parsed, so without a
+ * cap a client whose resolver answers `200` and then streams is a held worker
+ * slot and a growing heap rather than an error.
+ */
+export const RESOLVER_MAX_RESPONSE_BYTES = 8 * 1024
+
+/**
+ * How many resolved keys may be held at once, over every client.
+ *
+ * The TTL is what stops a *stale* key being used; it is not what keeps the map
+ * small, because an entry nobody reads again is an entry nobody notices has
+ * expired. `sweepResolvedKeyCache` is the bound and this is the number it
+ * enforces — generous, because the steady state is one entry per endpoint in
+ * use and the point is only that churn cannot grow without limit.
+ */
+export const RESOLVED_KEY_CACHE_MAX = 512
+
+/** What a paired client declared about where its keys come from. */
+export interface MirroredResolver {
+  /** The client's resolver route. `https://` in anything but a test rig. */
+  resolverUrl: string
+  /** The internal credential, sent as `x-api-key`. Never logged. */
+  resolverKey: string
+  /**
+   * What to echo as `workspaceId` in the resolver body.
+   *
+   * The client's own name for the scope its endpoints belong to — a Studio
+   * workspace id, in the deployment this exists for. Absent means "use the
+   * paired client's id", which is right for a client with one scope.
+   */
+  resolverScope?: string | null
+}
+
+/** What the resolver answers with. Only `apiKey` is required. */
+export interface ResolvedEndpointKey {
+  apiKey: string
+  baseUrl?: string | null
+  provider?: string | null
+  model?: string | null
+}
+
+/**
+ * The resolver request, in the shape `secureFetch` takes rather than
+ * `RequestInit`.
+ *
+ * `maxRedirects: 0` is the load-bearing field: a redirect from a resolver is
+ * refused outright, so the credential in the header cannot be re-sent anywhere
+ * the resolver names.
+ */
+export interface ResolverRequest {
+  method: string
+  headers: Record<string, string>
+  body: string
+  /** Budget for the round trip. */
+  timeout: number
+  /** Zero. A resolver that redirects is misconfigured, not a hop. */
+  maxRedirects: number
+  /** The byte cap on the answer. */
+  maxResponseBytes: number
+}
+
+/** The part of a response this module reads. `secureFetch` and `fetch` both fit. */
+export interface ResolverResponse {
+  ok: boolean
+  status: number
+  json(): Promise<unknown>
+}
+
+/** Injected in tests. The SSRF-guarded fetch everywhere else. */
+export type FetchLike = (input: string, init: ResolverRequest) => Promise<ResolverResponse>
+
+export interface MirroredEndpointSourceOptions {
+  fetchImpl?: FetchLike
+  now?: () => number
+  ttlMs?: number
+  timeoutMs?: number
+  maxResponseBytes?: number
+}
+
+type CacheEntry = { value: ResolvedEndpointKey; expiresAt: number }
+
+/** The mirror row's fields the resolver's answer is compared against. */
+interface MirrorFacts {
+  id: string
+  externalId: string | null
+  provider: string
+  model: string | null
+  baseUrl: string | null
+}
+
+/**
+ * The process-wide cache, keyed `(clientId, externalId)`.
+ *
+ * Module scope rather than instance scope on purpose: a source is constructed
+ * per request in the API layer and per job in the worker, and a cache that died
+ * with the instance would be a cache that never hit. Nothing is written here
+ * that is not also forgotten within `RESOLVED_KEY_TTL_MS`.
+ */
+const cache = new Map<string, CacheEntry>()
+
+/**
+ * Resolutions currently in flight, same key.
+ *
+ * Forty embed batches for one document start within milliseconds of each other
+ * and all miss the empty cache. Without this they are forty simultaneous
+ * resolver calls for one key; with it they are one call and thirty-nine
+ * awaits.
+ */
+const inFlight = new Map<string, Promise<ResolvedEndpointKey>>()
+
+/** NUL, so a client id containing the separator cannot forge another's entry. */
+function cacheKey(pairedClientId: string, externalId: string): string {
+  return `${pairedClientId}\0${externalId}`
+}
+
+/** Drop every cached key. For tests, and for a source being reconfigured. */
+export function clearResolvedKeyCache(): void {
+  cache.clear()
+  inFlight.clear()
+}
+
+/** How many entries are held. Tests assert the TTL through this. */
+export function resolvedKeyCacheSize(): number {
+  return cache.size
+}
+
+/**
+ * Forget everything cached for one paired client, and hand back how many
+ * entries went.
+ *
+ * Called by the registry on every write that changes what a client's endpoints
+ * *are* — `setEndpointSource`, `upsertMirroredEndpoints`, `deleteEndpoint`.
+ * Without it the TTL is also the blast radius of a mistake: a client that
+ * rotated its internal credential and re-declared keeps being served keys
+ * fetched with the old one for up to a minute, and a client that deleted an
+ * endpoint keeps embedding with its key for the same minute. Neither is a long
+ * time and both are the wrong answer to "I have just revoked that".
+ *
+ * In-flight calls are dropped from the collapse map too: their answer was asked
+ * for under the declaration that has just been replaced, so it must not become a
+ * cache entry under the new one. The call itself is already out and still
+ * resolves the job that asked — it simply is not shared any further.
+ */
+export function invalidateResolvedKeysFor(pairedClientId: string): number {
+  const prefix = `${pairedClientId}\0`
+  let dropped = 0
+  for (const key of [...cache.keys()]) {
+    if (key.startsWith(prefix)) {
+      cache.delete(key)
+      dropped += 1
+    }
+  }
+  for (const key of [...inFlight.keys()]) {
+    if (key.startsWith(prefix)) inFlight.delete(key)
+  }
+  return dropped
+}
+
+/**
+ * Drop expired entries, then the closest-to-expiry ones if the map is still
+ * over `RESOLVED_KEY_CACHE_MAX`.
+ *
+ * Run on insert, which is the only moment the map grows, and free until there is
+ * something to drop. The lazy TTL check on read is not enough on its own: an
+ * `externalId` that is resolved once and then re-pushed under a new id is never
+ * read again, so its entry — a live provider key — would sit in memory for the
+ * life of the process, and a worker process lives for weeks.
+ */
+export function sweepResolvedKeyCache(now: number = Date.now()): number {
+  let dropped = 0
+  for (const [key, entry] of [...cache.entries()]) {
+    if (entry.expiresAt <= now) {
+      cache.delete(key)
+      dropped += 1
+    }
+  }
+  if (cache.size <= RESOLVED_KEY_CACHE_MAX) return dropped
+  // Over the cap with nothing left to expire. Evict the entries closest to
+  // expiry: a bound that is enforced is worth more than a key that is kept.
+  const byExpiry = [...cache.entries()].sort((a, b) => a[1].expiresAt - b[1].expiresAt)
+  for (const [key] of byExpiry.slice(0, cache.size - RESOLVED_KEY_CACHE_MAX)) {
+    cache.delete(key)
+    dropped += 1
+  }
+  return dropped
+}
+
+/**
+ * Refuse an endpoint row that belongs to another paired client.
+ *
+ * Defence in depth, and deliberately in the source layer rather than only at
+ * the route: every endpoint row is selected by `id` alone — that is what makes
+ * `routing-endpoint-source.ts` possible — so the *only* thing between one
+ * client's endpoint id and another client's key is the route that checked the
+ * KB. This is the second thing. `client-mismatch` is terminal: an id that
+ * belongs to somebody else will still belong to them on the next attempt.
+ *
+ * `expected` is null wherever the caller has no client in hand (the engine's
+ * lifted call sites), and then no claim is made — see `source.ts`.
+ */
+export function assertEndpointOwner(
+  row: { id: string; pairedClientId: string; externalId?: string | null },
+  expected: string | null | undefined
+): void {
+  if (!expected || row.pairedClientId === expected) return
+  throw new EndpointKeyUnavailableError(
+    `endpoint ${row.id} belongs to another paired client; refusing to resolve it`,
+    {
+      reason: 'client-mismatch',
+      endpointId: row.id,
+      externalId: row.externalId ?? null,
+      pairedClientId: expected,
+    }
+  )
+}
+
+export class MirroredEndpointSource implements ModelEndpointSource {
+  readonly pairedClientId: string
+  private readonly resolver: MirroredResolver
+  private readonly fetchImpl: FetchLike
+  private readonly now: () => number
+  private readonly ttlMs: number
+  private readonly timeoutMs: number
+  private readonly maxResponseBytes: number
+
+  constructor(
+    pairedClientId: string,
+    resolver: MirroredResolver,
+    options: MirroredEndpointSourceOptions = {}
+  ) {
+    this.pairedClientId = pairedClientId
+    this.resolver = resolver
+    // `secureFetch`, not `fetch`: see the header. An injected one is a test's.
+    this.fetchImpl = options.fetchImpl ?? ((input, init) => secureFetch(input, init, 'resolverUrl'))
+    this.now = options.now ?? Date.now
+    this.ttlMs = options.ttlMs ?? RESOLVED_KEY_TTL_MS
+    this.timeoutMs = options.timeoutMs ?? RESOLVER_TIMEOUT_MS
+    this.maxResponseBytes = options.maxResponseBytes ?? RESOLVER_MAX_RESPONSE_BYTES
+  }
+
+  async embedding(binding: EndpointBinding): Promise<EmbeddingEndpoint> {
+    const row = await this.row(binding, 'embedding')
+    const resolved = await this.resolveKey(row.externalId, row.id)
+    this.checkDrift(row, resolved, 'embedding')
+    return {
+      id: row.id,
+      // The row, not the resolution. The resolver is asked for a key and is
+      // believed about nothing else — see `checkDrift`.
+      providerId: row.provider,
+      template: row.template,
+      modelName: row.model,
+      apiKey: resolved.apiKey,
+      baseUrl: row.baseUrl ?? undefined,
+      config: (row.config as Record<string, unknown> | null) ?? {},
+      dimensions: row.dimension ?? undefined,
+    }
+  }
+
+  async inference(binding: EndpointBinding): Promise<InferenceEndpoint | null> {
+    const row = await this.row(binding, 'inference')
+    const resolved = await this.resolveKey(row.externalId, row.id)
+    this.checkDrift(row, resolved, 'inference')
+    return {
+      id: row.id,
+      providerId: row.provider,
+      template: row.template,
+      modelName: row.model,
+      apiKey: resolved.apiKey,
+      baseUrl: row.baseUrl ?? undefined,
+      config: (row.config as Record<string, unknown> | null) ?? {},
+    }
+  }
+
+  /**
+   * The key this client registered for a named provider, or null when it
+   * registered none (the OCR step — see `source.ts`).
+   *
+   * Null means *the client has no endpoint for that provider*, which is a
+   * configuration answer the caller already handles. A resolver that cannot be
+   * reached is **not** that answer, and throws rather than reporting "no OCR
+   * configured" — a temporary outage must not quietly change what a document
+   * parses into.
+   */
+  async providerKey(binding: ProviderBinding): Promise<string | null> {
+    const rows = await db
+      .select()
+      .from(modelEndpoint)
+      .where(
+        and(
+          eq(modelEndpoint.pairedClientId, binding.pairedClientId),
+          eq(modelEndpoint.provider, binding.provider),
+          eq(modelEndpoint.source, 'mirrored')
+        )
+      )
+      .limit(1)
+    if (rows.length === 0) return null
+    const row = rows[0]
+    const resolved = await this.resolveKey(row.externalId, row.id)
+    return resolved.apiKey || null
+  }
+
+  private async row(binding: EndpointBinding, kind: 'embedding' | 'inference') {
+    const endpointId = binding.endpointId
+    const rows = await db
+      .select()
+      .from(modelEndpoint)
+      .where(eq(modelEndpoint.id, endpointId))
+      .limit(1)
+    if (rows.length === 0) {
+      throw new Error(`MirroredEndpointSource: endpoint not found: ${endpointId}`)
+    }
+    const row = rows[0]
+    // Before the kind and before the source: whose row this is decides whether
+    // there is anything here to answer at all.
+    assertEndpointOwner(row, binding.pairedClientId ?? this.pairedClientId)
+    if (row.kind !== kind) {
+      throw new Error(`MirroredEndpointSource: endpoint ${endpointId} is not ${kind}-kind`)
+    }
+    if (row.source !== 'mirrored') {
+      throw new Error(
+        `MirroredEndpointSource: endpoint ${endpointId} is local — it needs a LocalEndpointSource`
+      )
+    }
+    return row
+  }
+
+  /**
+   * Check the resolver's answer against the mirror row, and use the row.
+   *
+   * `resolved.model ?? row.model` was the original, and it is the one line here
+   * that could silently change what a corpus *means*. A KB's partition is a
+   * table with a vector column sized to the dimension the client declared when
+   * it pushed the row; the resolver answering `text-embedding-3-large` where the
+   * row says `text-embedding-3-small` produces vectors of a width that may well
+   * fit and are in a different space. Nothing downstream can notice: the insert
+   * succeeds and the ranking is quietly wrong for every chunk written after the
+   * answer changed. So for an **embedding** endpoint a disagreement about the
+   * model or the provider is refused, terminally, naming the endpoint.
+   *
+   * A disagreement about the base URL is warned about and the row's value used.
+   * Moving a deployment behind a new URL is a thing clients do legitimately, it
+   * does not move the embedding space on its own, and the row is still what the
+   * client *declared* — the fix is a push, which is one call.
+   *
+   * Keyword extraction has no partition to corrupt, so an inference endpoint
+   * warns rather than refuses.
+   */
+  private checkDrift(
+    row: MirrorFacts,
+    resolved: ResolvedEndpointKey,
+    kind: 'embedding' | 'inference'
+  ): void {
+    const answered: Record<string, string> = {}
+    if (resolved.provider && resolved.provider !== row.provider) {
+      answered.provider = resolved.provider
+    }
+    if (resolved.model && resolved.model !== row.model) {
+      answered.model = resolved.model
+    }
+    if (resolved.baseUrl && resolved.baseUrl !== row.baseUrl) {
+      answered.baseUrl = resolved.baseUrl
+    }
+    if (Object.keys(answered).length === 0) return
+
+    /**
+     * Only the two fields that name the embedding space are refusable, and only
+     * when the row has something for the resolver to *contradict*: a row that
+     * declares no model is under-pushed rather than drifting, there is no space
+     * to move, and it is said out loud instead. A base URL disagreement is
+     * never refusable — see the doc comment.
+     */
+    const modelContradicted = answered.model !== undefined && row.model !== null
+    const providerContradicted = answered.provider !== undefined
+
+    if (kind === 'embedding' && (modelContradicted || providerContradicted)) {
+      throw new EndpointKeyUnavailableError(
+        `the endpoint resolver answered for a different ${
+          modelContradicted ? 'model' : 'provider'
+        } than mirrored endpoint ${row.id} declares — refusing, because a knowledge base's ` +
+          `partition is sized to the model it was pushed with (re-push the endpoint instead)`,
+        {
+          reason: 'model-mismatch',
+          endpointId: row.id,
+          externalId: row.externalId,
+          pairedClientId: this.pairedClientId,
+        }
+      )
+    }
+
+    // The declared values and what was answered. Neither is a credential:
+    // `apiKey` is the one field this method never reads.
+    logger.warn("Ignoring a resolver's answer that disagrees with the mirrored row", {
+      pairedClientId: this.pairedClientId,
+      endpointId: row.id,
+      externalId: row.externalId,
+      kind,
+      declared: { provider: row.provider, model: row.model, baseUrl: row.baseUrl },
+      answered,
+    })
+  }
+
+  /** Cache-then-resolve, with the in-flight collapse. */
+  private async resolveKey(
+    externalId: string | null,
+    endpointId: string
+  ): Promise<ResolvedEndpointKey> {
+    if (!externalId) {
+      throw new EndpointKeyUnavailableError(
+        `mirrored endpoint ${endpointId} carries no external id, so the resolver cannot be asked about it`,
+        { reason: 'not-mirrored', endpointId, pairedClientId: this.pairedClientId }
+      )
+    }
+    const key = cacheKey(this.pairedClientId, externalId)
+    const hit = cache.get(key)
+    if (hit && hit.expiresAt > this.now()) return hit.value
+    if (hit) cache.delete(key)
+
+    const pending = inFlight.get(key)
+    if (pending) return pending
+
+    const call = this.fetchKey(externalId, endpointId)
+      .then((value) => {
+        // The only moment the map grows is the only moment it is swept.
+        sweepResolvedKeyCache(this.now())
+        cache.set(key, { value, expiresAt: this.now() + this.ttlMs })
+        return value
+      })
+      .finally(() => {
+        inFlight.delete(key)
+      })
+    inFlight.set(key, call)
+    return call
+  }
+
+  /** One resolver round trip. Everything that can go wrong is typed. */
+  private async fetchKey(externalId: string, endpointId: string): Promise<ResolvedEndpointKey> {
+    const context = {
+      endpointId,
+      externalId,
+      pairedClientId: this.pairedClientId,
+    }
+    const origin = safeOrigin(this.resolver.resolverUrl)
+
+    /**
+     * The static half of the guard, before anything is dialled.
+     *
+     * `secureFetch` runs this itself and would refuse the same URL — but it
+     * refuses by throwing a plain `Error`, and a declaration pointing at
+     * loopback or a private range is a *configuration* failure that must not
+     * spend a job's five attempts. Checking here is what makes it terminal
+     * deterministically rather than by reading a message.
+     */
+    const allowed = validateExternalUrl(this.resolver.resolverUrl, 'resolverUrl')
+    if (!allowed.isValid) {
+      throw new EndpointKeyUnavailableError(
+        `the endpoint resolver at ${origin} is not a URL this instance may fetch: ${allowed.error}`,
+        { reason: 'refused', ...context }
+      )
+    }
+
+    const body = JSON.stringify({
+      workspaceId: this.resolver.resolverScope ?? this.pairedClientId,
+      externalId,
+    })
+
+    let response: ResolverResponse
+    try {
+      response = await this.fetchImpl(this.resolver.resolverUrl, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json',
+          // The one place the resolver credential appears. Not in a URL, not in
+          // a log, not in an error — and, because redirects are refused rather
+          // than followed, not on a second host either.
+          'x-api-key': this.resolver.resolverKey,
+        },
+        body,
+        timeout: this.timeoutMs,
+        maxRedirects: 0,
+        maxResponseBytes: this.maxResponseBytes,
+      })
+    } catch (err) {
+      throw scrubSecret(this.callFailed(err, origin, context), this.resolver.resolverKey)
+    }
+
+    if (response.status === 404) {
+      throw new EndpointKeyUnavailableError(
+        `the paired client does not know endpoint "${externalId}" any more — its mirror is stale`,
+        { reason: 'unknown-endpoint', status: 404, ...context }
+      )
+    }
+    if (response.status === 401 || response.status === 403) {
+      throw new EndpointKeyUnavailableError(
+        `the endpoint resolver at ${origin} refused this instance's credential (${response.status})`,
+        { reason: 'unauthorized', status: response.status, ...context }
+      )
+    }
+    if (!response.ok) {
+      throw new EndpointKeyUnavailableError(
+        `the endpoint resolver at ${origin} answered ${response.status}`,
+        { reason: 'resolver-error', status: response.status, ...context }
+      )
+    }
+
+    // The body is read and parsed, and **never** put into a message: it is the
+    // one object in this file that holds a provider key. It is also capped —
+    // `maxResponseBytes` above — so `json()` cannot be handed a gigabyte.
+    let parsed: unknown
+    try {
+      parsed = await response.json()
+    } catch {
+      throw new EndpointKeyUnavailableError(
+        `the endpoint resolver at ${origin} answered ${response.status} with something that was not JSON`,
+        { reason: 'malformed', status: response.status, ...context }
+      )
+    }
+    const resolved = readResolution(parsed)
+    if (!resolved) {
+      throw new EndpointKeyUnavailableError(
+        `the endpoint resolver at ${origin} answered ${response.status} without an apiKey`,
+        { reason: 'malformed', status: response.status, ...context }
+      )
+    }
+
+    // Deliberately no key material, no lengths, no prefix. What is useful in a
+    // log is that the call happened and for which endpoint.
+    logger.debug('Resolved a mirrored endpoint key', {
+      pairedClientId: this.pairedClientId,
+      endpointId,
+      externalId,
+      ttlMs: this.ttlMs,
+    })
+    return resolved
+  }
+
+  /**
+   * Classify a throw from the fetch, without repeating any of its text.
+   *
+   * Four outcomes, and the first is the one that is new: a URL the guard
+   * refused, or a resolver that answered with a redirect, is `refused` —
+   * terminal, because the next attempt is refused for the same reason. The
+   * other three are the weather ADR 0010 D3 is about.
+   *
+   * Nothing from `err` reaches the message; `cause` carries it for a log line
+   * and `scrubSecret` covers the rest.
+   */
+  private callFailed(
+    err: unknown,
+    origin: string,
+    context: { endpointId: string; externalId: string; pairedClientId: string }
+  ): EndpointKeyUnavailableError {
+    const text = err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+    let reason: EndpointKeyUnavailableReason
+    let message: string
+    if (/Invalid resolverUrl:|Redirect blocked:|Too many redirects/i.test(text)) {
+      reason = 'refused'
+      message =
+        `the endpoint resolver at ${origin} was refused: either it is not a URL this ` +
+        `instance may fetch, or it answered with a redirect, which is never followed`
+    } else if (/exceeded maximum size/i.test(text)) {
+      reason = 'malformed'
+      message =
+        `the endpoint resolver at ${origin} answered with more than ` +
+        `${this.maxResponseBytes} bytes, which is not a resolution`
+    } else if (/abort|timeout|timed out/i.test(text)) {
+      reason = 'timeout'
+      message = `the endpoint resolver at ${origin} did not answer within ${this.timeoutMs}ms`
+    } else {
+      reason = 'unreachable'
+      message = `the endpoint resolver at ${origin} could not be reached`
+    }
+    return new EndpointKeyUnavailableError(message, { reason, ...context, cause: err })
+  }
+}
+
+/** Read the resolver's answer, or null when it is not one. */
+function readResolution(value: unknown): ResolvedEndpointKey | null {
+  if (!value || typeof value !== 'object') return null
+  const o = value as Record<string, unknown>
+  if (typeof o.apiKey !== 'string' || o.apiKey.length === 0) return null
+  return {
+    apiKey: o.apiKey,
+    baseUrl: typeof o.baseUrl === 'string' && o.baseUrl ? o.baseUrl : null,
+    provider: typeof o.provider === 'string' && o.provider ? o.provider : null,
+    model: typeof o.model === 'string' && o.model ? o.model : null,
+  }
+}
+
+/**
+ * The resolver's origin, for a message.
+ *
+ * The origin and not the URL: a resolver's path is the client's business and a
+ * query string is the one place a credential could plausibly have been put by
+ * somebody who has not read ADR 0004.
+ */
+function safeOrigin(url: string): string {
+  try {
+    return new URL(url).origin
+  } catch {
+    return 'the configured resolver'
+  }
+}
+
+/** The reasons, re-exported so a caller need not import two modules. */
+export type { EndpointKeyUnavailableReason }

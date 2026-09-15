@@ -6,11 +6,12 @@
   "private": true,
   "type": "module",
   "bin": {
-    "actana-search": "./src/index.ts"
+    "actana-search": "./bin/actana-search.mjs"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "start": "node bin/actana-search.mjs"
   },
   "dependencies": {
     "@actana/search": "workspace:*"
@@ -19,5 +20,9 @@
     "@types/node": "25.8.0",
     "typescript": "6.0.3",
     "vitest": "4.1.6"
-  }
+  },
+  "files": [
+    "bin",
+    "src"
+  ]
 }

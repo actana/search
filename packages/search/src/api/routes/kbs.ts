@@ -52,7 +52,7 @@ import {
 } from "../http.ts";
 import { chargeQuery } from "../rate-limit.ts";
 import { ownerIdFor, requireKb } from "../ownership.ts";
-import { listEndpoints } from "./endpoints.ts";
+import { listEndpoints } from "../../models/endpoint-registry.ts";
 import type { SearchRouter } from "../routes.ts";
 import { iso, kbToWire } from "../serialize.ts";
 
@@ -86,10 +86,10 @@ const DEFAULT_CHUNKING_CONFIG: ChunkingConfig = { maxSize: 1024, minSize: 1, ove
  * `404 not-found` rather than `403`: an id that is not the caller's must not be
  * confirmed to exist (ADR 0009 D5).
  *
- * **One helper and one lookup**, because TASK-005 replaces this branch's
- * registry (`api/routes/endpoints.ts`) with `models/endpoint-registry.ts` —
- * whose `listEndpoints(clientId)` is this name and signature already, so the
- * rebase swaps the import and nothing else.
+ * **One helper and one lookup**, over the endpoint registry's own per-client
+ * listing (`models/endpoint-registry.ts`). It was written against a copy of
+ * that listing that lived in `api/routes/endpoints.ts` until the two branches
+ * met, with the same name and signature, so the merge was one import.
  */
 async function requireOwnedEndpoints(
   pairedClientId: string,

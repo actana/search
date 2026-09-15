@@ -27,6 +27,18 @@ RUN pnpm install --frozen-lockfile --prod --ignore-scripts
 COPY packages/ packages/
 COPY scripts/ scripts/
 
+# The probe, and only the probe.
+#
+# The image's own `HEALTHCHECK` below runs `/app/deploy/healthcheck.mjs` and
+# `deploy/` was never copied, so the check failed with "Cannot find module" on
+# every container this image has ever produced — `docker run --wait` never
+# returned, a `depends_on: service_healthy` never fired, and an orchestrator
+# restarted a working instance in a loop. Only the one file: `Dockerfile`,
+# `docker-compose.yml` and `README.md` are what *builds* and *runs* the image,
+# not what runs inside it, and an image that carries its own build context is
+# an image whose contents nobody can account for.
+COPY deploy/healthcheck.mjs deploy/
+
 # The state directory holds the CA, the server certificate and the pairing
 # material. Mount a volume over it — an instance that loses it loses its
 # identity and every paired client has to pair again.

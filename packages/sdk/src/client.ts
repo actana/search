@@ -5,14 +5,13 @@
 // request through one `undici` `Agent`, and turns anything that is not a 2xx
 // into a {@link SearchApiError}.
 //
-// **The namespaces below are declared and empty on purpose.** TASK-004 fills
+// **The namespaces below are the whole surface, and TASK-004 filled them.**
 // `kbs`, `documents`, `keywords`, `clusters`, `tags`, `endpoints`, `webhooks`
-// and `events()` against the zod contracts it writes. They are named here so
-// that the shape of this client is decided once — by the routes TASK-004's task
-// file already lists — rather than accreting method by method, and so that a
-// caller reading the package can see what is coming and what is not. Each one
-// throws a `not-implemented` `SearchApiError` until then: a stub that returned
-// `undefined` would be a method that silently did nothing.
+// and `events()` are implemented against the zod contracts in
+// `src/contracts/`. They were *named* before they existed so that the shape of
+// this client was decided once — by the routes rather than by whichever method
+// somebody needed next — and `not-implemented` is now something only an older
+// instance answers, never this client.
 //
 // **`undici` rather than `fetch`.** Node's global `fetch` is undici, but its
 // per-request `dispatcher` is not a public, typed option, and mTLS material has

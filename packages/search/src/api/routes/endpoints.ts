@@ -13,57 +13,53 @@
  * `apiKey`; it is sealed with `SEARCH_ENCRYPTION_KEY` and reported afterwards
  * as `hasKey: true` and nothing more. A `mirrored` one carries no key at all —
  * the resolver's URL, its bearer and the `resolverScope` Search echoes back as
- * the request's `workspaceId` are sealed into the row's `config` for the
- * `MirroredEndpointSource` to use per job, and stripped out of every read.
+ * the request's `workspaceId` go into `paired_client.endpoint_source` with the
+ * credential sealed, and never come back out.
  *
  * ---
  *
- * **The six functions below are the registry, and they are deliberately named
- * after TASK-005's.** That ticket owns `models/endpoint-registry.ts` — the
- * process-wide source, the mirrored resolver and its TTL cache — and exports
- * `setEndpointSource(clientId, declaration)`, `upsertMirroredEndpoints(clientId,
- * inputs) → [{ id, externalId }]`, `createLocalEndpoint(clientId, input,
- * apiKey)`, `listEndpoints(clientId)`, `deleteEndpoint(clientId, id)` and
- * `getEndpointSourceSummary(clientId)`. These are the same names with the same
- * argument order over the same table, so when the two branches meet the change
- * is deleting this section and importing that module: the handler above it does
- * not move. They are written here rather than imported from there because that
- * file does not exist on this branch and a route that cannot store an endpoint
- * is a route the fixture suite cannot use.
+ * **This file is a route and nothing else.** The registry lives in
+ * `models/endpoint-registry.ts` (TASK-005): the process-wide source, the
+ * mirrored resolver and its TTL cache, the SSRF guard at declaration, the cache
+ * invalidation. What is left here is the three things a route owes a caller and
+ * a module underneath it must not know about — validating the body against the
+ * contract, reconciling the *declared set* against what the client used to
+ * declare, and turning the registry's refusals into status codes.
  */
 
-import { and, eq, inArray, isNotNull } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { PutEndpointsRequestSchema } from "@actana/search/contracts";
-import type { Endpoint, EndpointDeclaration, EndpointSource } from "@actana/search/contracts";
-import { generateId } from "@actana/search-shared/short-id";
-import { db } from "../../db/client.ts";
+import type {
+  Endpoint,
+  EndpointDeclaration,
+  PutEndpointsRequest,
+} from "@actana/search/contracts";
+import { db, type SearchExecutor } from "../../db/client.ts";
 import { knowledgeBase, modelEndpoint } from "../../db/schema.ts";
-import { encryptSecret } from "../../core/security/encryption.ts";
 import { validateExternalUrl } from "../../core/security/url-guard.ts";
+import {
+  createLocalEndpoint,
+  getEndpointSourceSummary,
+  invalidateEndpointKeyCache,
+  listEndpoints,
+  setEndpointSource,
+  upsertMirroredEndpoints,
+  type EndpointSummary,
+  type LocalEndpointInput,
+  type MirroredEndpointInput,
+} from "../../models/endpoint-registry.ts";
+import { readApiKeyEndpointId } from "../../models/endpoint-api-key.ts";
 import { badRequest, parseWith, readJsonBody, route, sendJson } from "../http.ts";
 import type { SearchRouter } from "../routes.ts";
-import { isoRequired } from "../serialize.ts";
-
-/** The `config` key the mirrored resolver's address, bearer and scope sit under. */
-export const RESOLVER_CONFIG_KEY = "__resolver";
-
-/** The row shape a mirrored push declares. TASK-005's `MirroredEndpointInput`. */
-export type MirroredEndpointInput = {
-  externalId: string;
-  kind: "embedding" | "inference";
-  provider: string;
-  template: string;
-  model?: string;
-  dimensions?: number;
-  baseUrl?: string;
-  label?: string;
-  config?: Record<string, unknown>;
-};
 
 export function registerEndpointRoutes(router: SearchRouter): void {
   router.add(
     route("GET", "/v1/endpoints", "read", async ({ res, client }) => {
       sendJson(res, 200, {
+        // The *declaration*, which is what the client told this instance, and
+        // not a guess derived from the rows: a client that has declared a
+        // resolver and pushed nothing yet is `mirrored`, and reading it off the
+        // rows would have called it `local`.
         source: await getEndpointSourceSummary(client!.id),
         endpoints: (await listEndpoints(client!.id)).map(endpointToWire),
       });
@@ -76,12 +72,17 @@ export function registerEndpointRoutes(router: SearchRouter): void {
 
       /**
        * Every declared `baseUrl` through the SSRF guard, before anything is
-       * written and for the same reason `resolverUrl` goes through it: that URL
-       * is **fetched** — `models/embedding.ts` posts to it per batch — so an
-       * admin-scoped client naming `https://169.254.169.254/` here would be
-       * asking this process to read its own instance metadata and hand back
-       * whatever came out as an embedding. Same dev allowance as the resolver's:
-       * `SEARCH_ALLOW_LOCAL_FETCH` is what makes a loopback endpoint legal.
+       * written.
+       *
+       * `resolverUrl` is guarded inside the registry (`sealDeclaration`), which
+       * is the right place for it — it is that module that dials it. A declared
+       * `baseUrl` is guarded *here* because it is the route that accepts it and
+       * the registry never calls it: `models/embedding.ts` posts to it per
+       * batch, so an admin-scoped client naming `https://169.254.169.254/` here
+       * would be asking this process to read its own instance metadata and hand
+       * back whatever came out as an embedding. Same dev allowance as the
+       * resolver's: `SEARCH_ALLOW_LOCAL_FETCH` is what makes a loopback
+       * endpoint legal.
        */
       for (const declared of body.endpoints) {
         if (declared.baseUrl === undefined) continue;
@@ -91,220 +92,185 @@ export function registerEndpointRoutes(router: SearchRouter): void {
         }
       }
 
-      // The source next, so a bad resolver URL is refused before any endpoint
-      // row is written against it.
-      const declaration = await setEndpointSource(client!.id, body.source);
-
-      const answered: Array<{ id: string; externalId: string }> = [];
-      const mirrored: MirroredEndpointInput[] = [];
-      for (const declared of body.endpoints) {
-        if (body.source.kind === "mirrored") {
-          if (declared.apiKey !== undefined) {
-            throw badRequest(
-              "a mirrored endpoint carries no key — Search resolves one per job and never " +
-                "stores it",
-            );
-          }
-          mirrored.push(inputFor(declared));
-          continue;
-        }
-        answered.push(
-          await createLocalEndpoint(client!.id, inputFor(declared), declared.apiKey ?? null),
-        );
-      }
-      if (mirrored.length > 0) {
-        answered.push(...(await upsertMirroredEndpoints(client!.id, mirrored, declaration)));
-      }
-
-      await removeUndeclared(
-        client!.id,
-        body.endpoints.map((e) => e.externalId),
-      );
-      sendJson(res, 200, { endpoints: answered });
+      sendJson(res, 200, { endpoints: await applyEndpointDeclaration(client!.id, body) });
     }),
   );
 }
 
-/** The contract's declaration, as the registry's input. */
-function inputFor(declared: EndpointDeclaration): MirroredEndpointInput {
+/**
+ * Apply one `PUT /v1/endpoints` body: the source, the endpoints, and the
+ * reconciliation of what is no longer declared — **all of it or none of it**.
+ *
+ * It used to be neither. `setEndpointSource` committed on its own, then each
+ * endpoint committed on its own, then the reconciliation ran; so a body whose
+ * fourth endpoint was refused (an embedding endpoint with no dimension, a
+ * provider the catalog does not know) left a client with a *new* source
+ * declaration, three of its endpoints written, the rest missing and the
+ * previous set still there — a half-applied declaration that no retry of the
+ * same body would have produced. One transaction: a refusal on row N leaves
+ * exactly what was there before.
+ *
+ * Exported because it is the unit worth testing against a real Postgres — the
+ * atomicity *is* the database — and a route handler needs a request to be
+ * called at all.
+ */
+export async function applyEndpointDeclaration(
+  clientId: string,
+  body: PutEndpointsRequest,
+): Promise<Array<{ id: string; externalId: string }>> {
+  const answered = await db.transaction(async (tx) => {
+    // The source first, so a bad resolver URL is refused before any endpoint
+    // row is written against it. The declaration is stored on the paired
+    // client, so nothing has to be threaded into the rows below.
+    await asBadRequest(() => setEndpointSource(clientId, body.source, tx));
+
+    /**
+     * The endpoint ids this client may link a key to.
+     *
+     * `config` is a `z.record(z.unknown())` on the wire and this route passes
+     * it through, so `config.apiKeyEndpointId` was a free choice of *any*
+     * endpoint id in the instance — and an id is a public value, answered by
+     * this very route. Client B could therefore declare an endpoint keyed on
+     * client A's, bind a KB to it and embed with A's sealed key.
+     * `resolveEndpointApiKey` refuses that at the moment of use; this refuses
+     * it at the moment it is declared, which is the message that reaches the
+     * client that made the mistake.
+     *
+     * **Both halves are collected before the first row is written**, because
+     * the set used to be grown *as* the loop created rows: a body whose second
+     * endpoint was keyed on its fourth was refused, and the same body with its
+     * endpoints in the other order was accepted. A declaration is a set and
+     * not a sequence, so the answer cannot depend on the order the client
+     * happened to serialise it in.
+     *
+     * The two halves are Search's ids for the endpoints this client already
+     * has, and the `externalId`s this body declares — which is the id a client
+     * pushing its own catalog has for a sibling it is declaring in the same
+     * breath. Neither can name another client's endpoint, which is the hole
+     * this check exists to close; what a link *resolves* to at use time is
+     * still `resolveEndpointApiKey`'s business, and it follows Search's id.
+     */
+    const linkable = new Set((await listEndpoints(clientId, tx)).map((e) => e.id));
+    for (const declared of body.endpoints) linkable.add(declared.externalId);
+
+    const written: Array<{ id: string; externalId: string }> = [];
+    const mirrored: MirroredEndpointInput[] = [];
+    for (const declared of body.endpoints) {
+      const linkedId = readApiKeyEndpointId(declared.config);
+      if (linkedId !== null && !linkable.has(linkedId)) {
+        throw badRequest(
+          `config.apiKeyEndpointId "${linkedId}" is not one of your endpoints — a key can ` +
+            "only be shared with an endpoint this client owns or is declaring in this body",
+        );
+      }
+      if (body.source.kind === "mirrored") {
+        if (declared.apiKey !== undefined) {
+          throw badRequest(
+            "a mirrored endpoint carries no key — Search resolves one per job and never " +
+              "stores it",
+          );
+        }
+        mirrored.push(mirroredInput(declared));
+        continue;
+      }
+      const row = await asBadRequest(() =>
+        createLocalEndpoint(clientId, localInput(declared), declared.apiKey ?? null, tx),
+      );
+      written.push({ id: row.id, externalId: declared.externalId });
+    }
+    if (mirrored.length > 0) {
+      written.push(...(await asBadRequest(() => upsertMirroredEndpoints(clientId, mirrored, tx))));
+    }
+
+    await removeUndeclared(
+      clientId,
+      body.endpoints.map((e) => e.externalId),
+      tx,
+    );
+    return written;
+  });
+
+  /**
+   * After the commit, not during it.
+   *
+   * The registry's writes defer the invalidation when they are handed a
+   * transaction: dropping this client's resolved keys before a commit that may
+   * still roll back would forget keys that are still current and re-read them
+   * under a declaration that is about to be undone.
+   */
+  invalidateEndpointKeyCache(clientId);
+  return answered;
+}
+
+/**
+ * The registry's refusals, as the status code they are.
+ *
+ * `models/endpoint-registry.ts` throws plain `Error`s — "a mirrored source
+ * needs a resolverUrl", "an embedding endpoint needs a dimension", the SSRF
+ * guard's verdict — because it is also reached from the CLI and from a job,
+ * where an HTTP status means nothing. Left untranslated, every one of them
+ * reached the router's catch-all and was answered `500 core-error` with an
+ * error id, which tells a client that named a private resolver address that
+ * *Search* is broken. They are all statements about the request, so they are
+ * all `400`.
+ */
+async function asBadRequest<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (err) {
+    // A refusal the router already knows how to answer — `badRequest` and its
+    // siblings — is left exactly as it is.
+    if (err instanceof Error && "status" in err) throw err;
+    throw badRequest(err instanceof Error ? err.message : "that endpoint cannot be registered");
+  }
+}
+
+/** The contract's declaration, as a mirrored push's input. */
+function mirroredInput(declared: EndpointDeclaration): MirroredEndpointInput {
   return {
     externalId: declared.externalId,
     kind: declared.kind,
     provider: declared.provider,
     template: declared.template ?? declared.provider,
-    ...(declared.model === undefined ? {} : { model: declared.model }),
+    model: declared.model,
     ...(declared.dimensions === undefined ? {} : { dimensions: declared.dimensions }),
     ...(declared.baseUrl === undefined ? {} : { baseUrl: declared.baseUrl }),
-    ...(declared.label === undefined ? {} : { label: declared.label }),
+    label: declared.label,
     ...(declared.config === undefined ? {} : { config: declared.config }),
   };
 }
 
-// ─── The registry (TASK-005's surface, on this branch) ───────────────────────
-
-/** What a mirrored push's resolver looks like once sealed, or `null` for local. */
-type SealedResolver = { url: string; key: string; scope?: string } | null;
-
-/**
- * Record where this client's keys come from, and refuse a resolver that cannot
- * be reached.
- *
- * The URL goes through the SSRF guard here, at registration, rather than only
- * at the first job: a resolver pointing at a private address is a mistake worth
- * reporting while somebody is watching.
- */
-export async function setEndpointSource(
-  _pairedClientId: string,
-  source: EndpointSource,
-): Promise<SealedResolver> {
-  if (source.kind === "local") return null;
-  const verdict = validateExternalUrl(source.resolverUrl, "source.resolverUrl");
-  if (!verdict.isValid) throw badRequest(verdict.error ?? "that resolver URL cannot be used");
+/** The same declaration, as a local one's. Carries the reconciliation key. */
+function localInput(declared: EndpointDeclaration): LocalEndpointInput {
   return {
-    url: source.resolverUrl,
-    key: (await encryptSecret(source.resolverKey)).encrypted,
-    ...(source.resolverScope === undefined ? {} : { scope: source.resolverScope }),
+    externalId: declared.externalId,
+    kind: declared.kind,
+    provider: declared.provider,
+    template: declared.template ?? declared.provider,
+    model: declared.model,
+    ...(declared.dimensions === undefined ? {} : { dimensions: declared.dimensions }),
+    ...(declared.baseUrl === undefined ? {} : { baseUrl: declared.baseUrl }),
+    label: declared.label,
+    ...(declared.config === undefined ? {} : { config: declared.config }),
   };
-}
-
-/** Upsert a mirrored push, keyed by `externalId`. Never touches a key. */
-export async function upsertMirroredEndpoints(
-  pairedClientId: string,
-  inputs: MirroredEndpointInput[],
-  resolver: SealedResolver = null,
-): Promise<Array<{ id: string; externalId: string }>> {
-  const existing = await byExternalId(pairedClientId);
-  const now = new Date();
-  const answered: Array<{ id: string; externalId: string }> = [];
-
-  for (const input of inputs) {
-    const id = existing.get(input.externalId) ?? generateId();
-    const config: Record<string, unknown> = { ...(input.config ?? {}) };
-    if (resolver) config[RESOLVER_CONFIG_KEY] = resolver;
-    const values = {
-      kind: input.kind,
-      provider: input.provider,
-      template: input.template,
-      model: input.model ?? null,
-      dimension: input.dimensions ?? null,
-      baseUrl: input.baseUrl ?? null,
-      source: "mirrored",
-      label: input.label ?? null,
-      config,
-      updatedAt: now,
-    };
-    if (existing.has(input.externalId)) {
-      await db.update(modelEndpoint).set(values).where(eq(modelEndpoint.id, id));
-    } else {
-      await db.insert(modelEndpoint).values({
-        id,
-        pairedClientId,
-        externalId: input.externalId,
-        keyCiphertext: null,
-        createdAt: now,
-        ...values,
-      });
-    }
-    answered.push({ id, externalId: input.externalId });
-  }
-  return answered;
-}
-
-/**
- * Create or update one locally-keyed endpoint.
- *
- * `apiKey` of `null` leaves whatever key the row already holds: a client that
- * pushes metadata on every edit and the key once must not blank it by saying
- * nothing about it.
- */
-export async function createLocalEndpoint(
-  pairedClientId: string,
-  input: MirroredEndpointInput,
-  apiKey: string | null,
-): Promise<{ id: string; externalId: string }> {
-  const existing = await byExternalId(pairedClientId);
-  const id = existing.get(input.externalId) ?? generateId();
-  const now = new Date();
-  const sealed = apiKey === null ? null : (await encryptSecret(apiKey)).encrypted;
-  const values = {
-    kind: input.kind,
-    provider: input.provider,
-    template: input.template,
-    model: input.model ?? null,
-    dimension: input.dimensions ?? null,
-    baseUrl: input.baseUrl ?? null,
-    source: "local",
-    label: input.label ?? null,
-    config: (input.config ?? {}) as Record<string, unknown>,
-    updatedAt: now,
-  };
-  if (existing.has(input.externalId)) {
-    await db
-      .update(modelEndpoint)
-      .set({ ...values, ...(sealed === null ? {} : { keyCiphertext: sealed }) })
-      .where(eq(modelEndpoint.id, id));
-  } else {
-    await db.insert(modelEndpoint).values({
-      id,
-      pairedClientId,
-      externalId: input.externalId,
-      keyCiphertext: sealed,
-      createdAt: now,
-      ...values,
-    });
-  }
-  return { id, externalId: input.externalId };
-}
-
-/** Every endpoint row this client has. */
-export async function listEndpoints(
-  pairedClientId: string,
-): Promise<Array<typeof modelEndpoint.$inferSelect>> {
-  return db
-    .select()
-    .from(modelEndpoint)
-    .where(eq(modelEndpoint.pairedClientId, pairedClientId));
-}
-
-/** Drop one endpoint. */
-export async function deleteEndpoint(pairedClientId: string, id: string): Promise<boolean> {
-  const gone = await db
-    .delete(modelEndpoint)
-    .where(and(eq(modelEndpoint.id, id), eq(modelEndpoint.pairedClientId, pairedClientId)))
-    .returning({ id: modelEndpoint.id });
-  return gone.length > 0;
-}
-
-/** Which source this client's endpoints came from. `local` when it has none. */
-export async function getEndpointSourceSummary(
-  pairedClientId: string,
-): Promise<"local" | "mirrored"> {
-  const rows = await db
-    .select({ source: modelEndpoint.source })
-    .from(modelEndpoint)
-    .where(eq(modelEndpoint.pairedClientId, pairedClientId));
-  return rows.some((r) => r.source === "mirrored") ? "mirrored" : "local";
 }
 
 // ─── Reconciliation and serialisation ───────────────────────────────────────
 
-/** This client's endpoints, indexed by the id the client knows them by. */
-async function byExternalId(pairedClientId: string): Promise<Map<string, string>> {
-  const rows = await db
-    .select({ id: modelEndpoint.id, externalId: modelEndpoint.externalId })
-    .from(modelEndpoint)
-    .where(
-      and(eq(modelEndpoint.pairedClientId, pairedClientId), isNotNull(modelEndpoint.externalId)),
-    );
-  return new Map(rows.map((row) => [row.externalId!, row.id]));
-}
-
 /**
  * Drop the endpoints this client used to declare and no longer does — except
  * the ones a knowledge base is bound to, which stay.
+ *
+ * This is the route's job rather than the registry's, because it is a property
+ * of `PUT` being *declarative*: the registry's job is to write one endpoint, and
+ * the request's is to say what the whole set is.
  */
-async function removeUndeclared(pairedClientId: string, declared: string[]): Promise<void> {
-  const bound = await db
+async function removeUndeclared(
+  pairedClientId: string,
+  declared: string[],
+  executor: SearchExecutor = db,
+): Promise<void> {
+  const bound = await executor
     .select({
       embeddingEndpointId: knowledgeBase.embeddingEndpointId,
       inferenceEndpointId: knowledgeBase.inferenceEndpointId,
@@ -320,30 +286,41 @@ async function removeUndeclared(pairedClientId: string, declared: string[]): Pro
   );
 
   const wanted = new Set(declared);
-  const removable = [...(await byExternalId(pairedClientId))]
-    .filter(([externalId, id]) => !wanted.has(externalId) && !inUse.has(id))
-    .map(([, id]) => id);
+  const removable = (await listEndpoints(pairedClientId, executor))
+    // A row with no `externalId` was not declared through this route at all —
+    // the admin socket's path, and anything a migration left — so it is not
+    // this route's to reap.
+    .filter(
+      (row) =>
+        row.externalId !== null && !wanted.has(row.externalId) && !inUse.has(row.id),
+    )
+    .map((row) => row.id);
   if (removable.length === 0) return;
-  await db.delete(modelEndpoint).where(inArray(modelEndpoint.id, removable));
+  await executor
+    .delete(modelEndpoint)
+    .where(
+      and(
+        eq(modelEndpoint.pairedClientId, pairedClientId),
+        inArray(modelEndpoint.id, removable),
+      ),
+    );
 }
 
-function endpointToWire(row: typeof modelEndpoint.$inferSelect): Endpoint {
-  const config = { ...((row.config as Record<string, unknown> | null) ?? {}) };
-  delete config[RESOLVER_CONFIG_KEY];
+function endpointToWire(row: EndpointSummary): Endpoint {
   return {
     id: row.id,
     externalId: row.externalId,
-    kind: row.kind as Endpoint["kind"],
+    kind: row.kind,
     provider: row.provider,
     template: row.template,
     model: row.model,
-    dimensions: row.dimension,
+    dimensions: row.dimensions,
     baseUrl: row.baseUrl,
     label: row.label,
-    source: row.source as Endpoint["source"],
-    hasKey: row.keyCiphertext !== null,
-    config,
-    createdAt: isoRequired(row.createdAt),
-    updatedAt: isoRequired(row.updatedAt),
+    source: row.source,
+    hasKey: row.hasKey,
+    config: row.config,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
   };
 }

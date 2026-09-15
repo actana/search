@@ -2,8 +2,49 @@
 #
 # Standalone, these three are Search's outright. Wired to a client that already
 # runs Postgres and Redis, point `SEARCH_DATABASE_URL` and `SEARCH_REDIS_URL` at
-# those instead — Search still owns the `search` schema, the `search:` queue
+# those instead — Search still owns the `search` schema, the `search` queue
 # prefix and a bucket of its own (ADR 0002, ADR 0006).
+#
+# **One `search` service, running the API and the ingestion worker together**
+# (ADR 0010). That is what "run Search" should mean: a container you can hand a
+# document to. The worker is Search's own — its retries, its concurrency and its
+# failure handling are deliberately not under a client's worker configuration —
+# and running it in the same process by default is a deployment shape, not a
+# coupling.
+#
+# **To split them**, run two services off the same image:
+#
+#     search-api:
+#       # …exactly this service, plus:
+#       environment:
+#         SEARCH_WORKERS: "off"      # the API stops running workers
+#     search-worker:
+#       # …the same build and the same environment, plus:
+#       command: ["node", "packages/search/src/worker.ts"]
+#       ports: []                    # it serves nothing
+#       environment:
+#         SEARCH_ROLE: "worker"      # …and therefore has no /v1/health
+#
+# `SEARCH_ROLE: "worker"` is not optional, and it is the one line that is easy
+# to leave out. The image carries a single `HEALTHCHECK` and it probes
+# `GET /v1/health` on `SEARCH_PORT`; a worker container serves nothing, so
+# without the variable it is permanently unhealthy while working perfectly —
+# `--wait` never returns, `depends_on: service_healthy` never fires, and an
+# orchestrator restarts it in a loop. With it, `deploy/healthcheck.mjs` probes
+# Redis (`PING`) instead, which is what a worker's liveness actually is — and
+# that branch of the probe has been run against a built image and is covered by
+# a test that spawns it for both roles. It used to throw a `ReferenceError`
+# before it reached the socket, which Docker read as unhealthy exactly the way
+# it read no probe at all (ADR 0010 D10).
+#
+# Both halves need `SEARCH_DATABASE_URL`, `SEARCH_REDIS_URL`, the `SEARCH_S3_*`
+# block and `SEARCH_ENCRYPTION_KEY`; only the API needs `SEARCH_PORT`,
+# `SEARCH_PUBLIC_HOST` and the state volume, which is its identity. Scale the
+# worker with `--scale search-worker=N`: they share the queue under one prefix,
+# and every job on it is idempotent and resumable, so more workers is more
+# throughput rather than more risk. Outside Docker the same split is
+# `pnpm --filter @actana/search-core start:api` (with `SEARCH_WORKERS=off`)
+# beside `start:worker`.
 name: actana-search
 
 services:
@@ -31,6 +72,12 @@ services:
       SEARCH_PUBLIC_HOST: ${SEARCH_PUBLIC_HOST:-localhost}
       SEARCH_STATE_DIR: /var/lib/actana-search
       SEARCH_LOG_LEVEL: ${SEARCH_LOG_LEVEL:-info}
+      # The Redis namespace. Only worth changing when a second Search instance
+      # shares this Redis — a client's own keys can never collide with it.
+      SEARCH_QUEUE_PREFIX: ${SEARCH_QUEUE_PREFIX:-search}
+      # Ingestion jobs this process runs at once. Studio's knowledge-queue
+      # number, for the same jobs.
+      SEARCH_WORKER_CONCURRENCY: ${SEARCH_WORKER_CONCURRENCY:-20}
     volumes:
       # The instance's identity. Losing it means every paired client pairs again.
       - search-state:/var/lib/actana-search

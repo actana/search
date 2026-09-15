@@ -54,6 +54,18 @@ export interface DocumentTimeoutSweepResult {
   candidates: number
   /** Documents successfully flipped to `failed`. */
   reconciled: number
+  /**
+   * Which documents those were, so the job layer can announce them.
+   *
+   * lifted: additive, and the only change to this file. The sweep is the one
+   * path to `failed` that no job's completion covers — a worker killed mid-job,
+   * or a job past `maxStalledCount`, leaves the row non-terminal with nothing
+   * running, so neither `jobs/run.ts`'s announcement nor the worker's failure
+   * handler ever sees that document again and its `document.failed` was simply
+   * lost. Reporting the ids rather than publishing from here keeps every
+   * announcement in the job layer, which is where ADR 0009 D8 put them.
+   */
+  failedDocumentIds: string[]
 }
 
 /**
@@ -85,7 +97,7 @@ export async function runDocumentTimeoutSweep(): Promise<DocumentTimeoutSweepRes
     .limit(MAX_DOCS_PER_SWEEP)
 
   if (stuckDocs.length === 0) {
-    return { candidates: 0, reconciled: 0 }
+    return { candidates: 0, reconciled: 0, failedDocumentIds: [] }
   }
 
   logger.warn(`[${requestId}] Reconciling stuck documents`, {
@@ -95,6 +107,7 @@ export async function runDocumentTimeoutSweep(): Promise<DocumentTimeoutSweepRes
 
   const now = Date.now()
   let reconciled = 0
+  const failedDocumentIds: string[] = []
   for (const doc of stuckDocs) {
     if (!doc.processingStartedAt) {
       continue
@@ -116,6 +129,7 @@ export async function runDocumentTimeoutSweep(): Promise<DocumentTimeoutSweepRes
     try {
       await markDocumentAsFailedTimeout(doc.id, doc.processingStartedAt, requestId)
       reconciled++
+      failedDocumentIds.push(doc.id)
     } catch (error) {
       logger.error(`[${requestId}] Failed to reconcile stuck document ${doc.id}`, {
         error: error instanceof Error ? error.message : String(error),
@@ -128,5 +142,5 @@ export async function runDocumentTimeoutSweep(): Promise<DocumentTimeoutSweepRes
     reconciled,
   })
 
-  return { candidates: stuckDocs.length, reconciled }
+  return { candidates: stuckDocs.length, reconciled, failedDocumentIds }
 }
