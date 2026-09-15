@@ -67,8 +67,8 @@ describe("QueryRequestSchema: `distanceThreshold`", () => {
   it("is accepted on the v1 path, where there is a distance to threshold", () => {
     expect(QueryRequestSchema.parse({ mode: "v1-tags", text: "leave", distanceThreshold: 0.8 }))
       .toMatchObject({ distanceThreshold: 0.8 });
-    // The whole range the wire allows, ends included.
-    for (const value of [0, 1, 2]) {
+    // The whole range the wire allows, from just above zero to two.
+    for (const value of [0.000001, 0.8, 1, 2]) {
       expect(
         QueryRequestSchema.safeParse({ mode: "v1-tags", text: "q", distanceThreshold: value })
           .success,
@@ -83,12 +83,30 @@ describe("QueryRequestSchema: `distanceThreshold`", () => {
     ]);
   });
 
-  it("is a cosine distance, so it is refused outside [0, 2]", () => {
+  it("is a cosine distance, so it is refused outside (0, 2]", () => {
     for (const value of [-0.1, 2.1]) {
       expect(issuePaths({ mode: "v1-tags", text: "q", distanceThreshold: value })).toEqual([
         "distanceThreshold",
       ]);
     }
+  });
+
+  it("refuses `0`, which the frozen guard cannot tell from nothing at all", () => {
+    /**
+     * `handleVectorOnlySearch` and `handleTagAndVectorSearch` both test this
+     * with `!distanceThreshold` — "was one given?" — so a stated `0` reads
+     * there as absent and the guard throws a plain `Error`, which on the wire
+     * was a `500` on a body the contract had accepted. `0` is also the one
+     * value that can match nothing at all, since a row is kept for being
+     * `< threshold`. Refused at the contract, because the engine is frozen
+     * (ADR 0005) and a `400` on the field is the honest answer.
+     */
+    expect(issuePaths({ mode: "v1-tags", text: "q", distanceThreshold: 0 })).toEqual([
+      "distanceThreshold",
+    ]);
+    expect(
+      issuePaths({ mode: "v1-tags", tags: [TAG], distanceThreshold: 0 }),
+    ).toEqual(["distanceThreshold"]);
   });
 
   it("reports both cross-field refusals at once when a request is wrong twice", () => {
@@ -276,6 +294,108 @@ describe("ListDocumentsQuerySchema: `tagFilters`", () => {
         tagFilters: JSON.stringify([{ ...TAG, fieldType: "colour" }]),
       }).success,
     ).toBe(false);
+  });
+
+  it("refuses an operator the engine does not implement at all", () => {
+    /**
+     * `buildTagFilterCondition` answers a condition it cannot build with
+     * `undefined`, and an undefined condition is **dropped** — so an operator
+     * it has never heard of answered a *filtered* listing with the
+     * *unfiltered* one, which a caller cannot tell from the rows. The enum is
+     * exactly what that function's four branches implement.
+     */
+    for (const operator of ["regex", "in", "not_in", "is_null", "like", "EQ", ""]) {
+      expect(
+        ListDocumentsQuerySchema.safeParse({ tagFilters: [{ ...TAG, operator }] }).success,
+      ).toBe(false);
+    }
+    // And the eleven it does implement are all accepted, on a type that has them.
+    for (const operator of ["eq", "neq", "contains", "not_contains", "starts_with", "ends_with"]) {
+      expect(
+        ListDocumentsQuerySchema.safeParse({ tagFilters: [{ ...TAG, operator }] }).success,
+      ).toBe(true);
+    }
+    for (const operator of ["eq", "neq", "gt", "gte", "lt", "lte"]) {
+      expect(
+        ListDocumentsQuerySchema.safeParse({
+          tagFilters: [{ tagSlot: "number1", fieldType: "number", operator, value: "7" }],
+        }).success,
+      ).toBe(true);
+    }
+  });
+
+  it("refuses an operator that type's branch does not implement", () => {
+    // A real operator on the wrong type is the dropped-condition case again:
+    // the `text` branch has no `gt`, the `boolean` branch has only `eq`/`neq`.
+    const refused = [
+      { tagSlot: "tag1", fieldType: "text", operator: "gt", value: "x" },
+      { tagSlot: "tag1", fieldType: "text", operator: "between", value: "a", valueTo: "b" },
+      { tagSlot: "boolean1", fieldType: "boolean", operator: "contains", value: "true" },
+      { tagSlot: "boolean1", fieldType: "boolean", operator: "gte", value: "true" },
+      { tagSlot: "number1", fieldType: "number", operator: "contains", value: "7" },
+      { tagSlot: "date1", fieldType: "date", operator: "starts_with", value: "2026" },
+    ];
+    for (const condition of refused) {
+      const result = ListDocumentsQuerySchema.safeParse({ tagFilters: [condition] });
+      expect(result.success).toBe(false);
+      expect(result.success ? [] : result.error.issues[0]!.path).toEqual([
+        "tagFilters",
+        0,
+        "operator",
+      ]);
+    }
+  });
+
+  it("binds `fieldType` to the slot's own prefix", () => {
+    /**
+     * Worse than a dropped condition: `{ tagSlot: 'number1', fieldType: 'text' }`
+     * reaches Postgres as a text comparison against an integer column, which is
+     * a type error and a `500`. The prefix *is* the column's type, so the pair
+     * has exactly one valid spelling and the mismatch is a `400` on `fieldType`.
+     */
+    for (const condition of [
+      { tagSlot: "number1", fieldType: "text", operator: "eq", value: "7" },
+      { tagSlot: "tag1", fieldType: "number", operator: "eq", value: "7" },
+      { tagSlot: "date1", fieldType: "text", operator: "eq", value: "2026-09-15" },
+      { tagSlot: "boolean1", fieldType: "text", operator: "eq", value: "true" },
+      { tagSlot: "tag7", fieldType: "boolean", operator: "eq", value: "true" },
+    ]) {
+      const result = ListDocumentsQuerySchema.safeParse({ tagFilters: [condition] });
+      expect(result.success).toBe(false);
+      expect(result.success ? [] : result.error.issues[0]!.path).toEqual([
+        "tagFilters",
+        0,
+        "fieldType",
+      ]);
+    }
+    // Each family's own spelling, accepted.
+    for (const condition of [
+      { tagSlot: "tag4", fieldType: "text", operator: "eq", value: "x" },
+      { tagSlot: "number5", fieldType: "number", operator: "lt", value: "7" },
+      { tagSlot: "date2", fieldType: "date", operator: "gte", value: "2026-09-15" },
+      { tagSlot: "boolean3", fieldType: "boolean", operator: "neq", value: "false" },
+    ]) {
+      expect(ListDocumentsQuerySchema.safeParse({ tagFilters: [condition] }).success).toBe(true);
+    }
+  });
+
+  it("requires `valueTo` for `between`, which the engine drops without one", () => {
+    for (const condition of [
+      { tagSlot: "number1", fieldType: "number", operator: "between", value: "1" },
+      { tagSlot: "date1", fieldType: "date", operator: "between", value: "2026-01-01" },
+    ]) {
+      const result = ListDocumentsQuerySchema.safeParse({ tagFilters: [condition] });
+      expect(result.success).toBe(false);
+      expect(result.success ? [] : result.error.issues[0]!.path).toEqual([
+        "tagFilters",
+        0,
+        "valueTo",
+      ]);
+      expect(
+        ListDocumentsQuerySchema.safeParse({ tagFilters: [{ ...condition, valueTo: "9" }] })
+          .success,
+      ).toBe(true);
+    }
   });
 
   it("refuses a number where the engine parses a string", () => {

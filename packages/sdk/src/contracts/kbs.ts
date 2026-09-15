@@ -175,8 +175,11 @@ export const QueryRequestSchema = z
      * query stayed in Studio (TASK-009's rework notes, contract change 1).
      *
      * Optional *only* there. `hybrid` embeds, and so does a tag-less
-     * `v1-tags`; a request with nothing to embed and nothing to filter by is
-     * refused below rather than answered with an arbitrary vector.
+     * `v1-tags` — which is the **vector-only** v1 search
+     * (`handleVectorOnlySearch`), the shape Studio's own wired path sends as
+     * `{ text, topK }` with no filters at all. A request with nothing to embed
+     * and nothing to filter by is refused below rather than answered with an
+     * arbitrary vector.
      */
     text: z.string().min(1).optional(),
     /**
@@ -215,8 +218,18 @@ export const QueryRequestSchema = z
      * this field is asking for something that does not exist. Refused rather
      * than accepted and dropped, because a threshold that was quietly ignored
      * looks exactly like one that was applied.
+     *
+     * **Above `0`, not from `0`.** The frozen v1 search functions test their
+     * threshold with `!distanceThreshold` — "was one given?" — so a stated `0`
+     * is indistinguishable there from one left out and the guard throws
+     * ("Query vector and distance threshold are required…"), which on this wire
+     * is a `500`. `0` is also the one value that can match nothing at all: a
+     * cosine distance is `< threshold`, so `0` is an empty result set by
+     * definition and anybody who means that means `minScore`-style "nothing".
+     * Refused at the contract rather than translated, because the engine is
+     * frozen (ADR 0005) and a `400` on the field is the honest answer.
      */
-    distanceThreshold: z.number().min(0).max(2).optional(),
+    distanceThreshold: z.number().gt(0).max(2).optional(),
     /**
      * The canonical query keywords to blend with, instead of the ones the
      * instance would pick.
@@ -255,8 +268,9 @@ export const QueryRequestSchema = z
         code: z.ZodIssueCode.custom,
         path: ["text"],
         message:
-          "`text` is required unless `mode` is 'v1-tags' and `tags` is non-empty " +
-          "(the tag-only search, which embeds nothing)",
+          "`text` is required unless `mode` is 'v1-tags' and `tags` is non-empty — " +
+          "the tag-only search, the one shape that embeds nothing. A tag-less " +
+          "`v1-tags` is the vector-only search and embeds `text` like any other",
       });
     }
     if (value.distanceThreshold !== undefined && mode !== "v1-tags") {
@@ -336,10 +350,17 @@ export const V1TagQueryResponseSchema = z.object({
    * {@link QueryRequestSchema}) reads its own value back, because a caller
    * comparing the threshold it asked for against the one it is told about
    * should not have to know which of the two this field means.
+   *
+   * Which is also why it is **absent on the tag-only search**: that shape
+   * embeds nothing, ranks by nothing and thresholds nothing, so there is no
+   * distance any row was kept or dropped for. Reporting the number
+   * `getQueryStrategy` would have computed — or the one the caller stated —
+   * would be reporting a threshold that never ran, on the one path where the
+   * field cannot mean what it means everywhere else.
    */
   strategy: z.object({
     useParallel: z.boolean(),
-    distanceThreshold: z.number(),
+    distanceThreshold: z.number().optional(),
     parallelLimit: z.number(),
     singleQueryOptimized: z.boolean(),
   }),

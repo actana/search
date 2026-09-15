@@ -20,6 +20,7 @@ import {
   NullableIsoDateTimeSchema,
   PaginationSchema,
   TagFieldTypeSchema,
+  type TagFieldType,
   TagSlotSchema,
   TagValuesSchema,
   TagWritesSchema,
@@ -165,25 +166,106 @@ export type IngestResponse = z.infer<typeof IngestResponseSchema>;
  * One tag filter on a document listing.
  *
  * `TagFilterCondition` as the lifted `getDocuments` already accepts it, field
- * for field: the slot, how to read the value, the operator, and the value
- * itself as a **string** whatever the column's type is — the service parses it,
- * exactly as it does for a tag write. `valueTo` is the upper bound of
- * `between`. More than one condition on the same slot is allowed and they are
- * ANDed, as the engine ANDs them.
+ * for field: the slot, how to read the value, the operator, and `valueTo` as
+ * the upper bound of `between`.
  *
- * `tagSlot` is the closed slot enum rather than the lifted signature's bare
- * `string`, because the engine *drops* a condition whose slot it does not
- * recognise — which would answer a filtered listing with an unfiltered one.
- * The seventeen names are exactly the set it will act on, so nothing a caller
- * can mean is refused and nothing that would be silently widened is accepted.
+ * **Every field of it is closed, and for one reason: the engine's
+ * `buildTagFilterCondition` answers a condition it cannot build with
+ * `undefined`, and an undefined condition is dropped — which answers a
+ * *filtered* listing with the *unfiltered* one.** A caller cannot tell those
+ * two apart from the rows, so anything that would be dropped is a `400` here
+ * instead:
+ *
+ *   - `tagSlot` is the seventeen-slot enum, not the lifted signature's bare
+ *     `string`;
+ *   - `operator` is the closed set below, which is exactly what the engine
+ *     implements. `contains`, `not_contains`, `starts_with` and `ends_with` are
+ *     its `LIKE` forms, `between` reads `valueTo`, and there is no `in`, no
+ *     `is_null` and no `regex` — a request for one of those was answered with
+ *     every document in the KB;
+ *   - the **slot's own prefix** fixes `fieldType` (`tag*` is text, `number*`
+ *     number, `date*` date, `boolean*` boolean). A mismatch is not merely
+ *     dropped: `{ tagSlot: 'number1', fieldType: 'text' }` reaches Postgres as
+ *     a text comparison against an integer column, which is a type error and a
+ *     `500`;
+ *   - a `fieldType` that does not implement the `operator` (`contains` on a
+ *     number, `gt` on a boolean) is the dropped-condition case again, so it is
+ *     refused too;
+ *   - `between` without `valueTo` is dropped by the engine for both types that
+ *     have it, so `valueTo` is required exactly there.
+ *
+ * `value` stays a **string** whatever the column's type is — the service parses
+ * it, exactly as it does for a tag write. More than one condition on the same
+ * slot is allowed and they are ANDed, as the engine ANDs them.
  */
-export const TagFilterConditionSchema = z.object({
-  tagSlot: TagSlotSchema,
-  fieldType: TagFieldTypeSchema,
-  operator: z.string().min(1),
-  value: z.string(),
-  valueTo: z.string().optional(),
-});
+export const TagFilterOperatorSchema = z.enum([
+  "eq",
+  "neq",
+  "contains",
+  "not_contains",
+  "starts_with",
+  "ends_with",
+  "gt",
+  "gte",
+  "lt",
+  "lte",
+  "between",
+]);
+export type TagFilterOperator = z.infer<typeof TagFilterOperatorSchema>;
+
+/** Which operators each column type's branch of `buildTagFilterCondition` builds. */
+const OPERATORS_BY_FIELD_TYPE: Record<TagFieldType, readonly TagFilterOperator[]> = {
+  text: ["eq", "neq", "contains", "not_contains", "starts_with", "ends_with"],
+  number: ["eq", "neq", "gt", "gte", "lt", "lte", "between"],
+  date: ["eq", "neq", "gt", "gte", "lt", "lte", "between"],
+  boolean: ["eq", "neq"],
+};
+
+/** The field type a slot name commits to. The prefix *is* the column's type. */
+const fieldTypeOfSlot = (slot: string): TagFieldType => {
+  if (slot.startsWith("number")) return "number";
+  if (slot.startsWith("date")) return "date";
+  if (slot.startsWith("boolean")) return "boolean";
+  return "text";
+};
+
+export const TagFilterConditionSchema = z
+  .object({
+    tagSlot: TagSlotSchema,
+    fieldType: TagFieldTypeSchema,
+    operator: TagFilterOperatorSchema,
+    value: z.string(),
+    valueTo: z.string().optional(),
+  })
+  .superRefine((condition, ctx) => {
+    const expected = fieldTypeOfSlot(condition.tagSlot);
+    if (condition.fieldType !== expected) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["fieldType"],
+        message:
+          `\`${condition.tagSlot}\` is a ${expected} column, so \`fieldType\` must be ` +
+          `'${expected}' and not '${condition.fieldType}'; the slot's prefix is its type`,
+      });
+      return;
+    }
+    if (!OPERATORS_BY_FIELD_TYPE[expected].includes(condition.operator)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["operator"],
+        message:
+          `\`${condition.operator}\` is not an operator on a ${expected} tag; ` +
+          `${expected} takes ${OPERATORS_BY_FIELD_TYPE[expected].join(", ")}`,
+      });
+    }
+    if (condition.operator === "between" && condition.valueTo === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["valueTo"],
+        message: "`between` is an inclusive range, so `valueTo` is its upper bound",
+      });
+    }
+  });
 export type TagFilterCondition = z.infer<typeof TagFilterConditionSchema>;
 
 /**
