@@ -15,7 +15,7 @@
 
 import type { SearchDocument, Chunk, KnowledgeBase } from "@actana/search/contracts";
 import type { KnowledgeBaseWithCounts } from "../knowledge/types.ts";
-import type { DocumentRow } from "./ownership.ts";
+import type { DocumentRow, KbRow } from "./ownership.ts";
 
 /** A timestamp, or `null`. */
 export function iso(value: Date | string | null | undefined): string | null {
@@ -29,16 +29,45 @@ export function isoRequired(value: Date | string): string {
 }
 
 /**
- * A knowledge base.
+ * The columns a wire KB is read off Search's own row rather than off the
+ * lifted shape.
  *
- * `language` is carried separately because the lifted `KnowledgeBaseWithCounts`
- * never had it — the column is Search's partition configuration and Studio's
- * type predates it.
+ * **Because the lifted shape does not reliably carry them.** `language` never
+ * existed in Studio's type — the column is Search's partition configuration —
+ * and the other six are declared optional on `KnowledgeBaseWithCounts` because
+ * `knowledge/service.ts` sets them on *one* of its four paths: the create
+ * returns a hand-built object that names none of them, the list and the update
+ * select twelve columns that do not include them, and only
+ * `getKnowledgeBaseById` selects them all. The engine is behaviour-frozen (ADR
+ * 0005), so the row is read here.
+ *
+ * What that cost while it was `{ language?: string }` and everything else fell
+ * through to the lifted object: `POST /v1/kbs` wrote `embedding_endpoint_id`
+ * and answered `embeddingEndpointId: null`, and so did `GET /v1/kbs`. A wired
+ * Studio reads KB shape from this instance, so a KB that *had* an embedding
+ * endpoint showed none — and `PATCH` reported the cluster count and the
+ * inference endpoint the same way.
+ *
+ * It is a required argument for that reason: every route that serialises a KB
+ * holds the row already (`requireKb` selects it whole), so the compiler asking
+ * for it costs nothing and closes the hole permanently.
  */
-export function kbToWire(
-  kb: KnowledgeBaseWithCounts,
-  extra: { language?: string } = {},
-): KnowledgeBase {
+export type KbWireColumns = Pick<
+  KbRow,
+  | "language"
+  | "embeddingEndpointId"
+  | "inferenceEndpointId"
+  | "inferenceModelId"
+  | "kmeansK"
+  | "kmeansSilhouette"
+  | "kmeansUpdatedAt"
+>;
+
+/**
+ * A knowledge base: the counts from the lifted shape, Search's own columns from
+ * the row. See {@link KbWireColumns} for why it takes both.
+ */
+export function kbToWire(kb: KnowledgeBaseWithCounts, row: KbWireColumns): KnowledgeBase {
   return {
     id: kb.id,
     userId: kb.userId,
@@ -54,13 +83,13 @@ export function kbToWire(
     workspaceId: kb.workspaceId,
     docCount: Number(kb.docCount),
     connectorTypes: kb.connectorTypes,
-    clusterCount: kb.clusterCount ?? null,
-    silhouette: kb.silhouette ?? null,
-    clustersUpdatedAt: iso(kb.clustersUpdatedAt),
-    inferenceModelId: kb.inferenceModelId ?? null,
-    embeddingEndpointId: kb.embeddingEndpointId ?? null,
-    inferenceEndpointId: kb.inferenceEndpointId ?? null,
-    ...(extra.language === undefined ? {} : { language: extra.language }),
+    clusterCount: row.kmeansK,
+    silhouette: row.kmeansSilhouette,
+    clustersUpdatedAt: iso(row.kmeansUpdatedAt),
+    inferenceModelId: row.inferenceModelId,
+    embeddingEndpointId: row.embeddingEndpointId,
+    inferenceEndpointId: row.inferenceEndpointId,
+    language: row.language,
   };
 }
 
