@@ -1,5 +1,23 @@
 #!/usr/bin/env node
-// Container health probe.
+// Container health probe, for both of the roles this image runs (ADR 0010 D2).
+//
+// **`SEARCH_ROLE=worker` probes Redis; anything else probes the API.** The image
+// carries one `HEALTHCHECK`, and the split deployment runs the *same image* a
+// second time with `command: [..., worker.ts]` and `ports: []`. That container
+// has no listener on 7443, so an API probe there is a container that is
+// permanently unhealthy while doing its job perfectly — which in compose means
+// `--wait` never returns, a `depends_on: service_healthy` never fires, and an
+// orchestrator restarts a healthy worker in a loop. Docker gives no way to
+// override a healthcheck per service other than replacing it, so the probe is
+// what knows about the roles.
+//
+// A worker's liveness is "can it still reach the queue it recovers through".
+// That is Redis, and it is asked the way a client would: `PING`, over the same
+// `SEARCH_REDIS_URL` the worker dials. Not queue *depth* — a backlog is a
+// capacity question and restarting the container is the wrong answer to it
+// (ADR 0010) — and not the database, which the API probe does not check either.
+//
+// ## The API role
 //
 // `GET /v1/health` — the second of the two open paths (ADR 0008 D5). It grants
 // nothing, mutates nothing, reads no client, and answers `{ ok, schemaVersion }`,
@@ -23,26 +41,103 @@
 // honest about what it proves — the listener is up — and it is not the path
 // taken once there is state.
 //
-// It does not check the worker. A worker that has stopped taking jobs is a
-// queue-depth question, not a liveness one, and restarting the container is the
+// It does not check the worker. Split out, the worker has the probe above; in
+// the combined process a worker that has stopped taking jobs is a queue-depth
+// question rather than a liveness one, and restarting the container is the
 // wrong answer to it (ADR 0010).
 
 import { readFileSync } from "node:fs";
 import * as https from "node:https";
+import * as net from "node:net";
 import * as path from "node:path";
+import * as tls from "node:tls";
 
-const port = Number.parseInt(process.env.SEARCH_PORT ?? "7443", 10);
-const host = process.env.SEARCH_HEALTHCHECK_HOST ?? "localhost";
+const role = (process.env.SEARCH_ROLE ?? "").trim().toLowerCase();
 const timeoutMs = Number.parseInt(process.env.SEARCH_HEALTHCHECK_TIMEOUT_MS ?? "4000", 10);
-const stateDir = process.env.SEARCH_STATE_DIR ?? "/var/lib/actana-search";
 
 const fail = (why) => {
   console.error(`unhealthy: ${why}`);
   process.exit(1);
 };
 
+if (role === "worker") {
+  probeRedis();
+} else {
+  probeApi();
+}
+
+// ---------------------------------------------------------------------------
+// The worker role
+// ---------------------------------------------------------------------------
+
+/** One RESP bulk-string argument. */
+const bulk = (value) => `$${Buffer.byteLength(value)}\r\n${value}\r\n`;
+
+/** A RESP array command, e.g. `command("PING")`. */
+const command = (...args) => `*${args.length}\r\n` + args.map(bulk).join("");
+
+/**
+ * `PING` the queue's Redis and expect `+PONG`.
+ *
+ * Hand-rolled RESP over a socket rather than through ioredis: this file runs
+ * with no dependencies of its own so that a probe cannot be broken by a
+ * `--prod` install that left something out, and `PING` is nine bytes.
+ *
+ * `AUTH` first when the URL carries credentials — pipelined with the `PING`, so
+ * a password-protected Redis is one round trip like an open one, and a refused
+ * password shows up as the absence of `+PONG`.
+ */
+function probeRedis() {
+  let url;
+  try {
+    url = new URL(process.env.SEARCH_REDIS_URL ?? "redis://localhost:6379");
+  } catch {
+    return fail(`SEARCH_REDIS_URL is not a URL`);
+  }
+  const secure = url.protocol === "rediss:";
+  const port = Number.parseInt(url.port || "6379", 10);
+  const host = url.hostname || "localhost";
+
+  const password = url.password ? decodeURIComponent(url.password) : "";
+  const username = url.username ? decodeURIComponent(url.username) : "";
+  const payload =
+    (password ? (username ? command("AUTH", username, password) : command("AUTH", password)) : "") +
+    command("PING");
+
+  const socket = secure
+    ? tls.connect({ host, port, servername: host, rejectUnauthorized: false })
+    : net.connect({ host, port });
+
+  let seen = "";
+  socket.setTimeout(timeoutMs);
+  socket.on(secure ? "secureConnect" : "connect", () => socket.write(payload));
+  socket.on("data", (chunk) => {
+    seen += chunk.toString("utf8");
+    if (seen.includes("+PONG")) {
+      socket.destroy();
+      process.exit(0);
+    }
+    // `-NOAUTH`, `-WRONGPASS`, `-ERR` — an answer, and not the one wanted.
+    if (seen.startsWith("-") || seen.includes("\r\n-")) {
+      socket.destroy();
+      // The first line only: never the password, which is not echoed anyway.
+      fail(`redis at ${host}:${port} refused PING (${seen.split("\r\n")[0]})`);
+    }
+  });
+  socket.on("timeout", () => {
+    socket.destroy();
+    fail(`redis at ${host}:${port} did not answer PING within ${timeoutMs}ms`);
+  });
+  socket.on("error", (err) => fail(`redis at ${host}:${port}: ${err.message}`));
+  socket.on("close", () => fail(`redis at ${host}:${port} closed without answering PING`));
+}
+
+// ---------------------------------------------------------------------------
+// The API role
+// ---------------------------------------------------------------------------
+
 /** The instance's CA certificate, or null before it has written one. */
-function loadCa() {
+function loadCa(stateDir) {
   try {
     const material = JSON.parse(readFileSync(path.join(stateDir, "material.json"), "utf8"));
     return typeof material?.caCert === "string" && material.caCert ? material.caCert : null;
@@ -51,40 +146,46 @@ function loadCa() {
   }
 }
 
-const ca = loadCa();
-const request = https.request(
-  {
-    host,
-    port,
-    path: "/v1/health",
-    method: "GET",
-    headers: { accept: "application/json" },
-    timeout: timeoutMs,
-    ...(ca ? { ca, rejectUnauthorized: true } : { rejectUnauthorized: false }),
-  },
-  (response) => {
-    const chunks = [];
-    response.on("data", (chunk) => chunks.push(chunk));
-    response.on("end", () => {
-      if (response.statusCode !== 200) {
-        return fail(`/v1/health answered ${response.statusCode}`);
-      }
-      let body;
-      try {
-        body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-      } catch {
-        return fail("/v1/health answered 200 with something that was not JSON");
-      }
-      // `ok: false` is the instance saying it is not well. Believe it.
-      if (body?.ok !== true) return fail(`/v1/health reports not ok: ${JSON.stringify(body)}`);
-      process.exit(0);
-    });
-  },
-);
+function probeApi() {
+  const port = Number.parseInt(process.env.SEARCH_PORT ?? "7443", 10);
+  const host = process.env.SEARCH_HEALTHCHECK_HOST ?? "localhost";
+  const stateDir = process.env.SEARCH_STATE_DIR ?? "/var/lib/actana-search";
 
-request.on("timeout", () => {
-  request.destroy();
-  fail(`/v1/health did not answer within ${timeoutMs}ms`);
-});
-request.on("error", (err) => fail(err.message));
-request.end();
+  const ca = loadCa(stateDir);
+  const request = https.request(
+    {
+      host,
+      port,
+      path: "/v1/health",
+      method: "GET",
+      headers: { accept: "application/json" },
+      timeout: timeoutMs,
+      ...(ca ? { ca, rejectUnauthorized: true } : { rejectUnauthorized: false }),
+    },
+    (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => {
+        if (response.statusCode !== 200) {
+          return fail(`/v1/health answered ${response.statusCode}`);
+        }
+        let body;
+        try {
+          body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        } catch {
+          return fail("/v1/health answered 200 with something that was not JSON");
+        }
+        // `ok: false` is the instance saying it is not well. Believe it.
+        if (body?.ok !== true) return fail(`/v1/health reports not ok: ${JSON.stringify(body)}`);
+        process.exit(0);
+      });
+    },
+  );
+
+  request.on("timeout", () => {
+    request.destroy();
+    fail(`/v1/health did not answer within ${timeoutMs}ms`);
+  });
+  request.on("error", (err) => fail(err.message));
+  request.end();
+}

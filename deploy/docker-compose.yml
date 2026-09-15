@@ -22,6 +22,16 @@
 #       # …the same build and the same environment, plus:
 #       command: ["node", "packages/search/src/worker.ts"]
 #       ports: []                    # it serves nothing
+#       environment:
+#         SEARCH_ROLE: "worker"      # …and therefore has no /v1/health
+#
+# `SEARCH_ROLE: "worker"` is not optional, and it is the one line that is easy
+# to leave out. The image carries a single `HEALTHCHECK` and it probes
+# `GET /v1/health` on `SEARCH_PORT`; a worker container serves nothing, so
+# without the variable it is permanently unhealthy while working perfectly —
+# `--wait` never returns, `depends_on: service_healthy` never fires, and an
+# orchestrator restarts it in a loop. With it, `deploy/healthcheck.mjs` probes
+# Redis (`PING`) instead, which is what a worker's liveness actually is.
 #
 # Both halves need `SEARCH_DATABASE_URL`, `SEARCH_REDIS_URL`, the `SEARCH_S3_*`
 # block and `SEARCH_ENCRYPTION_KEY`; only the API needs `SEARCH_PORT`,

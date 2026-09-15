@@ -29,7 +29,13 @@ export type ParsedArgs = {
   verbose: boolean;
   /** `-h` / `--help`. */
   help: boolean;
-  /** `-V` / `--version`. */
+  /**
+   * `-V` / `-v` / `--version`.
+   *
+   * Both short forms, and both spelled out in `HELP`: `-v` has always been
+   * accepted here and the help only named `-V`, which is the kind of gap that
+   * is discovered by somebody deciding the CLI is broken.
+   */
   version: boolean;
 
   // ─── reaching an instance ────────────────────────────────────────────────
@@ -194,8 +200,8 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
         parsed.help = true;
         break;
       case "-V":
-      case "--version":
       case "-v":
+      case "--version":
         parsed.version = true;
         break;
       default:

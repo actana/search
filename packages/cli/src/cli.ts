@@ -44,7 +44,8 @@ On the instance (through its admin Unix socket, mode 0600)
   pair revoke <id>            unpair a client, or cancel a pending code
   endpoint add --kind <k> --provider <p> --model <m> --key-stdin
                               register a model endpoint with a literal key
-  endpoint ls [--json]        the endpoints this instance knows
+  endpoint ls [--client <id>] [--json]
+                              the endpoints this instance knows
 
 On a paired machine (mTLS, through @actana/search)
   pair redeem <address> <ticket> [--fingerprint <fp>] [--profile <name>]
@@ -61,7 +62,7 @@ Flags
   --json                machine-readable output. Every listing honours it
   --verbose             explain the steps, on stderr
   -h, --help            show this help; \`<noun> --help\` shows the noun's
-  -V, --version         print the version
+  -V, -v, --version     print the version
 
 Getting started
   On the instance:   actana-search pair new --label laptop

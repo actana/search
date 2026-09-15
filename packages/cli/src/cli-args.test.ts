@@ -178,3 +178,23 @@ describe("parseInteger and parseFraction", () => {
     expect(parseInteger("-1", "--top-k")).toMatchObject({ error: expect.any(String) });
   });
 });
+
+describe("the help names the flags that work", () => {
+  /**
+   * Two small gaps, both of the kind that gets a working CLI reported as
+   * broken: `-v` was accepted and only `-V` was documented, and `endpoint ls`
+   * takes `--client` and the top-level help did not say so.
+   */
+  it("documents both short forms of --version", async () => {
+    const { HELP } = await import("./cli.ts");
+    expect(HELP).toContain("--version");
+    expect(HELP).toMatch(/-V, -v, --version/);
+    expect(parseArgs(["-V"]).version).toBe(true);
+    expect(parseArgs(["-v"]).version).toBe(true);
+  });
+
+  it("names --client on endpoint ls", async () => {
+    const { HELP } = await import("./cli.ts");
+    expect(HELP).toMatch(/endpoint ls \[--client <id>\] \[--json\]/);
+  });
+});
