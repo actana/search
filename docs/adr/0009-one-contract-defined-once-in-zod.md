@@ -136,11 +136,23 @@ the other, so the service offers both and a client may register both, one, or
 neither.
 
 **D8a — Event ids are derived from what happened, not from when it was
-noticed.** `id` is a digest of the event name and the facts (the document and
-its terminal state; the KB and its fit timestamp). Two workers that both notice
-the same document finished therefore produce the *same* event, and the delivery
-ledger's `(webhook, event)` unique index turns the second into a no-op rather
-than a duplicate POST.
+noticed.** `id` is a digest of the event name and the facts (the document, its
+terminal state and **which processing run reached it**; the KB and its fit
+timestamp). Two workers that both notice the same document finished therefore
+produce the *same* event, and the delivery ledger's `(webhook, event)` unique
+index turns the second into a no-op rather than a duplicate POST.
+
+**The run is part of the facts, and leaving it out lost events.** "This
+document, in this state" is not what happened — a document can reach `completed`
+twice. `POST /v1/kbs/:id/documents/:docId/include` re-runs the pipeline over a
+document that has already ingested, and the second `document.ingested` carried
+the *first one's* id: dropped in-process by the announced-id set, and dropped in
+the ledger by that same unique index, permanently. So the digest includes the
+row's `processing_started_at`, which is stamped once per run and never between
+the attempts of one job. That is exactly the line the dedupe wants — five
+attempts of one ingest are one event, two includes are two — where
+`processing_completed_at` moves on every attempt and would have made the dedupe
+a no-op instead.
 
 **D8b — The signature is over the raw body.** `x-search-signature:
 sha256=<hex>`, an HMAC-SHA256 over the exact bytes sent, keyed by the webhook's
@@ -155,15 +167,28 @@ being diffable against Studio's. `jobs/run.ts` reads the row the engine just
 wrote and publishes from there, which is correct for every path into that state
 including ones added later, and which costs the lifted files nothing.
 
-**Which needs one thing from the transport, and ADR 0010 says what.** "The row
+**Which needs two things from the transport, and ADR 0010 says what.** "The row
 the engine just wrote" is `failed` as soon as an attempt gives up, and under
 ADR 0010 D4 an attempt giving up is usually not the end of the story. So the
-runner is told how many attempts are left and a `document.failed` waits for the
-last one; a *terminal* failure the engine never recorded is announced by the
-worker's failure handler instead, carrying the typed `reason` that ADR 0010 D3
-defines and that `SearchEventSchema.reason` exists to hold. Both paths derive the
-event id from the same facts (D8a) and claim it from one set, so the two doors
-cannot produce two events for one document.
+runner is told how many attempts are left **and whether this dispatch is what
+failed**, and a `document.failed` waits for the last attempt only when the
+dispatch threw. A *terminal* failure the engine never recorded is announced by
+the worker's failure handler instead, and a document the **timeout sweep**
+reconciles is announced from the sweep's own result, carrying the typed `reason`
+that ADR 0010 D3 defines and that `SearchEventSchema.reason` exists to hold. All
+three doors derive the event id from the same facts (D8a) and claim it from one
+set, so they cannot produce two events for one document.
+
+**The outcome is half of that, and it was the half that was missing.** The
+attempt count alone says nothing about what the handler did:
+`finalizeDocumentEmbedding` marks a document `failed` when its batches have
+exhausted *their* attempts and then **returns**, so the job completes, the
+worker's failure handler never runs, and nothing re-reads the row — while the
+attempt count still said two were left and the announcement was held back. A
+`document.failed` therefore never went out on the ordinary BullMQ path at all,
+which the fixture suites could not show because the inline runner reports zero
+attempts remaining. A handler that returned has finished, whatever the counter
+says, and the row is the truth.
 
 ## Consequences
 

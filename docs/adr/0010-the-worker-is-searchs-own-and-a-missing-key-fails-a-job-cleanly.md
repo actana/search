@@ -71,6 +71,27 @@ for *its* knowledge queue, because these are the same jobs. A stall is tolerated
 rather than fatal: every job here is idempotent and resumable, so a job whose
 worker died is re-run rather than lost.
 
+**Which the job layer has to make true, because the engine does not.** "Every
+job here is idempotent" was a property of most of them and an assumption about
+`kb.ingest.document`: it chunks, embeds and inserts into the KB's partition with
+no `completed` short-circuit, no delete of what it is replacing, and no
+`(document_id, chunk_index)` uniqueness to fall back on — so a re-run left the
+document reporting N chunks over 2N rows, and every query over that KB answered
+twice out of one text. The engine is frozen (ADR 0005), so
+`jobs/ingest-idempotency.ts` is where the property is added: a document already
+`completed` skips the handler, and anything else has its partition rows and
+their keyword links dropped in one transaction immediately before the engine
+runs.
+
+**And the lock is deliberately shorter than the longest job.** A
+`kb.embed.batch` may run fifteen minutes and a `knowledge-process-document` up
+to an hour, so a `lockDuration` that *covered* the longest budget would be an
+hour before a dead worker's job could be recovered. What covers a long job is
+BullMQ's renewal, and `lockRenewTime` is now set explicitly at thirty seconds
+rather than left at the default half-of-the-lock — which gave a job exactly one
+chance to renew before losing it. When renewal cannot happen at all, the job is
+re-run, and the paragraph above is what makes that safe.
+
 The prefix is **settable**, which ADR 0006 did not say. Sharing a *client's*
 Redis was already safe at a fixed `search` — that is what the prefix is for. What
 a fixed prefix cannot survive is two *Search* instances on one Redis, which is a
@@ -117,6 +138,11 @@ in the failure handler would replace one failure with another.
 
 A transient failure that will retry is logged at **warn**, not error. A wired
 client's rolling restart must not read as an incident in Search's logs.
+
+**And "attempts are exhausted" is a question about the handler, not only about
+the counter.** See the last section: a handler that *returned* has finished
+whatever the counter says, and the timeout sweep is a third door onto the same
+event.
 
 **A terminal reason is re-thrown as BullMQ's `UnrecoverableError`.** "Whatever
 the attempt number" was, for a while, a claim the queue never heard: the failure
@@ -221,6 +247,20 @@ terminally. The id is optional on the binding because the engine's lifted call
 sites do not have one, and inventing a client there would be guessing rather
 than checking.
 
+**There is a third way to name a row, and it needed the same check.** A local
+endpoint may hold no key of its own and point at one that does, through
+`config.apiKeyEndpointId` — and `config` is a `z.record(z.unknown())` on the
+wire that `PUT /v1/endpoints` passes through, while an endpoint id is a *public*
+value this instance answers with. So client B could declare an endpoint keyed on
+client A's, bind a knowledge base to it and embed a corpus with A's sealed key,
+with nothing in either client's view of the instance to show it. The link is
+therefore scoped to the row's own `paired_client_id` at the moment of use —
+another client's endpoint is `client-mismatch`, terminal — refused with a `400`
+at the moment it is *declared*, and no longer reported as `hasKey: true` merely
+because the field is set. A link to an endpoint that has simply been deleted
+keeps the lifted fall-back to the row's own key (ADR 0005); the two are told
+apart rather than conflated.
+
 **D9 — The resolver is dialled through the SSRF guard, and believed only about
 the key.** The resolver URL is the one URL in this service that a *client*
 chooses and Search dials, with an internal credential in a header — so it goes
@@ -281,6 +321,24 @@ on anything a `--prod` install could leave out. Queue *depth* is deliberately
 not part of it: a backlog is a capacity problem and restarting the container is
 the wrong answer to it.
 
+**And the worker probe then did not run either, for a third reason.** The role
+dispatch sat *above* the RESP helpers it uses. `probeRedis()` is a function
+declaration and hoists; the `const bulk` and `const command` it calls do not, so
+the probe died in their temporal dead zone with `ReferenceError: Cannot access
+'command' before initialization` — before it opened a socket, on every attempt,
+in every worker container this image has produced. Docker reads that as
+unhealthy exactly the way it reads the missing module, so the fix above bought
+nothing until this one landed.
+
+Three things now hold it down, because a health probe is the one piece of code
+nothing else imports and CI therefore never ran: the dispatch is the last thing
+in the file, the helpers are function declarations, and
+`__tests__/deploy-healthcheck.test.ts` covers **both** roles by *spawning* the
+file the way Docker does — the bug was in the order of the file, so no test of
+its parts would have seen it. The module is importable (`import.meta.main`
+guards the dispatch) for the encoding assertions, and a built image is what the
+fix round checked last: both roles print a refused connection and exit 1.
+
 ## Consequences
 
 A client's outage is a delay and a warning line. A client's *mistake* — an
@@ -320,14 +378,32 @@ the engine just wrote — and the engine writes `failed` the moment *an attempt*
 gives up, which under D4 is routinely a resolver that will answer on the next
 one. Published as-is, every rolling restart on a wired client would raise
 `document.failed` on that client's own stream, and Studio's trigger would act on
-it. So **a `document.failed` is announced only from the terminal attempt**: the
-worker tells `runSearchJob` how many attempts BullMQ has left and the
-announcement is held back while that is above zero (a success is announced
-whatever the number). The event that a *terminal* reason produces — where the
-engine never got as far as the row — comes from the failure handler instead,
-with the typed `reason` on it, and both paths derive the event id from the same
-facts and claim it from the same set, so a document that fails is one event and
-not two.
+it. So **a `document.failed` is held back while the attempt that wrote it may be
+followed by another** — and "may be followed by another" is two facts, not one:
+the worker tells `runSearchJob` how many attempts BullMQ has left **and**
+`runSearchJob` knows whether this dispatch threw. The hold-back needs both.
+
+The first version needed only the count, and it lost the event it was written to
+protect. `finalizeDocumentEmbedding` marks a document `failed` when its batches
+have exhausted *their* attempts and then **returns normally**: the job completes,
+BullMQ's `failed` handler never runs, nothing ever re-reads the row — and the
+count still said two attempts were left, so nothing was announced. Studio
+therefore never heard `document.failed` on the ordinary path at all. The inline
+runner passes zero, which is why every fixture suite was green. A handler that
+returned has finished, whatever the counter says, and the row is the truth.
+
+There are **three** doors onto that one event, and they share an id space. The
+ordinary one is above. A *terminal* reason, where the engine never got as far as
+the row, comes from the worker's failure handler with the typed `reason` on it.
+And a document no live job will ever visit again — a worker killed mid-job, a
+job past `maxStalledCount` — is reconciled by the stranded-document sweep, which
+reports the rows it flipped so the job layer can announce them with the reason
+`timeout`; it used to flip them and tell nobody, because its payload names no
+document and the announcement returned before it read a row. All three derive
+the event id from the same facts (ADR 0009 D8a, which is now per *processing
+run*) and claim it from the same set, so a document that fails is one event and
+not two — while a document that is included again is a second run and therefore
+genuinely a second event.
 
 The cost is named rather than hidden: a document is `failed` in the database
 before it is `failed` on the wire, so a client polling `GET

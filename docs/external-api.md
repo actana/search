@@ -264,17 +264,25 @@ what went wrong — `unknown-endpoint`, `decrypt-failed`, `model-mismatch`,
 because the reasons are Search's vocabulary and a client must not break when one
 is added, and it is absent when there was no typed failure behind the error.
 
-**A `document.failed` is only sent once the job is out of attempts.** The engine
-marks a document `failed` as soon as an attempt gives up, which for a wired
-client mid-deploy is a resolver that will answer in a second; the announcement
-is held back until the attempt that really is the last one (ADR 0010 D4). So a
-`document.failed` means the document will not ingest, not that something went
-wrong once.
+**A `document.failed` means the document will not ingest, not that something
+went wrong once.** The engine marks a document `failed` as soon as an attempt
+gives up, which for a wired client mid-deploy is a resolver that will answer in
+a second — so the announcement is held back while the attempt that wrote it
+*threw* and the queue still has attempts for it. It is **not** held back when the
+job finished: a handler that returned having marked the document failed has
+decided, whatever the attempt counter says. Two other paths reach the same
+event: a failure the engine never recorded (a key that could not be resolved at
+all) is announced by the worker with a `reason`, and a document stranded by a
+worker that was killed is announced by the timeout sweep with `reason:
+"timeout"` (ADR 0010 D4).
 
 A **webhook** delivery is a POST carrying:
 
-- `x-search-event-id: <event.id>` — deterministic, so a redelivery after an
-  ambiguous timeout is recognisably the same event.
+- `x-search-event-id: <event.id>` — deterministic over *what happened*: the
+  document, its terminal state, and which processing run reached it. A
+  redelivery after an ambiguous timeout is recognisably the same event, and so
+  are the retries of one job; a document you **include again** is a new run and
+  therefore a new event id.
 - `x-search-signature: sha256=<hex>` — HMAC-SHA256 over the **raw body**, keyed
   by the registered secret. Verify over the bytes you received, not over a
   re-encoding. `verifyWebhookSignature` in the core does it in constant time;

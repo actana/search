@@ -9,7 +9,10 @@
   `GET /v1/health`, pinned against the instance's own CA when the state volume
   has one and falling back to the bare handshake before it does (ADR 0008 D5).
   With `SEARCH_ROLE=worker` it `PING`s `SEARCH_REDIS_URL` instead — see
-  [The API and the worker](#the-api-and-the-worker).
+  [The API and the worker](#the-api-and-the-worker). Both roles are covered by
+  `packages/search/src/__tests__/deploy-healthcheck.test.ts`, which spawns this
+  file the way Docker does; it is the one file here that nothing imports, and it
+  was broken in production and green in CI twice over.
 
 ```bash
 export SEARCH_ENCRYPTION_KEY=$(openssl rand -hex 32)
@@ -47,6 +50,18 @@ restarted in a loop. With it, the probe asks Redis for a `PONG` over the same
 `SEARCH_REDIS_URL` the worker dials, which is what a worker's liveness is.
 Queue *depth* is deliberately not part of it: a backlog is a capacity problem
 and restarting the container is the wrong answer to it (ADR 0010).
+
+That path works, which is worth saying because it did not: the probe's role
+dispatch ran before the RESP helpers it calls were initialised, so
+`SEARCH_ROLE=worker` answered `ReferenceError` rather than dialling anything and
+every worker container was unhealthy anyway. A built image now prints a refused
+connection when there is no Redis and exits `0` when Redis answers `PONG`:
+
+```bash
+docker build -f deploy/Dockerfile -t actana-search:check .
+docker run --rm -e SEARCH_ROLE=worker actana-search:check node /app/deploy/healthcheck.mjs
+# unhealthy: redis at localhost:6379: connect ECONNREFUSED 127.0.0.1:6379
+```
 
 `SEARCH_ENCRYPTION_KEY` is checked at boot in **both** halves and either will
 refuse to start without a 64-character hex value. It is required whether or not

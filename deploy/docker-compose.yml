@@ -31,7 +31,11 @@
 # without the variable it is permanently unhealthy while working perfectly —
 # `--wait` never returns, `depends_on: service_healthy` never fires, and an
 # orchestrator restarts it in a loop. With it, `deploy/healthcheck.mjs` probes
-# Redis (`PING`) instead, which is what a worker's liveness actually is.
+# Redis (`PING`) instead, which is what a worker's liveness actually is — and
+# that branch of the probe has been run against a built image and is covered by
+# a test that spawns it for both roles. It used to throw a `ReferenceError`
+# before it reached the socket, which Docker read as unhealthy exactly the way
+# it read no probe at all (ADR 0010 D10).
 #
 # Both halves need `SEARCH_DATABASE_URL`, `SEARCH_REDIS_URL`, the `SEARCH_S3_*`
 # block and `SEARCH_ENCRYPTION_KEY`; only the API needs `SEARCH_PORT`,

@@ -180,8 +180,12 @@ inventing language the project does not use, or there is a real gap to record.
   announced twice is recognisably one event. A `document.failed` may also carry
   a `reason`, which is the **Worker**'s classification of the failure
   (`unknown-endpoint`, `resolver-error`, …) as distinct from `error`, which is
-  the operator's sentence. It is announced only once the job is out of attempts:
-  a Document the engine marked `failed` on a retryable attempt is not news.
+  the operator's sentence. A `document.failed` is held back while the attempt
+  that wrote it threw and the queue still has attempts for it — a Document the
+  engine marked `failed` on a retryable attempt is not news — but never once the
+  job has *finished*, whatever the attempt count says. The id carries the
+  processing run, so the attempts of one job are one Event and a re-included
+  Document is a new one.
 
 **Webhook**
 : A URL a paired client asked to be told at. A delivery is signed
