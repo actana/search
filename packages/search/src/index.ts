@@ -41,6 +41,7 @@ import { registerSearchRoutes } from "./api/routes/index.ts";
 import { SearchPairingStore } from "./pairing/pairing-store.ts";
 import { PairingRevocations, startPairingRevocationSweep } from "./pairing/pairing-revocation.ts";
 import { ensureMaterial } from "./pairing/self-register.ts";
+import { assertEncryptionKeyConfigured } from "./core/security/encryption.ts";
 import { installShutdownHandlers, startWorkers } from "./worker.ts";
 
 const logger = createLogger("search");
@@ -48,6 +49,18 @@ const logger = createLogger("search");
 export async function boot(): Promise<void> {
   const cfg = config();
   const url = databaseUrl();
+
+  /**
+   * The sealing key, before anything else is touched.
+   *
+   * It was checked nowhere: `encryption.ts` threw at the first *use*, which is
+   * the first `PUT /v1/endpoints` or the first job that needs a mirrored key —
+   * so an instance with no `SEARCH_ENCRYPTION_KEY` paired, served health, and
+   * reported a cipher error hours later to whoever happened to be adding an
+   * endpoint. It is required in both modes (ADR 0010 D7): standalone it seals
+   * the provider keys, wired it seals the resolver credential that fetches them.
+   */
+  assertEncryptionKeyConfigured();
 
   logger.info("Applying migrations");
   await runMigrations({ url });
@@ -93,7 +106,22 @@ export async function boot(): Promise<void> {
    */
   const workersOff = /^(off|0|false|no)$/i.test(process.env.SEARCH_WORKERS ?? "");
   const workers = workersOff ? null : await startWorkers();
-  if (workers) installShutdownHandlers(workers);
+
+  /**
+   * One set of handlers for everything this process owns.
+   *
+   * It used to install them only when the workers were in this process, and
+   * only over the workers: a SIGTERM drained the queue and then called
+   * `process.exit(0)` with the API listener and the admin socket still open, so
+   * an in-flight request was cut mid-response and `admin.sock` was left behind
+   * for the next boot. With `SEARCH_WORKERS=off` there were no handlers at all.
+   * Now: drain the worker if there is one, then close the API, then the admin
+   * listener (which unlinks its socket), then exit.
+   */
+  installShutdownHandlers(workers, [
+    { name: "api", close: () => api.close() },
+    { name: "admin", close: () => admin.close() },
+  ]);
 
   logger.info("Search is up", {
     api: api.origin,

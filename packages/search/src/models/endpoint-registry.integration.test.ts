@@ -338,4 +338,229 @@ describeDb('the endpoint registry', () => {
       expect(await registry.deleteEndpoint('some-other-client', first!.id)).toBe(false)
     })
   })
+
+  describe('the resolver URL goes through the SSRF guard at declaration', () => {
+    /**
+     * `http(s)` was the whole of the check, which accepted the instance's own
+     * metadata service and the operator's internal network — reachable from
+     * inside the deployment and from nowhere else, and dialled with an internal
+     * credential in a header. Refusing here is what makes it a `400` to the
+     * client that asked rather than a failed job three days later.
+     */
+    const refused = [
+      'http://localhost:9000/resolve-endpoint',
+      'http://127.0.0.1:9000/resolve-endpoint',
+      'http://169.254.169.254/latest/meta-data/',
+      'https://10.0.0.5/resolve-endpoint',
+      'https://192.168.1.10/resolve-endpoint',
+      'http://studio.example/resolve-endpoint',
+      'https://studio.example:5432/resolve-endpoint',
+    ]
+
+    for (const resolverUrl of refused) {
+      it(`refuses ${resolverUrl}`, async () => {
+        await expect(
+          registry.setEndpointSource(CLIENT, {
+            kind: 'mirrored',
+            resolverUrl,
+            resolverKey: RESOLVER_KEY,
+          }),
+        ).rejects.toThrow(/resolverUrl/)
+      })
+    }
+
+    it('admits loopback when SEARCH_ALLOW_LOCAL_FETCH is set — one machine, one host', async () => {
+      process.env.SEARCH_ALLOW_LOCAL_FETCH = '1'
+      try {
+        const summary = await registry.setEndpointSource(CLIENT, {
+          kind: 'mirrored',
+          resolverUrl: 'http://127.0.0.1:3000/api/search/resolve-endpoint',
+          resolverKey: RESOLVER_KEY,
+        })
+        expect(summary).toMatchObject({
+          kind: 'mirrored',
+          resolverUrl: 'http://127.0.0.1:3000/api/search/resolve-endpoint',
+        })
+      } finally {
+        delete process.env.SEARCH_ALLOW_LOCAL_FETCH
+      }
+    })
+
+    it('writes nothing when the URL is refused', async () => {
+      // The loopback declaration above is still what the column holds: a
+      // refusal happens before the `UPDATE`.
+      const declaration = await registry.getEndpointSourceDeclaration(CLIENT)
+      expect(declaration).toMatchObject({ kind: 'mirrored' })
+      await expect(
+        registry.setEndpointSource(CLIENT, {
+          kind: 'mirrored',
+          resolverUrl: 'https://10.0.0.5/resolve-endpoint',
+          resolverKey: RESOLVER_KEY,
+        }),
+      ).rejects.toThrow(/resolverUrl/)
+      expect(await registry.getEndpointSourceDeclaration(CLIENT)).toEqual(declaration)
+    })
+  })
+
+  describe('a sealed credential that will not open', () => {
+    it('is a terminal typed failure rather than a cipher error', async () => {
+      // A rotated `SEARCH_ENCRYPTION_KEY`, in the only shape a test can make
+      // one: a ciphertext this key did not seal. Untyped it reaches the worker
+      // as "this job failed" and burns five attempts against a ciphertext that
+      // will not open on the fifth either (ADR 0010 D7).
+      await expect(
+        registry.openResolver(CLIENT, {
+          kind: 'mirrored',
+          resolverUrl: 'https://studio.example/api/search/resolve-endpoint',
+          resolverKeyCiphertext: `${'0'.repeat(32)}:deadbeef:${'1'.repeat(32)}`,
+          resolverScope: null,
+        }),
+      ).rejects.toMatchObject({
+        name: 'EndpointKeyUnavailableError',
+        reason: 'decrypt-failed',
+        retryable: false,
+        pairedClientId: CLIENT,
+      })
+    })
+  })
+
+  describe('a write invalidates that client’s resolved keys', () => {
+    it('drops the cached key when the source is re-declared', async () => {
+      const mirrored = await import('./mirrored-endpoint-source.ts')
+      mirrored.clearResolvedKeyCache()
+
+      const [pushed] = await registry.upsertMirroredEndpoints(CLIENT, [
+        {
+          externalId: `${PREFIX}-cache-endpoint`,
+          kind: 'embedding',
+          provider: 'openai',
+          template: 'openai',
+          model: 'text-embedding-3-small',
+          dimensions: 1536,
+        },
+      ])
+
+      const source = new mirrored.MirroredEndpointSource(
+        CLIENT,
+        { resolverUrl: 'https://studio.example/api/search/resolve-endpoint', resolverKey: 'x' },
+        {
+          fetchImpl: async () =>
+            new Response(
+              JSON.stringify({
+                apiKey: 'sk-live-cached-for-a-minute',
+                provider: 'openai',
+                model: 'text-embedding-3-small',
+              }),
+              { status: 200 },
+            ),
+        },
+      )
+      await source.embedding({ endpointId: pushed!.id })
+      expect(mirrored.resolvedKeyCacheSize()).toBe(1)
+
+      // The declaration changes. A minute of serving keys fetched under the old
+      // one is not a long time and is still the wrong answer to "I have just
+      // revoked that".
+      await registry.setEndpointSource(CLIENT, {
+        kind: 'mirrored',
+        resolverUrl: 'https://studio.example/api/search/resolve-endpoint',
+        resolverKey: `${RESOLVER_KEY}-rotated`,
+      })
+      expect(mirrored.resolvedKeyCacheSize()).toBe(0)
+    })
+
+    it('drops it when the endpoint is deleted, and when the catalog is re-pushed', async () => {
+      const mirrored = await import('./mirrored-endpoint-source.ts')
+      const push = async () =>
+        (
+          await registry.upsertMirroredEndpoints(CLIENT, [
+            {
+              externalId: `${PREFIX}-cache-endpoint-2`,
+              kind: 'embedding',
+              provider: 'openai',
+              template: 'openai',
+              model: 'text-embedding-3-small',
+              dimensions: 1536,
+            },
+          ])
+        )[0]!
+      const pushed = await push()
+      const source = new mirrored.MirroredEndpointSource(
+        CLIENT,
+        { resolverUrl: 'https://studio.example/api/search/resolve-endpoint', resolverKey: 'x' },
+        {
+          fetchImpl: async () =>
+            new Response(
+              JSON.stringify({
+                apiKey: 'sk-live-cached-for-a-minute',
+                provider: 'openai',
+                model: 'text-embedding-3-small',
+              }),
+              { status: 200 },
+            ),
+        },
+      )
+
+      await source.embedding({ endpointId: pushed.id })
+      expect(mirrored.resolvedKeyCacheSize()).toBe(1)
+      await push()
+      expect(mirrored.resolvedKeyCacheSize()).toBe(0)
+
+      await source.embedding({ endpointId: pushed.id })
+      expect(mirrored.resolvedKeyCacheSize()).toBe(1)
+      expect(await registry.deleteEndpoint(CLIENT, pushed.id)).toBe(true)
+      expect(mirrored.resolvedKeyCacheSize()).toBe(0)
+    })
+  })
+
+  describe('one client’s endpoint id does not resolve for another', () => {
+    it('is refused by the source layer, not only by the route', async () => {
+      // Two clients, one endpoint id. The route is the primary check — a caller
+      // may only name a KB its certificate owns (ADR 0003) — and this is the
+      // second thing standing between an id that got past it and somebody
+      // else's key.
+      const OTHER = `${PREFIX}-other-client`
+      await db.insert(pairedClient).values({
+        id: OTHER,
+        label: `${PREFIX} other`,
+        certSerial: `${PREFIX}-other-serial`,
+        certFingerprint: `${PREFIX}-other-fingerprint`,
+        scope: 'admin',
+        status: 'active',
+        createdAt: new Date(),
+      })
+      try {
+        const mine = await registry.createLocalEndpoint(
+          CLIENT,
+          {
+            kind: 'embedding',
+            provider: 'openai',
+            template: 'openai',
+            model: 'text-embedding-3-small',
+            dimensions: 1536,
+          },
+          'sk-live-mine-and-nobody-elses',
+        )
+
+        const { RoutingEndpointSource } = await import('./routing-endpoint-source.ts')
+        const routing = new RoutingEndpointSource()
+
+        // The owner gets it.
+        await expect(
+          routing.embedding({ endpointId: mine.id, pairedClientId: CLIENT }),
+        ).resolves.toMatchObject({ id: mine.id })
+
+        // The other client does not, and is told so terminally.
+        await expect(
+          routing.embedding({ endpointId: mine.id, pairedClientId: OTHER }),
+        ).rejects.toMatchObject({
+          name: 'EndpointKeyUnavailableError',
+          reason: 'client-mismatch',
+          retryable: false,
+        })
+      } finally {
+        await db.delete(pairedClient).where(eq(pairedClient.id, OTHER)).catch(() => {})
+      }
+    })
+  })
 })

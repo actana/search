@@ -40,7 +40,7 @@
  * through `scrubSecret` first.
  */
 
-import { Job, Worker, type Processor } from 'bullmq'
+import { Job, UnrecoverableError, Worker, type Processor } from 'bullmq'
 import { and, eq, inArray } from 'drizzle-orm'
 import { createLogger } from '@actana/search-shared/log'
 import { config } from './config.ts'
@@ -55,6 +55,7 @@ import {
   type JobType,
 } from './queue/index.ts'
 import { emitSearchEvent, eventTimestamp } from './events.ts'
+import { assertEncryptionKeyConfigured } from './core/security/encryption.ts'
 import {
   isEndpointKeyUnavailable,
   type EndpointKeyUnavailableError,
@@ -154,10 +155,86 @@ async function withTimeout<T>(
 }
 
 /**
+ * A job this build cannot run, whatever happens next: a name it does not know,
+ * a payload missing something it needs.
+ *
+ * Its own type so it can be *classified*. Thrown as a plain `Error` it is
+ * indistinguishable from "the provider timed out", and BullMQ spends the job's
+ * attempts re-reading the same malformed payload before reporting the same
+ * thing. Fields are assigned in the body rather than as constructor parameter
+ * properties: Node's type stripping cannot erase those
+ * (`scripts/check-strip-types.mjs`).
+ */
+export class NotRunnableJobError extends Error {
+  override readonly name = 'NotRunnableJobError'
+}
+
+/** The typed key failure in `error`, or in its `cause`, or null. */
+function endpointKeyFailureOf(error: unknown): EndpointKeyUnavailableError | null {
+  if (isEndpointKeyUnavailable(error)) return error
+  const cause = (error as { cause?: unknown } | null | undefined)?.cause
+  return isEndpointKeyUnavailable(cause) ? cause : null
+}
+
+/**
+ * Could a later attempt of this job succeed?
+ *
+ * The question ADR 0010 says only the code that failed can answer, asked at the
+ * one place that has to act on it. Three shapes say no: a job that is not
+ * runnable at all, a key failure whose `reason` is terminal (the client forgot
+ * the endpoint, the credential will not decrypt, the resolver names another
+ * model, the row is another client's), and an error that has already been
+ * marked unrecoverable.
+ */
+export function isTerminalJobFailure(error: unknown): boolean {
+  if (error instanceof NotRunnableJobError) return true
+  if (error instanceof UnrecoverableError) return true
+  const keyFailure = endpointKeyFailureOf(error)
+  return keyFailure !== null && !keyFailure.retryable
+}
+
+/**
+ * Re-throw a terminal failure as the only thing BullMQ reads: `UnrecoverableError`.
+ *
+ * Without this the classification was advice. `handleJobFailure` knew perfectly
+ * well that a resolver answering `404 unknown-endpoint` would answer the same
+ * on the fifth attempt, marked the document `failed` on the first — and BullMQ,
+ * which has never heard of `retryable`, re-queued the job anyway. Every attempt
+ * then ran a full ingest against a stale mirror to arrive at the same 404: five
+ * resolver round trips, five parses, and (until the rebase onto TASK-004's
+ * `documentId` payload) five document rows for one document.
+ *
+ * The original error is kept as the `cause` rather than discarded: it carries
+ * the `reason` that `handleJobFailure` puts in the log line and in
+ * `document.failed`, and the operator's sentence is the whole point of ADR 0010.
+ */
+function asBullMqFailure(error: unknown): unknown {
+  if (error instanceof UnrecoverableError) return error
+  if (!isTerminalJobFailure(error)) return error
+  const message = error instanceof Error ? error.message : String(error)
+  const unrecoverable = new UnrecoverableError(message)
+  unrecoverable.cause = error
+  if (error instanceof Error && error.stack) unrecoverable.stack = error.stack
+  return unrecoverable
+}
+
+/**
  * The processor. Exported so a unit test can drive it with a fake job rather
  * than a Redis.
+ *
+ * One `try` around the routing table, and it is not cosmetic: it is where a
+ * terminal failure stops being a retry (see {@link asBullMqFailure}).
  */
 export const processSearchJob: Processor = async (job: Job): Promise<unknown> => {
+  try {
+    return await routeSearchJob(job)
+  } catch (err) {
+    throw asBullMqFailure(err)
+  }
+}
+
+/** The routing table itself. */
+async function routeSearchJob(job: Job): Promise<unknown> {
   const { payload } = (job.data ?? {}) as JobEnvelope
   logger.info('Job started', correlationOf(job))
 
@@ -201,7 +278,7 @@ export const processSearchJob: Processor = async (job: Job): Promise<unknown> =>
       // Not a retry: a name this build does not know will not become one on the
       // fourth attempt. It fails loudly so an operator sees a version skew
       // rather than a queue that silently grows.
-      throw new Error(`Unknown search job name: ${job.name}`)
+      throw new NotRunnableJobError(`Unknown search job name: ${job.name}`)
   }
 }
 
@@ -215,11 +292,13 @@ export const processSearchJob: Processor = async (job: Job): Promise<unknown> =>
  * `await`.
  */
 async function runKbIngestDocument(payload: KbIngestDocumentPayload): Promise<unknown> {
+  // Not runnable rather than failed: a payload that is missing its knowledge
+  // base is missing it on every attempt.
   if (!payload?.knowledgeBaseId || !payload.filename) {
-    throw new Error('kb.ingest.document: knowledgeBaseId and filename are required')
+    throw new NotRunnableJobError('kb.ingest.document: knowledgeBaseId and filename are required')
   }
   if (payload.text === undefined && !payload.fileUrl) {
-    throw new Error('kb.ingest.document: one of text or fileUrl is required')
+    throw new NotRunnableJobError('kb.ingest.document: one of text or fileUrl is required')
   }
 
   let file: Buffer | undefined
@@ -348,10 +427,12 @@ export async function handleJobFailure(job: Job | undefined, error: Error): Prom
     return
   }
 
-  const keyFailure = isEndpointKeyUnavailable(error)
-    ? (error as EndpointKeyUnavailableError)
-    : null
-  const willRetry = hasAttemptsLeft(job) && (keyFailure === null || keyFailure.retryable)
+  // Through the `cause` as well as the error itself: a terminal failure reaches
+  // here wrapped in `UnrecoverableError`, and the `reason` the operator needs
+  // is on what it wraps.
+  const keyFailure = endpointKeyFailureOf(error)
+  const terminal = isTerminalJobFailure(error)
+  const willRetry = !terminal && hasAttemptsLeft(job)
 
   const line = {
     ...correlationOf(job),
@@ -365,6 +446,7 @@ export async function handleJobFailure(job: Job | undefined, error: Error): Prom
           pairedClientId: keyFailure.pairedClientId,
         }
       : {}),
+    terminal,
     willRetry,
   }
 
@@ -531,21 +613,82 @@ export async function registerRepeatableJobs(): Promise<void> {
   }
 }
 
+/** Something else this process should close before it exits. */
+export interface ShutdownCloser {
+  /** What a log line calls it. */
+  name: string
+  close(): Promise<void>
+}
+
+/**
+ * Drain the workers, then close whatever else was handed over, in that order.
+ *
+ * Exported so the ordering can be asserted against fakes rather than against a
+ * real listener and a real Redis.
+ *
+ * **The order is the decision.** The worker goes first because a job in flight
+ * still needs the database and the queue, and a listener closed underneath it
+ * would turn a clean handover into the half-written document this whole
+ * function exists to avoid. The servers then close in the order they were
+ * given — the API before the admin socket, which is the order they were opened
+ * in, so the last thing to stop answering is the socket an operator would use
+ * to ask what is happening.
+ *
+ * Every close is best-effort and independent: one listener that will not shut
+ * down must not leave the next one open, and a shutdown that throws is a
+ * container that gets killed instead.
+ */
+export async function drainAndClose(
+  workers: SearchWorkers | null,
+  closers: readonly ShutdownCloser[] = []
+): Promise<void> {
+  if (workers) {
+    try {
+      await workers.close()
+    } catch (err) {
+      logger.error('Error draining the workers', {
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+  for (const closer of closers) {
+    try {
+      await closer.close()
+      logger.info('Closed', { what: closer.name })
+    } catch (err) {
+      logger.error('Error closing a listener', {
+        what: closer.name,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+}
+
 /**
  * Install SIGTERM/SIGINT handlers that drain rather than kill.
  *
  * A worker killed mid-job leaves a document in `processing` until the sweep
  * finds it, which is minutes of a UI spinning for something that could have
  * been a clean handover.
+ *
+ * `closers` is what the *combined* process hands over (ADR 0010 D2). Draining
+ * the worker and then calling `process.exit(0)` was right for `start:worker`
+ * and wrong for `index.ts`, where the same function also owned the API listener
+ * and the admin socket: the exit closed neither, so an in-flight request was
+ * cut mid-response and the socket file survived at `$SEARCH_STATE_DIR/admin.sock`
+ * for the next boot to trip over. `admin.close()` unlinks it, which is why the
+ * fix is to *call* the closers rather than to add an unlink here.
  */
-export function installShutdownHandlers(workers: SearchWorkers): void {
+export function installShutdownHandlers(
+  workers: SearchWorkers | null,
+  closers: readonly ShutdownCloser[] = []
+): void {
   let stopping = false
   const stop = (signal: string) => {
     if (stopping) return
     stopping = true
     logger.info(`Received ${signal}; draining`)
-    workers
-      .close()
+    drainAndClose(workers, closers)
       .then(() => process.exit(0))
       .catch((err: unknown) => {
         logger.error('Shutdown failed', {
@@ -560,6 +703,11 @@ export function installShutdownHandlers(workers: SearchWorkers): void {
 
 /** `start:worker` — the worker with no API beside it. */
 export async function bootWorker(): Promise<SearchWorkers> {
+  // Before the migrations and before the queue. A worker with no
+  // `SEARCH_ENCRYPTION_KEY` starts happily and then fails every job that needs
+  // a mirrored key, one cipher error at a time; it is required in both modes
+  // (ADR 0010 D7), so the right place to say so is here.
+  assertEncryptionKeyConfigured()
   const { runMigrations } = await import('./db/migrate.ts')
   const { databaseUrl } = await import('./config.ts')
   // The worker migrates too. A split deployment where only the API migrates is

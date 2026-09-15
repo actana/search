@@ -40,8 +40,10 @@ import { generateId } from '@actana/search-shared/short-id'
 import { db } from '../db/client.ts'
 import { modelEndpoint, pairedClient } from '../db/schema.ts'
 import { encryptSecret, decryptSecret } from '../core/security/encryption.ts'
+import { validateExternalUrl } from '../core/security/url-guard.ts'
 import { LocalEndpointSource } from './local-endpoint-source.ts'
 import {
+  invalidateResolvedKeysFor,
   MirroredEndpointSource,
   type MirroredEndpointSourceOptions,
   type MirroredResolver,
@@ -158,6 +160,17 @@ export async function setEndpointSource(
   if (updated.length === 0) {
     throw new Error(`setEndpointSource: no paired client ${clientId}`)
   }
+  /**
+   * Forget what was resolved under the old declaration.
+   *
+   * The resolved-key cache is keyed `(clientId, externalId)` and knows nothing
+   * about which resolver produced the entry. A client that has just declared a
+   * new resolver URL, or rotated the internal credential behind the old one,
+   * would otherwise keep being handed keys fetched with the old one for the
+   * rest of the TTL — which makes "I have revoked that" take a minute to be
+   * true. It is a minute, and it is still the wrong answer.
+   */
+  invalidateResolvedKeysFor(clientId)
   // The URL, never the credential, and never the scope's *value* at info.
   logger.info('Endpoint source declared', { pairedClientId: clientId, kind: declaration.kind })
   return summariseSource(stored)
@@ -210,7 +223,28 @@ export async function openResolver(
       { reason: 'not-configured', pairedClientId: clientId }
     )
   }
-  const { decrypted } = await decryptSecret(stored.resolverKeyCiphertext)
+  /**
+   * A credential that will not open is a **terminal** failure, not a generic
+   * throw.
+   *
+   * `decryptSecret` throws whatever the cipher threw — an absent or wrong
+   * `SEARCH_ENCRYPTION_KEY`, or a rotation without a re-seal (ADR 0010 D7).
+   * Untyped, that reaches the worker as "this job failed" and burns five
+   * attempts against a ciphertext that will not open on the fifth either. Typed
+   * `decrypt-failed`, the worker refuses it once and the operator is told which
+   * client cannot be opened.
+   */
+  let decrypted: string
+  try {
+    ;({ decrypted } = await decryptSecret(stored.resolverKeyCiphertext))
+  } catch (err) {
+    throw new EndpointKeyUnavailableError(
+      `the sealed resolver credential for paired client ${clientId} could not be opened — ` +
+        `SEARCH_ENCRYPTION_KEY is absent, is not the key it was sealed with, or was rotated ` +
+        `without re-sealing the declaration`,
+      { reason: 'decrypt-failed', pairedClientId: clientId, cause: err }
+    )
+  }
   return {
     resolverUrl: stored.resolverUrl,
     resolverKey: decrypted,
@@ -293,6 +327,10 @@ export async function upsertMirroredEndpoints(
       .returning({ id: modelEndpoint.id, externalId: modelEndpoint.externalId })
     out.push({ id: row.id, externalId: row.externalId ?? externalId })
   }
+  // A re-pushed catalog may have moved an `externalId` to a different endpoint,
+  // or turned a local row into a mirror. Either way what was cached for this
+  // client was resolved against the catalog that has just been replaced.
+  invalidateResolvedKeysFor(clientId)
   logger.info('Mirrored endpoints upserted', { pairedClientId: clientId, count: out.length })
   return out
 }
@@ -363,6 +401,9 @@ export async function deleteEndpoint(clientId: string, endpointId: string): Prom
       and(eq(modelEndpoint.pairedClientId, clientId), eq(modelEndpoint.id, endpointId))
     )
     .returning({ id: modelEndpoint.id })
+  // A deleted endpoint's key must stop being served now rather than in a
+  // minute: deleting it is the only way an operator has to say so.
+  if (removed.length > 0) invalidateResolvedKeysFor(clientId)
   return removed.length > 0
 }
 
@@ -410,6 +451,27 @@ async function sealDeclaration(
     throw new Error(
       `setEndpointSource: a resolver is reached over http(s) — "${parsed.protocol}" is not`
     )
+  }
+  /**
+   * The SSRF guard, at the moment the URL is **declared** and not only at the
+   * moment it is dialled.
+   *
+   * This is the one URL in the service a client chooses and Search dials, and
+   * it is dialled with an internal credential in a header. `http(s)` was the
+   * whole of the check before, which accepted `http://169.254.169.254/latest/…`
+   * and `http://10.0.0.5/` — the instance's own metadata service and the
+   * operator's internal network, reachable from inside the deployment and from
+   * nowhere else. Refusing at declaration is what makes that a 400 to the
+   * client that asked for it rather than a failed job three days later.
+   *
+   * The guard's own switch is what a single-machine deployment sets:
+   * `SEARCH_ALLOW_LOCAL_FETCH=1` re-admits loopback (and plain `http` to it),
+   * which is what the fixture suites run with and what an operator running
+   * Studio and Search on one host needs. Off, it is https to a public address.
+   */
+  const allowed = validateExternalUrl(url, 'resolverUrl')
+  if (!allowed.isValid) {
+    throw new Error(`setEndpointSource: ${allowed.error}`)
   }
   if (!declaration.resolverKey) {
     throw new Error('setEndpointSource: a mirrored source needs a resolverKey')

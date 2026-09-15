@@ -45,8 +45,20 @@ const schema = z.object({
   SEARCH_S3_FORCE_PATH_STYLE: booleanish.default(true),
 
   /**
-   * 32 bytes of hex. Seals provider keys held locally (ADR 0004). In wired
-   * mode nothing is sealed here because nothing is stored here.
+   * 32 bytes of hex, and **required in both modes**.
+   *
+   * Standalone it seals the provider keys in `model_endpoint.key_ciphertext`
+   * (ADR 0004). Wired, none of those is stored — but the *resolver credential*
+   * in `paired_client.endpoint_source` is, and that is the credential which
+   * fetches provider keys, which makes it the more valuable of the two
+   * (ADR 0010 D7). The comment here used to say "in wired mode nothing is
+   * sealed here because nothing is stored here", which was true of ADR 0004 and
+   * stopped being true when the declaration got a column.
+   *
+   * Optional in the schema and asserted at boot instead
+   * (`assertEncryptionKeyConfigured`), so that a test which touches neither
+   * still needs no key while a *service* that starts without one stops at boot
+   * rather than at the first seal.
    */
   SEARCH_ENCRYPTION_KEY: z.string().optional(),
 

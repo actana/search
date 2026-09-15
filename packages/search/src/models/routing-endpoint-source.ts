@@ -23,7 +23,10 @@ import { eq } from 'drizzle-orm'
 import { db } from '../db/client.ts'
 import { modelEndpoint } from '../db/schema.ts'
 import { LocalEndpointSource } from './local-endpoint-source.ts'
-import { MirroredEndpointSource } from './mirrored-endpoint-source.ts'
+import {
+  assertEndpointOwner,
+  MirroredEndpointSource,
+} from './mirrored-endpoint-source.ts'
 import {
   getEndpointSourceDeclaration,
   getEndpointSourceFor,
@@ -39,12 +42,12 @@ import type {
 
 export class RoutingEndpointSource implements ModelEndpointSource {
   async embedding(binding: EndpointBinding): Promise<EmbeddingEndpoint> {
-    const source = await this.forEndpoint(binding.endpointId)
+    const source = await this.forEndpoint(binding)
     return source.embedding(binding)
   }
 
   async inference(binding: EndpointBinding): Promise<InferenceEndpoint | null> {
-    const source = await this.forEndpoint(binding.endpointId)
+    const source = await this.forEndpoint(binding)
     return source.inference(binding)
   }
 
@@ -59,17 +62,31 @@ export class RoutingEndpointSource implements ModelEndpointSource {
    * A row that is not there at all is left to the concrete source to report:
    * `LocalEndpointSource` already has the message, and duplicating it here
    * would be two spellings of one failure.
+   *
+   * **The row's client is checked against the binding's, when the binding has
+   * one.** This is where the endpoint id stops being enough on its own: the
+   * select is by `id`, which is what lets the engine's lifted call sites work
+   * at all (ADR 0004's seam), and it is therefore also what would serve one
+   * client another's key if an id got past the route. The primary check is at
+   * the route — a caller may only name a KB its certificate owns — and this is
+   * the second one. See `assertEndpointOwner`.
    */
-  private async forEndpoint(endpointId: string): Promise<ModelEndpointSource> {
+  private async forEndpoint(binding: EndpointBinding): Promise<ModelEndpointSource> {
+    const endpointId = binding.endpointId
     const rows = await db
       .select({
+        id: modelEndpoint.id,
         pairedClientId: modelEndpoint.pairedClientId,
+        externalId: modelEndpoint.externalId,
         source: modelEndpoint.source,
       })
       .from(modelEndpoint)
       .where(eq(modelEndpoint.id, endpointId))
       .limit(1)
     const row = rows[0]
+    // Local rows too: an id that belongs to somebody else is refused whichever
+    // source would have answered it.
+    if (row) assertEndpointOwner(row, binding.pairedClientId)
     if (!row || row.source !== 'mirrored') return new LocalEndpointSource()
 
     /**

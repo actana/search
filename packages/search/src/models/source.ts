@@ -22,9 +22,23 @@ export type InferenceEndpoint = WorkspaceInferenceEndpoint
  * What a KB is bound to. `endpointId` is Search's own id for the endpoint row;
  * for a mirrored endpoint that row also carries the paired client's
  * `external_id`, which is what the resolver is asked about.
+ *
+ * `pairedClientId` is **defence in depth**, and optional for that reason. The
+ * primary check is at the route: a caller may only name a KB its certificate
+ * owns (ADR 0003), and an endpoint id reaches this layer only through a KB row
+ * that has already been scoped to the caller. But an endpoint id is selected
+ * here by `id` alone, so a caller that did get one of another client's ids past
+ * the route would be served that client's key. When the id is passed, the
+ * source refuses a row whose `paired_client_id` is not it —
+ * `EndpointKeyUnavailableError` with reason `client-mismatch`, which is
+ * terminal. Absent, the check is simply not made: the engine's lifted call
+ * sites have an endpoint id and no client, which is what ADR 0004's seam is
+ * for, and inventing one here would be guessing.
  */
 export interface EndpointBinding {
   endpointId: string
+  /** The client the caller was authenticated as, when there is one. */
+  pairedClientId?: string | null
 }
 
 export interface ModelEndpointSource {

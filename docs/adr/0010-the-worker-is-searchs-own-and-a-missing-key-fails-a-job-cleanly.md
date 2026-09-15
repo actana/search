@@ -81,11 +81,16 @@ worker starts first half the time.
 
 **D3 — A key that cannot be resolved is its own error type.**
 `EndpointKeyUnavailableError`, thrown by `MirroredEndpointSource`, carrying a
-`reason` and a `retryable` derived from it. Three reasons are terminal:
-`not-configured` (the client declared no resolver), `not-mirrored` (a pushed row
-with no external id) and `unknown-endpoint` (the resolver answered 404 — the
-mirror is stale). Everything else — `unauthorized`, `resolver-error`, `timeout`,
-`unreachable`, `malformed` — is transient.
+`reason` and a `retryable` derived from it. Terminal are the reasons that are a
+*decision* rather than weather: `not-configured` (the client declared no
+resolver), `not-mirrored` (a pushed row with no external id),
+`unknown-endpoint` (the resolver answered 404 — the mirror is stale), `refused`
+(the URL is not one this instance may fetch, or it answered with a redirect —
+D9), `decrypt-failed` (the sealed resolver credential will not open — D7),
+`model-mismatch` (the resolver named another model — D9) and `client-mismatch`
+(the row belongs to another paired client — D8). Everything else —
+`unauthorized`, `resolver-error`, `timeout`, `unreachable`, `malformed` — is
+transient.
 
 `unauthorized` is deliberately on the transient side. A 401 from the resolver is
 most often a key that was rotated a moment ago and is about to be pushed, and the
@@ -107,6 +112,22 @@ in the failure handler would replace one failure with another.
 A transient failure that will retry is logged at **warn**, not error. A wired
 client's rolling restart must not read as an incident in Search's logs.
 
+**A terminal reason is re-thrown as BullMQ's `UnrecoverableError`.** "Whatever
+the attempt number" was, for a while, a claim the queue never heard: the failure
+handler knew a `404 unknown-endpoint` would say the same thing on the fifth
+attempt, marked the document `failed` on the first — and BullMQ, which has never
+heard of `retryable`, re-queued the job anyway. Every attempt then ran a whole
+ingest against a stale mirror to arrive at the same 404. So the processor
+classifies before it re-throws (`isTerminalJobFailure`), and a terminal failure
+leaves it as an `UnrecoverableError` carrying the original as its `cause` — the
+`cause` because the `reason` on it is the operator's sentence, and discarding it
+to satisfy a type would trade the whole point of D3 for a retry.
+
+Two other things are terminal for the same reason and were not typed at all: a
+job name this build does not know, and a payload with no knowledge base id.
+Both are `NotRunnableJobError`, which is the same decision wearing a different
+name.
+
 **D5 — The key is resolved per job, and its whole life is a cache entry.**
 Sixty seconds, in memory, keyed `(clientId, externalId)`, with concurrent misses
 for one key collapsed into one resolver call. Not a column, not a file, not a log
@@ -118,6 +139,22 @@ the client's HTTP stack part of the hot path — the coupling the split exists t
 remove. Longer and a key rotated on the client side keeps working here after it
 has stopped working there. A minute is short enough that a rotation is picked up
 within one and long enough that the resolver is a control-plane call.
+
+**A minute is the staleness budget, not the revocation budget.** The cache knows
+nothing about which declaration produced an entry, so a client that re-declared
+its resolver or deleted an endpoint was still served keys fetched under the old
+one until the TTL ran out. A minute is not a long time and it is still the wrong
+answer to "I have just revoked that": `setEndpointSource`,
+`upsertMirroredEndpoints` and `deleteEndpoint` now drop that client's entries
+outright, in-flight resolutions included.
+
+And the TTL is not what keeps the map *small*, which is a separate thing that
+was missing. An entry nobody reads again is an entry nobody notices has expired,
+so an instance whose clients churn `externalId`s — a catalog re-pushed with new
+ids — accumulated one live provider key per id for the life of the process, and
+a worker process lives for weeks. The sweep runs on insert, which is the only
+moment the map grows, drops what has expired, and enforces a hard cap by
+evicting the entries closest to expiry.
 
 **D6 — Nothing thrown from the resolving path carries a key, and that is
 tested.** Two rules, belt and braces: the resolver client never interpolates a
@@ -138,6 +175,30 @@ makes it the more valuable of the two, and a column a `SELECT *` could print is
 not where it goes. This widens ADR 0004's "in wired mode nothing is sealed here":
 nothing *of the client's provider keys* is, and this still is.
 
+Which makes the key a **boot requirement in both processes**, and it now is:
+`index.ts` and `bootWorker` both call `assertEncryptionKeyConfigured()` before
+anything else and refuse to start without 64 hex characters. It used to be
+checked at the first *use* — the first `PUT /v1/endpoints`, the first job that
+needed a mirrored key — so an instance with no key paired, served health, and
+reported a cipher error hours later to whoever happened to be adding an
+endpoint. The check is hex-shaped rather than merely 64 characters long, because
+`Buffer.from(key, 'hex')` stops at the first character that is not hex and hands
+back a short key without complaining.
+
+**And the envelope carries no key version, so rotation means re-sealing.** The
+ciphertext is `iv:ciphertext:authTag`, all hex, byte for byte Studio's format —
+because the phase-4 data move copies sealed endpoint keys across and a different
+envelope would make every one of them unreadable
+(`core/security/encryption.ts`). There is no room in it for a key id, which is
+the cost of that compatibility, and it is named here rather than mitigated:
+changing `SEARCH_ENCRYPTION_KEY` re-seals nothing, so every
+`model_endpoint.key_ciphertext` and every
+`paired_client.endpoint_source.resolverKeyCiphertext` sealed under the old key
+stops opening. A rotation is therefore a migration — decrypt with the old key,
+encrypt with the new, in one transaction — and not a variable change. Without
+one, what an operator gets is `decrypt-failed`, which is a *terminal* reason
+(D3, D4) precisely so that they are told once per job instead of five times.
+
 **D8 — The endpoint source is chosen per row, not per process.** There is no
 "wired mode" flag. `model_endpoint` carries both `paired_client_id` and `source`,
 so an endpoint id is enough to decide which source resolves it
@@ -145,12 +206,82 @@ so an endpoint id is enough to decide which source resolves it
 wired one at the same time. The engine's call sites — which have an endpoint id
 and no notion of a client — are unchanged, which is what ADR 0004's seam was for.
 
+The corollary is that an endpoint row is selected by `id` **alone**, which is
+also the one thing that could serve one client another client's key. The route
+is the primary check — a caller may only name a KB its certificate owns
+(ADR 0003) — and the source layer is the second: when a binding carries a paired
+client id, a row belonging to anyone else is refused with `client-mismatch`,
+terminally. The id is optional on the binding because the engine's lifted call
+sites do not have one, and inventing a client there would be guessing rather
+than checking.
+
+**D9 — The resolver is dialled through the SSRF guard, and believed only about
+the key.** The resolver URL is the one URL in this service that a *client*
+chooses and Search dials, with an internal credential in a header — so it goes
+through `core/security/url-guard.ts` (`validateExternalUrl` at declaration,
+`secureFetch` at the call) and not through `fetch`. Three reasons, and none of
+them is theoretical:
+
+* `fetch` defaults to `redirect: 'follow'`, and Node follows a `307` to another
+  host carrying the `x-api-key` header and the POST body with it. That is the
+  credential handed to whoever controls the redirect. `maxRedirects: 0`: a
+  resolver that redirects is misconfigured, not a hop.
+* `http(s)` was the whole of the declaration check, which accepted
+  `http://169.254.169.254/latest/…` and `http://10.0.0.5/` — the instance's own
+  metadata service and the operator's internal network, reachable from inside
+  the deployment and from nowhere else. Refused at declaration now, which makes
+  it a `400` to the client that asked rather than a failed job three days later.
+* The answer was `await response.json()` with no cap. A resolver that answers
+  `200` and then streams was a held worker slot and a growing heap;
+  `maxResponseBytes` is 8 KB, and a resolution is a few hundred bytes.
+
+A refused URL is `refused` — terminal, because the next attempt is refused for
+the same reason. `SEARCH_ALLOW_LOCAL_FETCH=1` is the guard's own switch and
+re-admits loopback for a single-machine deployment and for the fixture suites;
+it is off unless set.
+
+And the answer's `model`, `provider` and `baseUrl` are now checked against the
+mirror row rather than preferred over it. `resolved.model ?? row.model` is a
+plausible line that quietly changes what a corpus *means*: a KB's partition is a
+table with a vector column sized to the dimension the client declared when it
+pushed the row, so a resolver answering with a different model embeds the next
+chunks into a different space in the same table, at a width that may well fit.
+Nothing downstream can notice. For an embedding endpoint a disagreement about the
+model or the provider is therefore `model-mismatch` and terminal; a disagreement
+about the base URL is a warning and the row's value, because moving a deployment
+behind a new URL is a thing clients legitimately do and it does not move the
+embedding space on its own. An inference endpoint has no partition to corrupt
+and only warns.
+
+**D10 — One image, two roles, and the probe knows which.** The split deployment
+(D2) runs the *same image* a second time with `command: [… worker.ts]` and
+`ports: []`, and the image carries a single Docker `HEALTHCHECK`, which probed
+`GET /v1/health`. A worker container serves nothing, so it was permanently
+unhealthy while working perfectly: `--wait` never returns, a
+`depends_on: service_healthy` never fires, and an orchestrator restarts a
+healthy worker in a loop.
+
+`healthcheck: { disable: true }` on the worker service would have been one line,
+and it buys a container with no liveness signal at all. Instead
+`SEARCH_ROLE=worker` switches `deploy/healthcheck.mjs` to `PING` the Redis the
+worker dials — hand-rolled RESP over a socket, because the probe must not depend
+on anything a `--prod` install could leave out. Queue *depth* is deliberately
+not part of it: a backlog is a capacity problem and restarting the container is
+the wrong answer to it.
+
 ## Consequences
 
 A client's outage is a delay and a warning line. A client's *mistake* — an
 endpoint it deleted and did not un-push — is a failed document with a reason
 that names it. Those are different sentences and the operator gets the right
 one.
+
+A `SIGTERM` is a handover rather than a kill, and in the combined process that
+now includes the listeners: the worker drains first — a job in flight still
+needs the database and the queue — then the API closes, then the admin listener,
+which unlinks its socket. Draining the worker and calling `process.exit(0)` used
+to leave both open, so an in-flight request was cut mid-response and
+`$SEARCH_STATE_DIR/admin.sock` survived for the next boot to trip over.
 
 The costs are named rather than mitigated. **The retry window is finite**: a
 resolver down for longer than five attempts of exponential backoff will fail

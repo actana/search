@@ -19,7 +19,7 @@
  * @vitest-environment node
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Job } from 'bullmq'
+import { UnrecoverableError, type Job } from 'bullmq'
 
 const handlers = vi.hoisted(() => ({
   planDocumentEmbedding: vi.fn(async () => 'planned'),
@@ -37,6 +37,15 @@ const handlers = vi.hoisted(() => ({
 // failure handler, both of which are plain functions.
 vi.mock('bullmq', () => ({
   Job: class {},
+  // The real one is what BullMQ checks to decide not to retry
+  // (`classes/job.js`: `err instanceof UnrecoverableError || err.name ==
+  // 'UnrecoverableError'`). The stand-in keeps the name for the same reason.
+  UnrecoverableError: class UnrecoverableError extends Error {
+    constructor(message?: string) {
+      super(message)
+      this.name = 'UnrecoverableError'
+    }
+  },
   Worker: class {
     on() {
       return this
@@ -79,7 +88,14 @@ vi.mock('./kb/ingest.ts', () => ({ ingestDocument: handlers.ingestDocument }))
 
 import { clearSearchEventListeners, onSearchEvent, type SearchEvent } from './events.ts'
 import { EndpointKeyUnavailableError } from './models/endpoint-key-errors.ts'
-import { handleJobFailure, processSearchJob } from './worker.ts'
+import {
+  drainAndClose,
+  handleJobFailure,
+  isTerminalJobFailure,
+  NotRunnableJobError,
+  processSearchJob,
+  type SearchWorkers,
+} from './worker.ts'
 
 /** A BullMQ job, as much of one as the code under test reads. */
 function job(
@@ -297,5 +313,182 @@ describe('a failure retries or fails the document', () => {
         new Error('first failure')
       )
     ).resolves.toBeUndefined()
+  })
+})
+
+describe('a terminal failure is unrecoverable, not retried', () => {
+  /**
+   * The gap this describe closes. `handleJobFailure` has always known that a
+   * resolver answering `404 unknown-endpoint` would say the same on the fifth
+   * attempt — and BullMQ, which has never heard of `retryable`, re-queued the
+   * job anyway, because nothing turned the classification into the one thing it
+   * reads. Every attempt then ran a full ingest to arrive at the same 404.
+   */
+  const ingestJob = () =>
+    job('kb.ingest.document', {
+      knowledgeBaseId: 'kb-1',
+      filename: 'handbook.md',
+      text: '# Handbook',
+      documentId: 'doc-7',
+    })
+
+  it('re-throws a terminal key failure as UnrecoverableError, keeping the reason', async () => {
+    const original = new EndpointKeyUnavailableError('the client forgot it', {
+      reason: 'unknown-endpoint',
+      endpointId: 'ep-1',
+      externalId: 'ws-1',
+      pairedClientId: 'pc-1',
+    })
+    handlers.ingestDocument.mockRejectedValueOnce(original)
+
+    const err = (await processSearchJob(ingestJob())
+      .then(() => null)
+      .catch((e: unknown) => e)) as Error
+
+    expect(err).toBeInstanceOf(UnrecoverableError)
+    expect(err.name).toBe('UnrecoverableError')
+    // The message survives, so `failedReason` still names the resolver…
+    expect(err.message).toBe('the client forgot it')
+    // …and the typed reason survives on the cause, which is what the log line
+    // and `document.failed` read.
+    expect(err.cause).toBe(original)
+  })
+
+  for (const reason of ['refused', 'decrypt-failed', 'model-mismatch', 'client-mismatch'] as const) {
+    it(`treats ${reason} as terminal`, async () => {
+      handlers.ingestDocument.mockRejectedValueOnce(
+        new EndpointKeyUnavailableError(reason, { reason })
+      )
+      await expect(processSearchJob(ingestJob())).rejects.toBeInstanceOf(UnrecoverableError)
+    })
+  }
+
+  it('leaves a transient key failure exactly as it was thrown', async () => {
+    const original = new EndpointKeyUnavailableError('resolver 503', { reason: 'resolver-error' })
+    handlers.ingestDocument.mockRejectedValueOnce(original)
+    const err = await processSearchJob(ingestJob())
+      .then(() => null)
+      .catch((e: unknown) => e)
+    expect(err).toBe(original)
+    expect(err).not.toBeInstanceOf(UnrecoverableError)
+  })
+
+  it('leaves an ordinary error alone — a parse may well work on a retry', async () => {
+    const original = new Error('this PDF is a picture of a PDF')
+    handlers.ingestDocument.mockRejectedValueOnce(original)
+    await expect(processSearchJob(ingestJob())).rejects.toBe(original)
+  })
+
+  it('makes a job name this build does not know unrecoverable', async () => {
+    const err = (await processSearchJob(job('kb.something.new'))
+      .then(() => null)
+      .catch((e: unknown) => e)) as Error
+    expect(err).toBeInstanceOf(UnrecoverableError)
+    expect(err.cause).toBeInstanceOf(NotRunnableJobError)
+    expect(err.message).toMatch(/Unknown search job name/)
+  })
+
+  it('makes a payload that is missing its knowledge base unrecoverable', async () => {
+    const err = (await processSearchJob(job('kb.ingest.document', { filename: 'x.md' }))
+      .then(() => null)
+      .catch((e: unknown) => e)) as Error
+    expect(err).toBeInstanceOf(UnrecoverableError)
+    expect(err.message).toMatch(/knowledgeBaseId and filename are required/)
+  })
+
+  it('classifies through the wrapper as well as the raw error', () => {
+    const terminal = new EndpointKeyUnavailableError('gone', { reason: 'unknown-endpoint' })
+    const wrapped = new UnrecoverableError('gone')
+    wrapped.cause = terminal
+    expect(isTerminalJobFailure(terminal)).toBe(true)
+    expect(isTerminalJobFailure(wrapped)).toBe(true)
+    expect(isTerminalJobFailure(new NotRunnableJobError('nope'))).toBe(true)
+    expect(
+      isTerminalJobFailure(new EndpointKeyUnavailableError('503', { reason: 'resolver-error' }))
+    ).toBe(false)
+    expect(isTerminalJobFailure(new Error('weather'))).toBe(false)
+  })
+
+  it('still fails the document once, with the reason, when the failure is wrapped', async () => {
+    const target = { documentId: 'doc-7', knowledgeBaseId: 'kb-1' }
+    const terminal = new EndpointKeyUnavailableError('the mirror is stale', {
+      reason: 'unknown-endpoint',
+      endpointId: 'ep-1',
+    })
+    const wrapped = new UnrecoverableError(terminal.message)
+    wrapped.cause = terminal
+    const seen: SearchEvent[] = []
+    onSearchEvent((e) => seen.push(e))
+    queueUpdate([{ id: 'doc-7' }])
+    queueSelect([{ pairedClientId: 'pc-1' }])
+
+    // Attempt one of five: BullMQ will not give it a second, and neither does
+    // this.
+    await handleJobFailure(
+      job('kb.ingest.document', target, { attempts: 5, attemptsMade: 1 }),
+      wrapped
+    )
+
+    expect(handlers.update).toHaveBeenCalledOnce()
+    expect(seen).toEqual([
+      expect.objectContaining({
+        type: 'document.failed',
+        documentId: 'doc-7',
+        reason: 'unknown-endpoint',
+      }),
+    ])
+  })
+})
+
+describe('shutdown', () => {
+  /** A `SearchWorkers` that only records that it was drained. */
+  const fakeWorkers = (order: string[], fail = false): SearchWorkers => ({
+    workers: [],
+    close: async () => {
+      order.push('workers')
+      if (fail) throw new Error('the worker would not stop')
+    },
+  })
+
+  it('drains the worker first, then closes the listeners in the order given', async () => {
+    // The order is the decision: a job in flight still needs the database and
+    // the queue, so a listener closed underneath it would turn a clean handover
+    // into the half-written document the drain exists to avoid.
+    const order: string[] = []
+    await drainAndClose(fakeWorkers(order), [
+      { name: 'api', close: async () => void order.push('api') },
+      { name: 'admin', close: async () => void order.push('admin') },
+    ])
+    expect(order).toEqual(['workers', 'api', 'admin'])
+  })
+
+  it('closes the listeners when the workers are somewhere else', async () => {
+    // `SEARCH_WORKERS=off`: there was no shutdown handler at all before, so a
+    // SIGTERM left the API listener and the admin socket to the kill.
+    const order: string[] = []
+    await drainAndClose(null, [
+      { name: 'api', close: async () => void order.push('api') },
+      { name: 'admin', close: async () => void order.push('admin') },
+    ])
+    expect(order).toEqual(['api', 'admin'])
+  })
+
+  it('closes what it can when a worker or a listener will not stop', async () => {
+    const order: string[] = []
+    await expect(
+      drainAndClose(fakeWorkers(order, true), [
+        {
+          name: 'api',
+          close: async () => {
+            order.push('api')
+            throw new Error('a request would not finish')
+          },
+        },
+        { name: 'admin', close: async () => void order.push('admin') },
+      ])
+    ).resolves.toBeUndefined()
+    // The admin socket is still unlinked: one listener that will not shut down
+    // must not leave the next one open.
+    expect(order).toEqual(['workers', 'api', 'admin'])
   })
 })

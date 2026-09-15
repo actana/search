@@ -77,9 +77,15 @@ inventing language the project does not use, or there is a real gap to record.
   answering `{ apiKey, baseUrl?, provider, model }` or 404. `workspaceId` is the
   **client's** word, not Search's: Search echoes the `resolverScope` that client
   declared and does not know what it names (rule 5). The url, the credential
-  (sealed) and the scope are what `PUT /endpoints` records. A key it cannot
-  produce is an `EndpointKeyUnavailableError` — transient reasons retry the job,
-  terminal ones fail the Document (ADR 0010).
+  (sealed) and the scope are what `PUT /endpoints` records. **Only `apiKey` is
+  taken**: the other fields are compared against the mirror row and dropped,
+  because the row is what the client declared and a KB's Partition is sized to
+  the model it was declared with — for an embedding Endpoint a disagreement is
+  refused rather than followed. The url is dialled through the SSRF guard, so a
+  loopback or private-range resolver is refused when it is *declared* and a
+  redirect is never followed (ADR 0010 D9). A key it cannot produce is an
+  `EndpointKeyUnavailableError` — transient reasons retry the job, terminal ones
+  fail the Document (ADR 0010).
 
 **Template**
 : The request shape a provider speaks (`openai`, `cohere`, `voyage`, `google`,

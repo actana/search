@@ -43,19 +43,52 @@ export type EndpointKeyUnavailableReason =
   | 'timeout'
   /** The resolver could not be reached at all. */
   | 'unreachable'
-  /** A 200 that was not a resolution — no `apiKey`, or not JSON. */
+  /** A 200 that was not a resolution — no `apiKey`, not JSON, or too big. */
   | 'malformed'
+  /**
+   * The resolver URL is not one this instance may fetch. The SSRF guard
+   * (`core/security/url-guard.ts`) refused it: loopback, a private or reserved
+   * address, a blocked port, a non-http(s) scheme — or the resolver answered
+   * with a redirect, which is never followed.
+   */
+  | 'refused'
+  /**
+   * The sealed resolver credential could not be opened.
+   * `SEARCH_ENCRYPTION_KEY` is absent, is not the key the declaration was
+   * sealed with, or has been rotated without re-sealing (ADR 0010 D7).
+   */
+  | 'decrypt-failed'
+  /**
+   * The resolver answered naming a different model or provider than the mirror
+   * row declares. A KB's partition is sized to *its* model's dimension, so
+   * quietly embedding with another model is a corrupted index rather than a
+   * slow day (ADR 0005: behaviour is what the client declared).
+   */
+  | 'model-mismatch'
+  /** The endpoint row belongs to a paired client other than the caller's. */
+  | 'client-mismatch'
 
 /**
  * Reasons a retry cannot fix. An endpoint the client has forgotten is not
  * coming back on the fourth attempt, and neither is a push that carried no
  * external id — both are the *configuration* being wrong, which is the one
  * shape of this failure that should reach the document.
+ *
+ * The last four are the same kind of fact. A refused URL, a credential that
+ * will not decrypt, a resolver naming another model and a row belonging to
+ * another client are all decisions rather than weather: the fifth attempt is
+ * told exactly the same thing, and the worker turns them into BullMQ's
+ * `UnrecoverableError` rather than spending the job's attempts on them
+ * (ADR 0010 D3, D4).
  */
 const TERMINAL_REASONS = new Set<EndpointKeyUnavailableReason>([
   'not-configured',
   'not-mirrored',
   'unknown-endpoint',
+  'refused',
+  'decrypt-failed',
+  'model-mismatch',
+  'client-mismatch',
 ])
 
 export interface EndpointKeyUnavailableInit {
