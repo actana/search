@@ -572,3 +572,272 @@ failure and `documentOf`'s second spelling), `worker.integration.test.ts` 4
 across three attempts and no `document.failed` on the way),
 `endpoint-registry.integration.test.ts` 30 (was 28),
 `api/admin-endpoints.test.ts` deleted (−12).
+
+## Merge-review fix round (2026-09-15)
+
+The review of the stitched branch (`feat/endpoint-sources-worker-cli` at
+`67b9690`) found three blockers, seven should-fixes and two nits. Every one is
+below as finding → fix → test. Nothing in the lifted engine
+(`packages/search/src/{kb,knowledge}/**`) changed behaviour: the two edits there
+are a returned-value addition and an `export` keyword, and both are named where
+they appear.
+
+### 1 — BLOCKER: every worker container was permanently unhealthy
+
+**Finding.** `deploy/healthcheck.mjs` dispatched on `SEARCH_ROLE` *above* the
+RESP helpers the worker probe uses. `probeRedis()` is a function declaration and
+hoists; the `const bulk` and `const command` it calls do not, so with
+`SEARCH_ROLE=worker` the probe died with `ReferenceError: Cannot access 'command'
+before initialization` — before it opened a socket, on every attempt. Docker
+reads that exactly the way it read the missing module the previous round fixed:
+`--wait` never returns, `depends_on: service_healthy` never fires, and an
+orchestrator restarts a working worker in a loop.
+
+**Fix.** The dispatch is the last thing in the file, where nothing it calls can
+be in a temporal dead zone, and the two helpers are function declarations so
+neither half can come back on its own. The RESP encoding (`bulk`, `command`,
+`respPayload`) and the role test are exported, and `import.meta.main` guards the
+dispatch so the module can be imported without probing anything.
+
+**Test.** `packages/search/src/__tests__/deploy-healthcheck.test.ts`, 9 tests. The
+behavioural half **spawns** the file the way Docker does — the bug was in the
+order of the file, so no test of its parts would have seen it — and covers both
+roles: `+PONG` exits 0, a closed port exits 1 naming the refused connection and
+*not* a `ReferenceError`, `-NOAUTH` exits 1, a malformed URL exits 1, and the
+API role dials `SEARCH_PORT` rather than Redis. And on a built image:
+
+```
+$ docker build -f deploy/Dockerfile -t actana-search:fix .   # ~17s
+$ docker run --rm -e SEARCH_ROLE=worker actana-search:fix node /app/deploy/healthcheck.mjs
+unhealthy: redis at localhost:6379: connect ECONNREFUSED 127.0.0.1:6379
+exit=1
+$ docker run --rm actana-search:fix node /app/deploy/healthcheck.mjs
+unhealthy: connect ECONNREFUSED 127.0.0.1:7443
+exit=1
+```
+
+The old file, for comparison: `ReferenceError: Cannot access 'command' before
+initialization at probeRedis`.
+
+### 2 — BLOCKER: `document.failed` never went out on the BullMQ path
+
+**Finding.** `finalizeDocumentEmbedding` marks a document `failed` when its
+batches have exhausted their own attempts and then **returns normally**. The
+worker passes `attemptsRemaining = attempts − (attemptsMade + 1)`, which on a
+first attempt of three is `2`, so `announce` held the event back — and then the
+job *completed*, BullMQ's `failed` handler never ran, and nothing ever re-read
+the row. Studio therefore never heard `document.failed` on the ordinary path.
+Every fixture suite was green because the inline runner passes `0`.
+
+**Fix.** The hold-back is about a dispatch that *threw*, so `runSearchJob` passes
+the outcome into `announce` beside the attempt count. A handler that returned has
+finished, whatever the counter says, and the row is the truth.
+
+**Test.** `worker.test.ts` — "announces a failed row the finalizer wrote, with
+attempts still on the job" (exactly one event, and not the ingested one) and
+"still holds a failed row back while the dispatch itself is retrying".
+`worker.integration.test.ts` — "announces the failure a finalizer writes and
+returns from", against the real `finalizeDocumentEmbedding` with a staged
+unembedded chunk and a failed batch row, at `attemptsRemaining: 2`. Both fail on
+the old code (`expected [] to deeply equal [ 'document.failed' ]`).
+
+### 3 — BLOCKER: a key link could name another client's endpoint
+
+**Finding.** `config.apiKeyEndpointId` was followed by id alone. `config` is a
+`z.record(z.unknown())` on the wire that `PUT /v1/endpoints` passes straight
+through, and an endpoint id is a *public* value this instance answers with. So
+client B could declare a local endpoint keyed on client A's endpoint, bind a KB
+to it, and embed a corpus with A's sealed key — with nothing in either client's
+view of the instance to show it.
+
+**Fix**, at all three layers the finding named:
+
+* `resolveEndpointApiKey` scopes the linked lookup to the row's own
+  `pairedClientId` and refuses another client's endpoint with
+  `client-mismatch` — terminal, the reason `MirroredEndpointSource` already
+  uses for the same fact. A link to an endpoint that has simply been deleted
+  keeps Studio's fall-back to the row's own key (ADR 0005); the two are told
+  apart with a second lookup rather than conflated. `EndpointKeySource` gained a
+  required `pairedClientId`, which every call site already had in hand.
+* `PUT /v1/endpoints` refuses (400) an `apiKeyEndpointId` that is neither one of
+  the caller's own endpoints nor one the same request is creating.
+* `hasKey` is no longer the presence of the field: the link has to lead to a
+  ciphertext held by this client. `listEndpoints` derives that from the rows it
+  has already selected; `createLocalEndpoint` asks only when its row has a link.
+
+**Test.** `endpoint-api-key.test.ts` — "refuses a link to another paired client
+endpoint, terminally", asserting `reason`, `retryable: false` and that no key was
+decrypted on the way out. `endpoint-registry.integration.test.ts`, with two real
+clients — the route refuses the declaration with a `400` naming the id and writes
+nothing; a row planted underneath the route is refused at resolution and listed
+as `hasKey: false`; and a link to one of the client's *own* endpoints still
+resolves to that key.
+
+### 4 — `kb.ingest.document` was not idempotent for chunk writes
+
+**Finding.** No `completed` short-circuit, no delete-before-insert, no
+`(document_id, chunk_index)` uniqueness on the partition, and no `budgetMs` on
+the job. A re-queued attempt (a lost lock) or a crash between the chunk commit
+and `moveToCompleted` therefore left the document reporting N chunks over 2N
+partition rows, and every query over that KB was answered twice out of one text.
+
+**Fix.** `jobs/ingest-idempotency.ts`, reached through a new `prepare` hook on the
+dispatch table — the engine is frozen and opens its own transaction, so the delete
+is immediately before the engine call rather than inside it. A document already
+`completed` skips the handler (the announcement then reads the same row under the
+same event id, so nothing new goes out); anything else has its partition rows
+dropped with the `embedding_keyword` links over those chunk ids and the
+`document_keyword` rollup, in one transaction. The job also has the size-scaled
+budget it lacked, and `WORKER_LOCK_TUNING` sets `lockRenewTime` explicitly — a
+quarter of the lock rather than BullMQ's default half, which gave a job exactly
+one chance to renew before losing it. The lock is deliberately left shorter than
+the longest budget: covering an hour-long parse would mean an hour before a dead
+worker's job could be recovered, and the renewal is what covers a long job.
+
+**Test.** `worker.integration.test.ts` — "leaves N chunks and not 2N when the same
+ingest job runs twice": run one ingests, run two finds it `completed` and does not
+re-run the handler, and run three (the row put back to `pending`, the way a lost
+lock leaves it, with the first run's chunks still there) leaves N. It fails on the
+old code with `expected 2 to be 1`. `worker.test.ts` asserts the dispatch consults
+the seam and honours a `skip`; `jobs/run.test.ts` asserts the lock invariants.
+
+### 5 — an event id said nothing about which run it was
+
+**Finding.** `searchEventId(name, documentId, status)` is deterministic on a
+document and a terminal state, so a re-include of a completed document
+(`POST …/documents/:id/include`) produced a second `document.ingested` with the
+first one's id — dropped by `claimAnnouncedEvent` in-process and by
+`webhook_delivery_hook_event_unique` in the ledger, permanently.
+
+**Fix.** The id carries a generation: `processingStartedAt`, which is stamped once
+per run by every path that starts a document over and never between the attempts
+of one job (`processingCompletedAt` moves on every attempt and would have made the
+dedupe a no-op). `documentEventId` is one function and all three announcement
+paths use it, `worker.ts` deriving the stamps from its own `UPDATE`'s `RETURNING`.
+
+**Test.** Both properties: `jobs/run.test.ts` ("is the start of the run, which is
+stamped once per run and not per attempt" / "changes when the document is
+processed again") and `worker.test.ts` ("gives the attempts of one run one event
+id" / "gives a second run its own event, because it is a second event").
+
+### 6 — the timeout sweep flipped rows and told nobody
+
+**Finding.** `markDocumentAsFailedTimeout` flips a stranded document to `failed`,
+but the sweep's payload names no document, so `announce` returned at the
+`documentId` check — and the sweep is the one path to `failed` that no job's
+completion covers. A worker killed mid-job, or a job past `maxStalledCount`, was
+a document that failed silently.
+
+**Fix.** `DocumentTimeoutSweepResult` gains `failedDocumentIds` — additive, no
+behaviour change, and the only edit to that engine file — and the job layer
+announces each one with the typed reason `timeout`. The announcement still reads
+the row, so a document a sibling carried to `completed` under the sweep is not
+reported as failed.
+
+**Test.** `worker.test.ts`, three cases (every flipped row announced with
+`reason: 'timeout'`; the row's state rather than the sweep's assumption; nothing
+when the sweep found nothing) and `worker.integration.test.ts` — a document
+`processing` since two hours ago, swept, flipped and announced.
+
+### 7 — `PUT /v1/endpoints` was not atomic
+
+**Finding.** `setEndpointSource` committed and invalidated the cache before the
+endpoint loop, so a refusal on row N left a client with a *new* source
+declaration, some of its endpoints written and the rest missing — a state no
+retry of the same body would produce.
+
+**Fix.** Every registry write takes an optional `SearchExecutor` (defaulting to
+`db`) and `applyEndpointDeclaration` hands one transaction to all of them,
+including `removeUndeclared`. The resolved-key cache is invalidated **after** the
+commit: dropping keys before a rollback forgets keys that are still current and
+re-reads them under a declaration that is about to be undone.
+
+**Test.** `endpoint-registry.integration.test.ts` — "leaves the previous
+declaration intact when a later row is refused": a declaration stands, a second
+one whose second row is refused rolls back, and the client still has exactly one
+endpoint, still keyed, with the source still `local`. It fails on the old
+arrangement (`expected { kind: 'mirrored', … } to deeply equal { kind: 'local' }`).
+
+### 8 — `endpoint add` rewrote the other rows
+
+**Finding.** `redeclare` filled a missing `model` or `label` with the row's
+`provider`, and the push is an upsert keyed by `externalId` — so every
+`endpoint add` silently rewrote the `model` of every model-less endpoint on the
+instance to the string `openai`. A model is the field that decides what a stored
+vector means.
+
+**Fix.** Nothing is invented. The contract requires both fields, so a row that
+has neither cannot be sent and `add` refuses with the ids — a set this verb
+cannot describe faithfully is a set it must not push. A row with no `externalId`
+is still skipped, which is what the route's own reconciliation does with it.
+
+**Test.** `packages/cli/src/endpoint-command.test.ts`, 6 tests against a stub
+client: the faithful re-declaration (including a null dimension, a `baseUrl` and
+a `config`), the refusal naming `--model`, the refusal naming both fields,
+nothing pushed in either case, the unkeyed row skipped, and the mirrored-source
+refusal.
+
+### 9 — two files were binary to git
+
+`events/publish.ts` and `models/mirrored-endpoint-source.ts` carried literal NUL
+bytes as separators. They are the `"\0"` escape now — identical bytes at run
+time (asserted by the event-id tests, which are digests of those joins) — and a
+diff from the fixed version is textual: `git diff --numstat` reports `1 0`
+instead of `- -`.
+
+### 10 — stale docs after the stitch
+
+* `packages/cli/README.md`, `kb-command.ts`, `exit-codes.ts` and
+  `packages/sdk/src/client.ts` said `kb`, `ingest` and `query` throw
+  `not-implemented` until TASK-004. They work; exit `3` is now a statement about
+  an older *instance*, and the sentence `reportApi` prints says so.
+* `local-endpoint-source.ts` named the verb `endpoints add`. It is `endpoint add`.
+* `deploy/README.md` and the compose header describe the worker probe as run
+  against a built image, with the command and its output.
+* ADR 0010 D10 records the `ReferenceError` beside the missing `COPY`, because
+  they failed identically; D1 records that the ingest job's idempotency is the
+  job layer's and that the lock is shorter than the longest job on purpose; D8
+  records the third way to name an endpoint row; D4 and the last section record
+  that the hold-back reads the outcome and that there are three announcement
+  doors. ADR 0009 D8a records the generation in an event id.
+* `docs/external-api.md` and `CONTEXT.md` said a `document.failed` is announced
+  "once the job is out of attempts", which was both wrong and the reason the
+  event went missing.
+
+### 11–12 — the nits
+
+* An unknown-size document's budget was `computeProcessingTimeoutMs(0)`, the base
+  600s — which is the engine's own `TIMEOUTS.FILE_DOWNLOAD` to the millisecond,
+  so the job's abort raced the download's timeout and left nothing for the
+  parsing after it. A document whose size is unknown now gets the download's wall
+  *plus* the base budget; a known size is unchanged. `TIMEOUTS` is exported so
+  `jobs/run.test.ts` asserts the agreement rather than a comment claiming it.
+* `.dockerignore` excludes `**/__tests__/`, `**/__fixtures__/`, `**/*.test.ts`
+  and the vitest config/setup files. `COPY packages/ packages/` was carrying the
+  whole frozen fixture corpus and every suite into a `--prod` container with no
+  vitest to run them; nothing under `src/` imports any of it (the corpus is named
+  in comments and in test files only), and the built image confirms it: 0
+  `*.test.ts`, no `__fixtures__`, and the service still reaches its migration
+  step.
+
+### Gates
+
+Against `search_test_b`, schema dropped first, Redis prefix `search-test-b`:
+
+| | |
+|---|---|
+| `pnpm typecheck` | green, 4 packages |
+| `pnpm lint` | green, 268 files strippable |
+| `node scripts/check-strip-types.mjs` | green, 268 files |
+| `pnpm audit --prod --audit-level high` | green (3 moderate, 2 high ignored per ADR 0007) |
+| `pnpm test` | **1052 passed**, 6 skipped, 1 todo — shared 358, core 598, sdk 36, cli 60 |
+| `fixture-suite.rest.test.ts` | 33 tests, the fifteen frozen queries 15/15 |
+| pairing (7 files, e2e included) | 114 passed |
+| `migrate-cli.ts` | applied against a dropped schema, and skipped on a second run |
+| `rehearse-npm-pack.mjs` | 11 entry points, 74 files |
+| `docker build` + both probe roles | refused connection, exit 1, no `ReferenceError` |
+
+Up from 1014: `deploy-healthcheck.test.ts` +9 and `jobs/run.test.ts` +7 (both
+new), `worker.test.ts` 44 (+8), `worker.integration.test.ts` 7 (+3),
+`endpoint-registry.integration.test.ts` 34 (+4), `endpoint-api-key.test.ts` 7
+(+1), `endpoint-command.test.ts` +6 (new).
