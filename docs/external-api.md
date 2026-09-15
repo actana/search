@@ -55,10 +55,20 @@ in it; do not infer capability from `protocol`.
 | `GET /v1/kbs/:kbId` | read | — | `KnowledgeBaseSchema` |
 | `PATCH /v1/kbs/:kbId` | write | `UpdateKbRequestSchema` | `KnowledgeBaseSchema` |
 | `DELETE /v1/kbs/:kbId` | write | — | `DeleteKbResponseSchema` |
+| `POST /v1/kbs/:kbId/restore` | write | — | `KnowledgeBaseSchema` |
 
 `DELETE` is a soft delete: the KB becomes archived and is listed by
 `?scope=archived`. Creating a KB also provisions its vector partition, sized to
 the embedding endpoint's dimension.
+
+`POST …/restore` is the way back: it clears `deletedAt` and un-archives the
+documents the delete archived. It is the **one** route whose subject is an
+archived row — every other treats `deleted_at IS NULL` as part of a KB's
+identity — and it answers with the knowledge base rather than an
+acknowledgement because the restore may have had to **rename** it: a KB whose
+name was taken while it was archived comes back as `…_restored`, then a
+suffixed variant. A KB that is not archived is `409 conflict`; one that is not
+this client's, or does not exist, is `404` like every other KB route.
 
 `embeddingEndpointId` and `inferenceEndpointId` must name **this client's own**
 endpoints (`GET /v1/endpoints` is the list). An id that is not is `404
@@ -88,12 +98,32 @@ knob: **omitted** selects the query's keywords from the KB's vocabulary first,
 `[]` blends nothing and collapses to pure semantic similarity, and a list uses
 exactly those (ADR 0009 D4a).
 
+`topK` goes up to **100** (ADR 0009 D3a), which is what Studio's own public
+search routes accept.
+
+**`text` is optional for one shape only: `mode: 'v1-tags'` with a non-empty
+`tags`.** That is the tag-only search — it filters by tag, returns what
+survives, and **embeds nothing** (`usage.embed` is zero and every `distance` is
+`0`) — and it is the one v1 request that ranks by nothing. `hybrid` and a
+tag-less `v1-tags` both embed, so both still require `text`, and `text: ''` is a
+`400` everywhere.
+
+**`distanceThreshold` (0–2) is `v1-tags` only.** Present, it replaces the
+threshold `getQueryStrategy` would have computed and `strategy.distanceThreshold`
+reports the one that ran. It exists because a caller fanning a single logical
+search out over several KBs computes one threshold for the whole call — `0.8`
+above three KBs, `1.0` otherwise — and a per-KB route can only ever infer
+`1.0`. Sent with `hybrid` it is `400 validation-failed`: that path ranks by a
+blended score, whose floor is `minScore`, and a threshold silently dropped looks
+exactly like one that was applied.
+
 ## Documents
 
 | Route | Scope | Request | Response |
 |---|---|---|---|
 | `POST /v1/kbs/:kbId/documents` | write | `IngestJsonRequestSchema` **or** multipart (`IngestMultipartFieldsSchema` + a `file` part) | `IngestResponseSchema` (202) |
 | `POST /v1/kbs/:kbId/documents/upsert` | write | `UpsertDocumentRequestSchema` | `UpsertDocumentResponseSchema` (202) |
+| `POST /v1/kbs/:kbId/documents/bulk` | write | `BulkDocumentsRequestSchema` | `BulkDocumentsResponseSchema` |
 | `GET /v1/kbs/:kbId/documents` | read | `ListDocumentsQuerySchema` (query) | `ListDocumentsResponseSchema` |
 | `GET /v1/kbs/:kbId/documents/:docId` | read | — | `DocumentSchema` |
 | `PATCH /v1/kbs/:kbId/documents/:docId` | write | `UpdateDocumentRequestSchema` | `DocumentSchema` |
@@ -114,6 +144,33 @@ capped at 64 MB and a JSON body at 4 MB. A body over either cap is answered
 `413 payload-too-large` with `Connection: close` — the answer arrives, and then
 the socket goes.
 
+**`chunkCount` on the ingest answer is present only when the row already
+carries one** — the idempotent re-ingest of a `documentId`, or an ingest whose
+work had landed before the answer did. It is absent, never `0`, while a
+document is still being processed: the `202` does not wait for a chunker, and
+"not known yet" and "no chunks" are different claims. The count for a document
+in flight arrives on `document.ingested` or from `GET …/documents/:docId`.
+
+**A tag-filtered listing is one JSON-encoded query parameter**:
+`?tagFilters=[{"tagSlot":"tag1","fieldType":"text","operator":"eq","value":"handbook"}]`.
+`TagFilterConditionSchema` is the lifted `getDocuments`' own condition — slot,
+field type, operator, `value` as a string whatever the column's type is, and
+`valueTo` for `between` — and it is encoded rather than flattened to `tag1=…`
+because a flat parameter cannot carry an operator, a second bound, or two
+conditions on one slot. A slot outside the seventeen is `400` rather than a
+condition the engine would drop, which would answer a filtered listing with an
+unfiltered one. Conditions on different slots are ANDed.
+
+**Bulk** takes `{ operation: 'enable' | 'disable' | 'delete' }` with exactly one
+of `documentIds` (at most 500, and **every** one must be in this KB or the call
+is `404` and writes nothing — the message names none of them) or `enabledFilter`
+(`all | enabled | disabled`, uncapped). The answer is `{ affected }`. Those two
+forms and no others because the frozen service has exactly two
+(`bulkDocumentOperation`, `bulkDocumentOperationByFilter`) and the by-filter one
+reads `enabled` and no other column: filter by tag with
+`GET …/documents?tagFilters=…` and pass the ids. `delete` is the same soft
+delete the single-document route performs.
+
 **The multipart encoding carries the same fields as the JSON one**, as string
 parts beside `file`:
 
@@ -123,6 +180,7 @@ parts beside `file`:
 | `includedInKb` | `1\|true\|yes\|on` or `0\|false\|no\|off`; anything else is a `400`. `false` stores the bytes and the row and does **not** chunk the document — no pipeline runs, the document has no chunks and cannot be matched by a query, and `POST …/documents/:docId/include` is the way in afterwards. |
 | `metadata` | A JSON-encoded object, validated against `MetadataSchema` — a malformed value is a `400` rather than a part quietly dropped. **Accepted and not written on a file ingest**: only the `text` path (`ingestDocument`) carries metadata onto the chunk rows, and that is frozen engine code (ADR 0005). The JSON encoding's `url` branch is the same pipeline and does the same thing. |
 | `documentId` | The caller's own id for the document. |
+| `tag1`…`tag7`, `number1`…`number5`, `date1`, `date2`, `boolean1`…`boolean3` | The JSON encoding's nested `tags` object, flattened — a form has no nesting. Same meanings, same parsers, strings throughout (`TagWritesSchema`), and they land on the staged row exactly as `tags` does. A part that is not one of the seventeen slots is dropped, not refused: a form can only carry strings, so there is nothing to refuse it for. |
 
 **`documentId` lets the caller keep its own id** (both encodings). Omitted,
 Search generates one. Supplied, it is the id the row gets and the id the
@@ -149,14 +207,40 @@ unchanged.
 | Route | Scope | Request | Response |
 |---|---|---|---|
 | `GET …/documents/:docId/chunks` | read | `ListChunksQuerySchema` (query) | `ListChunksResponseSchema` |
+| `POST …/documents/:docId/chunks` | write | `CreateChunkRequestSchema` | `ChunkSchema` (201) |
 | `PATCH …/chunks/:chunkId` | write | `UpdateChunkRequestSchema` | `ChunkSchema` |
 | `DELETE …/chunks/:chunkId` | write | — | `DeleteChunkResponseSchema` |
 | `PUT …/chunks/:chunkId/keywords` | write | `AttachChunkKeywordRequestSchema` | `ChunkKeywordResponseSchema` |
 | `DELETE …/chunks/:chunkId/keywords/:keywordId` | write | — | `{ id, deleted: true }` |
+| `GET /v1/kbs/:kbId/chunks/:chunkId` | read | — | `ChunkSchema` |
+| `PUT\|POST /v1/kbs/:kbId/chunks/:chunkId/keywords` | write | `AttachChunkKeywordRequestSchema` | `ChunkKeywordResponseSchema` |
+| `DELETE /v1/kbs/:kbId/chunks/:chunkId/keywords/:keywordId` | write | — | `{ id, deleted: true }` |
 
 Editing a chunk's `content` re-embeds it through the KB's embedding endpoint.
 That is not optional: a chunk whose text and vector disagree ranks for the wrong
-query.
+query. `POST …/documents/:docId/chunks` writes one by hand on the same terms: the
+content is embedded before it is stored, the chunk lands at the next
+`chunkIndex`, it inherits every tag value from its document, and the document's
+`chunkCount`, `tokenCount` and `characterCount` go up by what it added. A KB
+with no embedding endpoint has nothing to embed it with and answers `400`.
+
+**A chunk is addressable twice: through its document, and by its own id**
+(ADR 0009 D10). The last three rows are the second: a chunk id is unique across
+the instance, the `:kbId` is the ownership anchor, and a caller that holds only
+a chunk id — Studio's chunk editor, its `kb_admin` tool — can say what it means
+without a document id it does not have. One handler each, so the two addressings
+cannot come to mean different things; the document-addressed form additionally
+asserts the chunk is in *that* document. The attach takes `PUT` **and** `POST`
+because it is idempotent (create-or-return on the pair) and both verbs are
+unambiguous.
+
+`POST …/documents/:docId/chunks`, the chunk reads and the keyword attach all work
+over the **shared `embedding` table** — v1 code, frozen (ADR 0005) — which the
+file pipeline writes and the `text` pipeline does not. So a document ingested as
+`text` has no chunks on these routes, and a chunk added by hand is found by
+`mode: 'v1-tags'` and not by `hybrid`, which reads the KB's own partition. That
+is Studio's behaviour unchanged, and it is the reason its chunk editor works over
+uploaded files.
 
 ## Keywords
 
