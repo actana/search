@@ -215,6 +215,108 @@ describeDb('the endpoint registry', () => {
       )
       expect(endpoint.dimensions).toBeNull()
     })
+
+    /**
+     * The three properties `PUT /v1/endpoints` needs from the local path, and
+     * the reason this function is an upsert at all.
+     *
+     * The route is declarative: a client sends the set of endpoints it wants to
+     * exist, on pairing and again on every edit, and anything left out is
+     * reconciled away. An insert-only local path meant the second push created
+     * a second row and the reconciliation then reaped the first — which is a
+     * KB's `embedding_endpoint_id` pointing at a row that has gone. So: the
+     * same `externalId` is the same row; a push that says nothing about the key
+     * leaves the sealed ciphertext where it is; and a push that carries one
+     * replaces it.
+     */
+    it('upserts a local endpoint on its externalId, and keeps the key when told nothing', async () => {
+      const externalId = `${PREFIX}-local-ext`
+      const first = await registry.createLocalEndpoint(
+        CLIENT,
+        {
+          externalId,
+          kind: 'embedding',
+          provider: 'openai',
+          template: 'openai',
+          model: 'text-embedding-3-small',
+          dimensions: 1536,
+          label: 'first',
+        },
+        'sk-first-0123456789abcdef',
+      )
+      expect(first.externalId).toBe(externalId)
+      expect(first.hasKey).toBe(true)
+
+      // The second push: new metadata, and `null` for the key — which is what
+      // the route passes when the declaration carried no `apiKey`.
+      const second = await registry.createLocalEndpoint(
+        CLIENT,
+        {
+          externalId,
+          kind: 'embedding',
+          provider: 'openai',
+          template: 'openai',
+          model: 'text-embedding-3-large',
+          dimensions: 1536,
+          label: 'renamed',
+        },
+        null,
+      )
+      expect(second.id).toBe(first.id)
+      expect(second.model).toBe('text-embedding-3-large')
+      expect(second.label).toBe('renamed')
+      expect(second.hasKey).toBe(true)
+
+      // One row, and the original ciphertext, byte for byte.
+      const rows = await db
+        .select()
+        .from(modelEndpoint)
+        .where(eq(modelEndpoint.externalId, externalId))
+      expect(rows).toHaveLength(1)
+      expect((await decryptSecret(rows[0]!.keyCiphertext!)).decrypted).toBe(
+        'sk-first-0123456789abcdef',
+      )
+
+      // And a push that does carry one replaces it.
+      await registry.createLocalEndpoint(
+        CLIENT,
+        {
+          externalId,
+          kind: 'embedding',
+          provider: 'openai',
+          template: 'openai',
+          model: 'text-embedding-3-large',
+          dimensions: 1536,
+        },
+        'sk-rotated-0123456789abcdef',
+      )
+      const [rotated] = await db
+        .select()
+        .from(modelEndpoint)
+        .where(eq(modelEndpoint.externalId, externalId))
+      expect((await decryptSecret(rotated!.keyCiphertext!)).decrypted).toBe(
+        'sk-rotated-0123456789abcdef',
+      )
+    })
+
+    it('leaves a row with no externalId out of the upsert, so two are two rows', async () => {
+      // The admin socket's path, which predates the route. Unreconciled by
+      // construction: nothing can address it by a client-side id, so nothing
+      // upserts onto it and the route's reconciliation never reaps it.
+      const one = await registry.createLocalEndpoint(
+        CLIENT,
+        { kind: 'inference', provider: 'openai', template: 'openai', model: 'gpt-4o-mini' },
+        'sk-anon-1-0123456789',
+      )
+      const two = await registry.createLocalEndpoint(
+        CLIENT,
+        { kind: 'inference', provider: 'openai', template: 'openai', model: 'gpt-4o-mini' },
+        'sk-anon-2-0123456789',
+      )
+      expect(one.externalId).toBeNull()
+      expect(two.externalId).toBeNull()
+      expect(two.id).not.toBe(one.id)
+    })
   })
 
   describe('upsertMirroredEndpoints', () => {

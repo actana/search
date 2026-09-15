@@ -106,6 +106,16 @@ export interface MirroredEndpointInput {
 
 /** One endpoint registered with a literal key (standalone, and the CLI). */
 export interface LocalEndpointInput {
+  /**
+   * The declaring client's own stable id for this endpoint, when it has one.
+   *
+   * `PUT /v1/endpoints` is declarative — the body is the set the client wants
+   * to exist — so a local push needs the same reconciliation key a mirrored one
+   * does, or every push would create a second row and the previous one would be
+   * reaped as undeclared. Absent (the admin path that predates the route) means
+   * an unreconciled row: it is never upserted onto and never reaped.
+   */
+  externalId?: string | null
   kind: EndpointKind
   provider: string
   template: string
@@ -130,6 +140,8 @@ export interface EndpointSummary {
   source: 'local' | 'mirrored'
   /** Whether a key can be produced for this row. Never the key. */
   hasKey: boolean
+  /** Template extras — `{ extras: {...}, custom: {...} }`. Never a key. */
+  config: Record<string, unknown>
   createdAt: string
   updatedAt: string
 }
@@ -336,8 +348,26 @@ export async function upsertMirroredEndpoints(
 }
 
 /**
- * Register one endpoint whose key Search holds. Standalone, and the CLI's
- * `endpoint add`.
+ * Register or update one endpoint whose key Search holds — a standalone
+ * client's `PUT /v1/endpoints`, and the CLI's `endpoint add`.
+ *
+ * **An upsert, keyed by `externalId`, for the same reason the mirrored push is
+ * one.** `PUT /v1/endpoints` is declarative: a client sends the set it wants to
+ * exist, on pairing and again on every edit. An insert-only local path meant
+ * the second push created a second row and the route's reconciliation then
+ * reaped the first — which is a KB's `embedding_endpoint_id` pointing at a row
+ * that has gone. A local row with no `externalId` (the admin socket's path,
+ * which predates the route) is inserted and left out of the reconciliation
+ * entirely.
+ *
+ * **`apiKey` of `null` leaves whatever key the row already holds, and `''` is
+ * refused.** The two are different sentences and the difference matters: a
+ * client that pushes metadata on every edit and the key once says *nothing*
+ * about the key in the later pushes, and blanking it there would break the
+ * endpoint on the first harmless rename. An empty string is a client that
+ * meant to send one and sent nothing, which is worth a refusal. A brand new row
+ * may have no key at all — that is a declared-but-not-yet-credentialed endpoint
+ * and `hasKey: false` says so.
  *
  * The key is sealed with `SEARCH_ENCRYPTION_KEY` before it reaches a column and
  * is not in the return value.
@@ -345,42 +375,77 @@ export async function upsertMirroredEndpoints(
 export async function createLocalEndpoint(
   clientId: string,
   input: LocalEndpointInput,
-  apiKey: string
+  apiKey: string | null
 ): Promise<EndpointSummary> {
-  if (!apiKey) {
+  if (apiKey !== null && !apiKey) {
     throw new Error('createLocalEndpoint: a local endpoint needs an API key')
   }
   if (input.kind === 'embedding' && !input.dimensions) {
     throw new Error('createLocalEndpoint: an embedding endpoint needs a dimension')
   }
-  const { encrypted } = await encryptSecret(apiKey)
+  const externalId = input.externalId?.trim() || null
+  const sealed = apiKey === null ? null : (await encryptSecret(apiKey)).encrypted
   const now = new Date()
-  const [row] = await db
-    .insert(modelEndpoint)
-    .values({
-      id: generateId(),
-      pairedClientId: clientId,
-      kind: input.kind,
-      provider: input.provider,
-      template: input.template,
-      model: input.model ?? null,
-      dimension: input.kind === 'embedding' ? (input.dimensions ?? null) : null,
-      baseUrl: input.baseUrl ?? null,
-      keyCiphertext: encrypted,
-      source: 'local',
-      externalId: null,
-      label: input.label ?? null,
-      config: input.config ?? {},
-      createdAt: now,
-      updatedAt: now,
-    })
-    .returning()
+  const values = {
+    id: generateId(),
+    pairedClientId: clientId,
+    kind: input.kind,
+    provider: input.provider,
+    template: input.template,
+    model: input.model ?? null,
+    dimension: input.kind === 'embedding' ? (input.dimensions ?? null) : null,
+    baseUrl: input.baseUrl ?? null,
+    keyCiphertext: sealed,
+    source: 'local' as const,
+    externalId,
+    label: input.label ?? null,
+    config: input.config ?? {},
+    createdAt: now,
+    updatedAt: now,
+  }
+
+  let row: EndpointRow
+  if (externalId === null) {
+    ;[row] = await db.insert(modelEndpoint).values(values).returning()
+  } else {
+    ;[row] = await db
+      .insert(modelEndpoint)
+      .values(values)
+      .onConflictDoUpdate({
+        target: [modelEndpoint.pairedClientId, modelEndpoint.externalId],
+        // The index is partial (`WHERE external_id IS NOT NULL`), so the
+        // predicate has to be restated for Postgres to recognise which index
+        // this conflict clause means — see `upsertMirroredEndpoints`.
+        targetWhere: sql`${modelEndpoint.externalId} IS NOT NULL`,
+        set: {
+          kind: values.kind,
+          provider: values.provider,
+          template: values.template,
+          model: values.model,
+          dimension: values.dimension,
+          baseUrl: values.baseUrl,
+          label: values.label,
+          config: values.config,
+          // A row that was a mirror and is now declared local stops being one:
+          // two sources for one endpoint is the ambiguity this module exists
+          // to not have.
+          source: 'local',
+          // Said nothing about the key: keep the ciphertext that is there.
+          ...(sealed === null ? {} : { keyCiphertext: sealed }),
+          updatedAt: now,
+        },
+      })
+      .returning()
+  }
   logger.info('Local endpoint registered', {
     pairedClientId: clientId,
     endpointId: row.id,
     kind: row.kind,
     provider: row.provider,
   })
+  // A row that has just been re-declared may have been resolved through the
+  // mirror a moment ago.
+  invalidateResolvedKeysFor(clientId)
   return summarise(row)
 }
 
@@ -423,6 +488,7 @@ function summarise(row: EndpointRow): EndpointSummary {
     baseUrl: row.baseUrl,
     label: row.label,
     source: row.source === 'mirrored' ? 'mirrored' : 'local',
+    config: (row.config as Record<string, unknown> | null) ?? {},
     // A mirrored row's key is always obtainable in principle — it is one
     // resolver call away — and a local row's is obtainable when it has a
     // ciphertext or points at another endpoint that does.
