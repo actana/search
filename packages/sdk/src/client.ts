@@ -29,10 +29,13 @@ import {
 import type { SearchHealth, SearchPairStatus } from "./pairing-wire.ts";
 import type {
   AttachChunkKeywordRequest,
+  BulkDocumentsRequest,
+  BulkDocumentsResponse,
   Capabilities,
   Chunk,
   ChunkKeywordResponse,
   ClusteringStatus,
+  CreateChunkRequest,
   CreateKbRequest,
   DeleteChunkResponse,
   DeleteDocumentResponse,
@@ -321,6 +324,22 @@ export class SearchClient {
       this.request<DeleteKbResponse>("DELETE", `/v1/kbs/${encodeURIComponent(kbId)}`),
 
     /**
+     * `POST /v1/kbs/:id/restore` — the other half of the soft delete.
+     *
+     * Clears `deleted_at` on the KB and un-archives the documents that were
+     * archived with it. A KB archived under a name something else has taken
+     * since comes back **renamed** (`…_restored`, then a suffixed variant), so
+     * the answer is the knowledge base rather than an acknowledgement: the
+     * caller has to be able to see the name it got back.
+     *
+     * `404` for a KB that is not this client's or does not exist, as every
+     * other KB route (ADR 0009 D5), and `409 conflict` for one that is not
+     * archived in the first place.
+     */
+    restore: (kbId: string): Promise<KnowledgeBase> =>
+      this.request<KnowledgeBase>("POST", `/v1/kbs/${encodeURIComponent(kbId)}/restore`),
+
+    /**
      * `POST /v1/kbs/:id/query`.
      *
      * The return type follows `mode`: the default is the hybrid rank, and
@@ -359,13 +378,27 @@ export class SearchClient {
   };
 
   readonly documents = {
-    /** `GET /v1/kbs/:id/documents`. */
-    list: (kbId: string, query: ListDocumentsQuery = {}): Promise<ListDocumentsResponse> =>
-      this.request<ListDocumentsResponse>(
+    /**
+     * `GET /v1/kbs/:id/documents`.
+     *
+     * `tagFilters` is a list of conditions and a query string holds strings, so
+     * it goes over as one JSON-encoded parameter — which is what the route
+     * parses it back out of. Every other member of the query is a scalar and
+     * travels as itself.
+     */
+    list: (kbId: string, query: ListDocumentsQuery = {}): Promise<ListDocumentsResponse> => {
+      const { tagFilters, ...scalars } = query;
+      return this.request<ListDocumentsResponse>(
         "GET",
         `/v1/kbs/${encodeURIComponent(kbId)}/documents`,
-        { query: query as Record<string, string | number | boolean | undefined> },
-      ),
+        {
+          query: {
+            ...(scalars as Record<string, string | number | boolean | undefined>),
+            ...(tagFilters === undefined ? {} : { tagFilters: JSON.stringify(tagFilters) }),
+          },
+        },
+      );
+    },
 
     /** `GET /v1/kbs/:id/documents/:docId`. Poll this for `processingStatus`. */
     get: (kbId: string, documentId: string): Promise<SearchDocument> =>
@@ -435,6 +468,76 @@ export class SearchClient {
         "POST",
         `/v1/kbs/${encodeURIComponent(kbId)}/documents/upsert`,
         { json: input },
+      ),
+
+    /**
+     * `POST /v1/kbs/:id/documents/bulk` — enable, disable or delete many.
+     *
+     * `{ operation, documentIds }` for a list the caller holds, capped at 500
+     * and refused whole with a `404` if any id is not in this KB, or
+     * `{ operation, enabledFilter }` for every document in the KB (or every
+     * enabled or disabled one), which is not capped at all.
+     */
+    bulk: (kbId: string, input: BulkDocumentsRequest): Promise<BulkDocumentsResponse> =>
+      this.request<BulkDocumentsResponse>(
+        "POST",
+        `/v1/kbs/${encodeURIComponent(kbId)}/documents/bulk`,
+        { json: input },
+      ),
+  };
+
+  /**
+   * Chunks addressed by their own id, and the one write that makes a new one.
+   *
+   * **Why a second namespace rather than more `documents.*` methods.** A chunk
+   * id is unique across the instance, and a caller that holds one — Studio's
+   * chunk editor and its `kb_admin` tool both do — has no document id to put
+   * in a path. So these methods take `(kbId, chunkId)`, and the
+   * document-addressed ones on {@link SearchClient.documents} and
+   * {@link SearchClient.keywords} stay exactly as they are: two addressings for
+   * one chunk, each on the namespace whose arguments a caller actually has,
+   * rather than one method whose third argument means two different things.
+   */
+  readonly chunks = {
+    /**
+     * `POST /v1/kbs/:id/documents/:docId/chunks` — one chunk, by hand.
+     *
+     * The content is embedded through the KB's own endpoint before it is
+     * stored, the chunk lands at the next `chunkIndex`, and it inherits its
+     * document's tag values. `(kbId, documentId)` and not `(kbId, chunkId)`
+     * because a chunk that does not exist yet has no id and *does* have a
+     * document.
+     */
+    create: (
+      kbId: string,
+      documentId: string,
+      input: CreateChunkRequest,
+    ): Promise<Chunk> =>
+      this.request<Chunk>("POST", `${documentPath(kbId, documentId)}/chunks`, { json: input }),
+
+    /** `GET /v1/kbs/:id/chunks/:chunkId`. 404 for a chunk outside this KB. */
+    get: (kbId: string, chunkId: string): Promise<Chunk> =>
+      this.request<Chunk>("GET", chunkPath(kbId, chunkId)),
+
+    /** `PUT /v1/kbs/:id/chunks/:chunkId/keywords` — attach, by chunk id. */
+    attachKeyword: (
+      kbId: string,
+      chunkId: string,
+      input: AttachChunkKeywordRequest,
+    ): Promise<ChunkKeywordResponse> =>
+      this.request<ChunkKeywordResponse>("PUT", `${chunkPath(kbId, chunkId)}/keywords`, {
+        json: input,
+      }),
+
+    /** `DELETE /v1/kbs/:id/chunks/:chunkId/keywords/:keywordId`. */
+    detachKeyword: (
+      kbId: string,
+      chunkId: string,
+      keywordId: string,
+    ): Promise<{ id: string; deleted: true }> =>
+      this.request(
+        "DELETE",
+        `${chunkPath(kbId, chunkId)}/keywords/${encodeURIComponent(keywordId)}`,
       ),
   };
 
@@ -657,6 +760,11 @@ export class SearchClient {
 /** `/v1/kbs/:kbId/documents/:docId`, escaped. */
 function documentPath(kbId: string, documentId: string): string {
   return `/v1/kbs/${encodeURIComponent(kbId)}/documents/${encodeURIComponent(documentId)}`;
+}
+
+/** `/v1/kbs/:kbId/chunks/:chunkId`, escaped — the chunk-by-id addressing. */
+function chunkPath(kbId: string, chunkId: string): string {
+  return `/v1/kbs/${encodeURIComponent(kbId)}/chunks/${encodeURIComponent(chunkId)}`;
 }
 
 /** What {@link SearchClient.kbs.ingest} takes: bytes, a URL, or text. */
