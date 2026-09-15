@@ -716,7 +716,14 @@ describeDb('the worker, end to end', () => {
       .from(document)
       .where(eq(document.knowledgeBaseId, ids.kbTwice))
     expect(rows).toHaveLength(1)
-    expect(rows[0]!.status).toBe('completed')
+    /**
+     * `completed`, or `keywording` on its way back to it: a completed ingest
+     * enqueues `kb-keywords-extract`, which takes the document through
+     * `keywording` and — with no inference endpoint on this KB — settles it
+     * again. Which of the two a read lands on is a race with the worker running
+     * beside this test, and it is nothing to do with how many chunks there are.
+     */
+    expect(['completed', 'keywording']).toContain(rows[0]!.status)
     expect(rows[0]!.chunks).toBe(first)
   }, 120_000)
 
