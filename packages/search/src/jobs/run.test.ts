@@ -50,8 +50,9 @@ describe("the queue's lock tuning", () => {
      * Not an accident to be corrected: a `lockDuration` long enough to cover
      * an hour-long document parse is an hour before a dead worker's job can be
      * recovered. What covers a long job is the renewal above; what makes a
-     * re-run safe when renewal fails is the job layer's idempotency
-     * (`ingest-idempotency.ts`).
+     * re-run safe when renewal fails is the skip in `ingest-idempotency.ts`
+     * and, for a re-run that does go through, the locked chunk replacement
+     * inside the engine's own transaction (ADR 0011).
      */
     expect(EMBED_BATCH_TIMEOUT_MS).toBeGreaterThan(WORKER_LOCK_TUNING.lockDuration);
     expect(WORKER_LOCK_TUNING.maxStalledCount).toBeGreaterThan(0);

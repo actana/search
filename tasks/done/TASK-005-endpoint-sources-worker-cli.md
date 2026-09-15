@@ -577,10 +577,17 @@ across three attempts and no `document.failed` on the way),
 
 The review of the stitched branch (`feat/endpoint-sources-worker-cli` at
 `67b9690`) found three blockers, seven should-fixes and two nits. Every one is
-below as finding → fix → test. Nothing in the lifted engine
-(`packages/search/src/{kb,knowledge}/**`) changed behaviour: the two edits there
-are a returned-value addition and an `export` keyword, and both are named where
-they appear.
+below as finding → fix → test.
+
+The lifted engine (`packages/search/src/{kb,knowledge}/**`) carries **three**
+edits out of this round, all named where they appear. Two are not behaviour: a
+returned-value addition and an `export` keyword. The third is —
+`kb/ingest.ts` takes an advisory lock and replaces the document's chunks at the
+top of the transaction it already opened (finding 4 below), which is a
+deliberate logic change to a frozen file and therefore has its own record,
+[ADR 0011](../../docs/adr/0011-the-one-engine-edit-replacing-a-documents-chunks-under-a-lock.md).
+A single run writes what it always wrote, and the frozen fixture suite is the
+evidence.
 
 ### 1 — BLOCKER: every worker container was permanently unhealthy
 
@@ -681,13 +688,30 @@ the job. A re-queued attempt (a lost lock) or a crash between the chunk commit
 and `moveToCompleted` therefore left the document reporting N chunks over 2N
 partition rows, and every query over that KB was answered twice out of one text.
 
-**Fix.** `jobs/ingest-idempotency.ts`, reached through a new `prepare` hook on the
-dispatch table — the engine is frozen and opens its own transaction, so the delete
-is immediately before the engine call rather than inside it. A document already
-`completed` skips the handler (the announcement then reads the same row under the
-same event id, so nothing new goes out); anything else has its partition rows
-dropped with the `embedding_keyword` links over those chunk ids and the
-`document_keyword` rollup, in one transaction. The job also has the size-scaled
+**Fix**, in two places, and the split is the finding's own shape.
+
+`jobs/ingest-idempotency.ts`, reached through a new `prepare` hook on the
+dispatch table, holds what only a job layer can know: a document already
+`completed` skips the handler (the announcement then reads the same row under
+the same event id, so nothing new goes out), the payload's KB is checked
+against the one its document is in, and the `document_keyword` rollup a
+previous attempt left behind is dropped.
+
+**The chunk rows are replaced inside the engine's own transaction**, which is
+the part that could not live in the job layer: a pre-engine delete commits
+minutes before `ingestDocument` opens its transaction, so a run still embedding
+when that delete commits wrote its chunks afterwards and two *live* runs still
+left 2N. `kb/ingest.ts` therefore takes
+`pg_advisory_xact_lock(hashtext(documentId))` and deletes the document's chunks
+— with the `embedding_keyword` links over exactly those chunk ids and the
+`kb_keyword.usage_count` those links were counted in — as the first statements
+of the transaction it already opened. That is a deliberate logic edit to a
+frozen file, so it carries the record ADR 0005 asks for:
+[ADR 0011](../../docs/adr/0011-the-one-engine-edit-replacing-a-documents-chunks-under-a-lock.md),
+which also records the one number the replacement leaves cosmetically stale
+(`totalExisting`, counted before the transaction).
+
+The job also has the size-scaled
 budget it lacked, and `WORKER_LOCK_TUNING` sets `lockRenewTime` explicitly — a
 quarter of the lock rather than BullMQ's default half, which gave a job exactly
 one chance to renew before losing it. The lock is deliberately left shorter than

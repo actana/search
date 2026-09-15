@@ -300,12 +300,14 @@ describe('kb.ingest.document', () => {
 
   it('asks the idempotency step first, and does not re-ingest a completed document', async () => {
     /**
-     * `kb/ingest.ts` has no `completed` short-circuit and no
-     * delete-before-insert, and the partition has no `(document_id,
-     * chunk_index)` uniqueness — so a second run of one job is a second copy of
-     * every chunk. The job layer is what stops that (`jobs/ingest-idempotency.ts`,
-     * asserted against a real partition in the integration suite); what is
-     * asserted here is that the dispatch honours it.
+     * `kb/ingest.ts` has no `completed` short-circuit, and the partition has
+     * no `(document_id, chunk_index)` uniqueness — so nothing below the job
+     * layer knows that a document's work is *already done*, and a re-queued
+     * attempt would chunk and embed the whole thing again to arrive at the
+     * same rows. The chunk writes themselves are a replacement rather than an
+     * addition, under an advisory lock inside the engine's own transaction
+     * (ADR 0011); what `jobs/ingest-idempotency.ts` adds is the skip, and what
+     * is asserted here is that the dispatch honours it.
      */
     handlers.prepareIngestDocument.mockResolvedValueOnce({ skip: true })
     queueDocument()

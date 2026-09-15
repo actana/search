@@ -26,8 +26,10 @@
  * them, with the `kb_keyword.usage_count` those links are counted in) as the
  * first statements of the transaction it already opened. Two runs are
  * serialised on the document id and the second replaces the first, atomically.
- * It is the one behaviour-frozen file this round touches, additively, and it is
- * recorded in TASK-005.
+ * It is the one deliberate logic edit to the frozen engine (ADR 0005), and it
+ * is recorded as `docs/adr/0011-the-one-engine-edit-replacing-a-documents-chunks-under-a-lock.md`
+ * — what changed, why the delete could not live here, and the one number
+ * (`totalExisting`) the replacement leaves cosmetically stale.
  *
  * What is left here is what the engine has no way to know: that the work is
  * *already done* and the handler should not run at all, that the payload names
