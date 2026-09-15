@@ -28,6 +28,7 @@ import {
   SearchPairingError,
   type SearchRegistrationBlob,
 } from "@actana/search";
+import { WhoamiSchema } from "@actana/search/contracts";
 import { resetConfig } from "../config.ts";
 import { createDatabase, type SearchDatabase } from "../db/client.ts";
 import { runMigrations, SEARCH_SCHEMA } from "../db/migrate.ts";
@@ -247,6 +248,50 @@ describe.skipIf(!url)("pairing, end to end", () => {
       });
       // Health, to the same client, does carry it — it has a certificate.
       expect(await client.health()).toEqual({ ok: true, schemaVersion: SCHEMA_VERSION });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("names the paired client, and the certificate on this connection, on `whoami`", async () => {
+    const minted = await mint({ label: "who", scope: "write" });
+    const blob = await pair(minted, "who");
+    const client = SearchClient.fromRegistrationBlob(blob);
+    try {
+      const me = await client.whoami();
+      const status = await client.pairStatus();
+
+      // The same row, and the id spelled as the thing it is: this is the
+      // `search.paired_client.id` a caller writing rows of its own needs.
+      expect(me.clientId).toBe(status.id);
+      expect(me.label).toBe("who");
+      // Expanded, not the single stored value `/v1/pair/status` answers.
+      expect(status.scope).toBe("write");
+      expect(me.scopes).toEqual(["read", "write"]);
+      expect(me.schemaVersion).toBe(SCHEMA_VERSION);
+      expect(me.createdAt).toBe(status.pairedAt);
+
+      // **Off the socket**, which is what makes this "the certificate I am
+      // holding" rather than a copy of a column. Over mTLS it is there; the
+      // insecure development path has no certificate and leaves it out
+      // (`fixture-suite.rest.test.ts` asserts that half).
+      expect(me.serialNumber).toMatch(/^[0-9a-fA-F]+$/);
+      expect(me.serialNumber).toBe(status.certSerial);
+
+      expect(WhoamiSchema.safeParse(me).success).toBe(true);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("answers `whoami` to a client scoped below every other route", async () => {
+    // `scope: null`: a caller that cannot ask who it is cannot find out that it
+    // is scoped too low to do anything else.
+    const minted = await mint({ label: "reader-who", scope: "read" });
+    const blob = await pair(minted, "reader-who");
+    const client = SearchClient.fromRegistrationBlob(blob);
+    try {
+      expect((await client.whoami()).scopes).toEqual(["read"]);
     } finally {
       await client.close();
     }

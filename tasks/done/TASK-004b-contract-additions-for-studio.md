@@ -320,3 +320,167 @@ node packages/sdk/scripts/rehearse-npm-pack.mjs
 version bumped. Five new cases: the four contract ones and the listing over the
 wire — `client.test.ts`'s two additions are rows inside cases that already
 existed.
+
+## Addendum: the two wire additions the data migration needed (2026-09-15)
+
+Studio's TASK-013 rehearsed the data migration
+(`~/Projects/actana.ai/wt-search-extraction` →
+`tasks/search-extraction/proto/MIGRATION.md`) and could not rehearse two of its
+own steps, for the same kind of reason each time: the thing it needed to say was
+not on this wire. Both are additive, neither touches the engine, and neither
+changes an existing route.
+
+| Gap | What it was | The addition |
+|---|---|---|
+| **G-1**, the blob copy | The bytes of a migrated document are in *Studio's* bucket. Every route here that takes bytes creates a document and runs a pipeline, and re-ingesting rewrites the chunk ids and embeddings that just moved by SQL — which is not a move. Studio must not write into Search's bucket (ADR 0006), so `--blob-copy=sdk` was refused outright and `--blob-copy=s3` warned instead of copying: **the migration moved rows, not bytes.** | `PUT /v1/kbs/:kbId/documents/:docId/blob` |
+| **G-2**, the paired client id | `workspace_search` holds an address, a CA fingerprint and a sealed blob; `SearchRegistrationBlob` carries no client id, and the sidecar's status route answers with the *Studio* row's id. `GET /v1/pair/status` does answer one, and no Studio surface reaches it. So the id that `search.knowledge_base.paired_client_id` is written with had to come from an operator on a command line (`--paired-client-id`). | `GET /v1/whoami` |
+
+### `GET /v1/whoami`
+
+`WhoamiSchema` (`contracts/whoami.ts`, the new family), the route beside
+`/v1/capabilities` in `api/server.ts`, `client.whoami()`.
+
+```
+{ clientId, label, scopes, createdAt, serialNumber?, schemaVersion }
+```
+
+**`GET /v1/capabilities` does not already answer this.** It is about the
+instance — `protocol`, `schemaVersion`, `features`, `publicHost` — and carries
+no client id in any form; that is exactly why the migration had to be told one.
+`whoami` is the explicit call, and it is added as one rather than by widening
+capabilities: a route about the caller and a route about the build are two
+questions, and a caller that wants the second on every poll should not be told
+the first.
+
+It also overlaps `GET /v1/pair/status`, which stays. That route is the *pairing
+surface's* shape — `platform`, `kbIds`, `certNotAfter`, the pairing lifecycle —
+typed in `@actana/search/pairing-wire` because it was copied out of Control with
+ADR 0008, and it spells the id `id`. This one is the identity read named for the
+question a caller is asking, defined in the zod contracts like everything else
+on this wire, and it carries `schemaVersion` beside the id so that the two
+preconditions a writer checks — *who am I*, *is this the version I was written
+against* — are one round trip observed at one instant rather than two.
+
+Three decisions inside it:
+
+- **`scope: null` — any paired client, at any scope.** Every other
+  non-open route names `read`, `write` or `admin`. A caller that cannot ask who
+  it is cannot find out that it is scoped too low to do anything else, and the
+  answer is about the caller itself, so it discloses nothing a certificate
+  holder did not already hold.
+- **`scopes` is a list, and it is expanded.** A pairing stored `admin` reads
+  `["read", "write", "admin"]`. For the reason `CapabilitiesSchema.features` is
+  a list: a caller tests membership rather than re-implementing the
+  `admin` ⊃ `write` ⊃ `read` rank — and a caller that re-implemented it could
+  disagree with the router about what it may do. `scopesHeldBy` is derived from
+  `scopeAllows`, the predicate the router itself uses, so the two cannot drift.
+  `/v1/pair/status` still answers the single stored value under `scope`.
+- **`serialNumber` is read off the socket, which is why it is optional.** It
+  answers "which certificate am I holding", not "which certificate was this
+  pairing issued" — a copy of `paired_client.cert_serial` would have been the
+  second question. The plain-HTTP development mode has no certificate to report
+  and the field is absent there, as `SearchPairStatus.certNotAfter` is null for
+  the same reason. Both halves are asserted: over real mTLS in
+  `pairing.e2e.test.ts`, and absent over `SEARCH_DEV_INSECURE` in the REST
+  fixture suite.
+
+### `PUT /v1/kbs/:kbId/documents/:docId/blob`
+
+`AttachBlobMultipartFieldsSchema` in `contracts/documents.ts`, the route in
+`api/routes/documents.ts`, `client.documents.attachBlob(kbId, documentId,
+{ file, filename, mimeType })` over the same hand-written `encodeMultipart` the
+ingest uses. Multipart with a `file` part, the same 50 MB file cap from the same
+`MAX_UPLOAD_SIZE_BYTES` inside the same 64 MB envelope, and the answer is the
+`DocumentSchema` row.
+
+**It is the one write on this surface that moves bytes and no meaning.** The
+object goes into this instance's bucket under ingest's own key scheme
+(`kb/<timestamp>-<random>-<sanitised>`, so a migrated object needs no rename)
+and exactly three columns change: `file_url`, `mime_type`, `file_size` — the
+three that describe the object, and the three the schema has.
+`processingStatus`, `chunkCount`, `processedChunks`, `tokenCount`,
+`characterCount`, `keywordStatus`, the chunk rows, their vectors and the keyword
+overlay are all left as they were, and **nothing is enqueued**.
+
+- **`filename` names the object, not the document.** It is what the storage key
+  is built from; `document.filename` is untouched, because a rename is
+  `PATCH …/documents/:docId` and a route that quietly did both would make a
+  blob copy a rename.
+- **Idempotent in the row, not in the bucket, and that is the honest
+  description.** The key scheme is ingest's, so a second attach of the same
+  bytes writes a second object and points the row at it: the row ends in the
+  same state, the document still says the same things about itself, and a
+  retried stream is safe — which is the idempotence the migration needs. The
+  superseded object is **left in place** deliberately, because a job holding the
+  old `fileUrl` in its payload may still be reading it and a migration re-run
+  after a partial failure should not find its source deleted. A `customKey`
+  derived from the document id would have been idempotent in the bucket too, and
+  would have broken both of those.
+- **`409` covers the whole in-flight set, not the literal `processing`.** The
+  brief named `processing`; that value is the legacy umbrella
+  (`ProcessingStatusSchema`) and `chunking`, `embedding`, `clustering` and
+  `keywording` are the same run further along, so all five are one answer to one
+  question — is a worker reading this object right now? Swapping it underneath
+  one leaves the chunks describing one object and the row naming another.
+  `pending` is **not** refused: a document uploaded with `includedInKb: false`
+  rests there with no job enqueued at all, and attaching its bytes is the
+  obvious next thing to do. `completed` and `failed` are settled.
+- **`404` for a foreign or unknown document**, through the same `requireKb` +
+  `requireDocument` pair every other document route uses, so it says nothing
+  about whose document it is (ADR 0009 D5).
+
+A side effect worth naming: a document ingested as `text` has `file_url = ''`
+and `POST …/include` answers `409` on it ("no stored bytes to re-ingest"). That
+`409` now has a remedy — attach the bytes, then include.
+
+### Tests
+
+`contracts.test.ts` — 34 → 40. `AttachBlobMultipartFieldsSchema` has exactly the
+two fields and strips an ingest form's `documentId`/`tags`/`includedInKb`, and
+refuses an empty name or media type; `WhoamiSchema` round-trips, has
+`serialNumber` as its **only** optional field (each of the other five dropped in
+turn, with the issue landing on that field), takes `scopes` as a list of the
+three and refuses a bare string, and keeps `schemaVersion` an integer.
+
+`client.test.ts` — 18 → 21. Two rows in the route table (`GET /v1/whoami`, `PUT
+…/documents/:docId/blob`), then: the attach sends three parts and **none** of
+the ingest form's — no `documentId`, `includedInKb`, `metadata` or `tag*` — the
+bytes survive verbatim, both ids are escaped, and the answer parses as a
+`DocumentSchema` whose `processingStatus` and `chunkCount` did not move;
+`whoami()` is a bodiless `GET` whose `scopes` arrive expanded.
+
+`fixture-suite.rest.test.ts` — 50 → 52, over a real server, a real bucket and a
+real job graph:
+
+| Test | What it proves |
+|---|---|
+| says who the caller is, on `whoami`, without being told | The client's own id and label off the route rather than from configuration, `schemaVersion` equal to `capabilities()`'s, `scopes` expanded to all three for an `admin` pairing, `serialNumber` **absent** because the insecure path has no certificate, the second paired client getting its own answer from the same route, and the raw body parsed by `WhoamiSchema` |
+| attaches new bytes to a document without re-ingesting it | A file-ingested, completed, chunked document: the attach rewrites `fileUrl`/`fileSize`/`mimeType`, the new key matches the ingest scheme, the bytes **in the bucket** equal what was sent, and `processingStatus`, `chunkCount`, `processedChunks`, `tokenCount`, `characterCount`, `keywordStatus`, `uploadedAt`, `filename`, `tag1` and every chunk id **and** chunk content are unchanged with no job enqueued. Then: the same bytes attached twice leaves the row identical but for the key and the superseded object still readable; each of the five in-flight statuses is a `409`; `pending` is not; another client's attach, this client's attach under the wrong KB and an unknown document id are all `404`; a form with no `file` part is `400`, a JSON body is `415`, `filename: ""` is `validation-failed`; and a document ingested as `text` goes from `fileUrl: ""` to an internal reference |
+
+`pairing.e2e.test.ts` — 32 → 34, and these are the mTLS half: `whoami`'s
+`clientId` is `pairStatus().id`, its `createdAt` is `pairedAt`, its
+`serialNumber` is hex and equals `certSerial` — the socket's certificate, over a
+real handshake — a `write` pairing reads `["read", "write"]`, and a `read`-only
+client, which every other route but health and status refuses something to,
+gets its answer.
+
+The 50 MB file-part cap is not re-tested here: the multipart envelope's own
+`413` is `api/http.test.ts`'s, and the constant is the ingest's, imported rather
+than restated.
+
+q01–q15 unchanged and green.
+
+### Gate
+
+```sh
+pnpm typecheck && pnpm lint && node scripts/check-strip-types.mjs \
+  && pnpm audit --prod --audit-level high
+SEARCH_TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/search_test pnpm test
+node packages/sdk/scripts/rehearse-npm-pack.mjs
+```
+
+1114 → 1127 passing (358 + 627 + 82 + 60), no reds, no dependency added and no
+version bumped. Nothing under `packages/search/src/{kb,knowledge,v1}/**` was
+touched (ADR 0005). The pack rehearsal gained the new
+`@actana/search/contracts/whoami` entry point and two named exports on
+`@actana/search/contracts`.

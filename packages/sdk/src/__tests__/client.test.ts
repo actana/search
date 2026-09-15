@@ -24,6 +24,7 @@ import { SearchApiError } from "../errors.ts";
 import {
   CapabilitiesSchema,
   DocumentSchema,
+  WhoamiSchema,
   HybridQueryResponseSchema,
   IngestResponseSchema,
   KnowledgeBaseSchema,
@@ -173,6 +174,15 @@ describe("the namespaces", () => {
       "/v1/kbs/kb_1/documents/d_1",
     );
     await check(
+      () =>
+        client.documents.attachBlob("kb_1", "d_1", {
+          file: Buffer.from("x"),
+          filename: "a.md",
+        }),
+      "PUT",
+      "/v1/kbs/kb_1/documents/d_1/blob",
+    );
+    await check(
       () => client.documents.chunks("kb_1", "d_1"),
       "GET",
       "/v1/kbs/kb_1/documents/d_1/chunks",
@@ -278,6 +288,7 @@ describe("the namespaces", () => {
     );
     await check(() => client.webhooks.delete(), "DELETE", "/v1/webhooks");
     await check(() => client.capabilities(), "GET", "/v1/capabilities");
+    await check(() => client.whoami(), "GET", "/v1/whoami");
     await check(() => client.pairStatus(), "GET", "/v1/pair/status");
   });
 
@@ -420,6 +431,124 @@ describe("ingest", () => {
     const first = String(last().headers["content-type"]);
     await client.kbs.ingest("kb_1", { filename: "a.md", file: Buffer.from("x") });
     expect(String(last().headers["content-type"])).not.toBe(first);
+  });
+});
+
+describe("attachBlob", () => {
+  /** A document row the fake answers the attach with. */
+  const DOCUMENT = {
+    id: "d_1",
+    knowledgeBaseId: "kb_1",
+    filename: "handbook.md",
+    fileUrl: "/api/files/serve/s3/kb%2F1758000000000-abcd1234-handbook.md",
+    fileSize: 12,
+    mimeType: "text/markdown",
+    chunkCount: 6,
+    processedChunks: 6,
+    tokenCount: 900,
+    characterCount: 3182,
+    processingStatus: "completed" as const,
+    processingStartedAt: "2026-09-14T00:00:00.000Z",
+    processingCompletedAt: "2026-09-14T00:00:01.000Z",
+    processingError: null,
+    enabled: true,
+    includedInKb: true,
+    keywordStatus: "extracted",
+    uploadedAt: "2026-09-14T00:00:00.000Z",
+    deletedAt: null,
+    connectorId: null,
+    sourceUrl: null,
+    tag1: null,
+    tag2: null,
+    tag3: null,
+    tag4: null,
+    tag5: null,
+    tag6: null,
+    tag7: null,
+    number1: null,
+    number2: null,
+    number3: null,
+    number4: null,
+    number5: null,
+    date1: null,
+    date2: null,
+    boolean1: null,
+    boolean2: null,
+    boolean3: null,
+  };
+
+  it("sends three parts and answers with the document, not an acknowledgement", async () => {
+    canned = { status: 200, json: DocumentSchema.parse(DOCUMENT) };
+    const bytes = Buffer.from("# Leave\r\n\r\nSix.\r\n", "utf8");
+    const answer = await client.documents.attachBlob("kb_1", "d_1", {
+      file: bytes,
+      filename: "handbook.md",
+      mimeType: "text/markdown",
+    });
+
+    const contentType = String(last().headers["content-type"]);
+    expect(contentType).toMatch(/^multipart\/form-data; boundary=----actana-search-[0-9a-f]{32}$/);
+    const raw = last().body.toString("binary");
+    expect(raw).toContain(
+      `content-disposition: form-data; name="file"; filename="handbook.md"`,
+    );
+    expect(raw).toContain("content-type: text/markdown");
+    expect(raw).toContain(`content-disposition: form-data; name="filename"`);
+    expect(raw).toContain(`content-disposition: form-data; name="mimeType"`);
+    // The bytes go over verbatim, CRLFs and all — this is a copy, not a parse.
+    expect(last().body.includes(bytes)).toBe(true);
+    // Nothing that belongs to the row: the document exists and is not being
+    // re-described. No `documentId`, no tags, no `includedInKb`, no `metadata`.
+    expect(raw).not.toContain(`name="documentId"`);
+    expect(raw).not.toContain(`name="includedInKb"`);
+    expect(raw).not.toContain(`name="metadata"`);
+    expect(raw).not.toContain(`name="tag1"`);
+
+    // What comes back is the document, so a caller sees the new `fileUrl` and
+    // that `processingStatus` and `chunkCount` did not move.
+    expect(DocumentSchema.safeParse(answer).success).toBe(true);
+    expect(answer).toMatchObject({
+      fileUrl: DOCUMENT.fileUrl,
+      processingStatus: "completed",
+      chunkCount: 6,
+    });
+  });
+
+  it("escapes both ids, so neither can add a path segment", async () => {
+    canned = { status: 200, json: {} };
+    await client.documents
+      .attachBlob("kb/1", "d/1", { file: Buffer.from("x"), filename: "a.md" })
+      .catch(() => undefined);
+    expect(last().path).toBe("/v1/kbs/kb%2F1/documents/d%2F1/blob");
+  });
+});
+
+describe("whoami()", () => {
+  it("answers the paired client id, the scopes it holds, and the schema version", async () => {
+    /**
+     * The call Studio's migration needs. `capabilities()` carries no client id
+     * and the registration blob has none either, so before this route the id
+     * had to come from an operator on a command line.
+     */
+    canned = {
+      status: 200,
+      json: WhoamiSchema.parse({
+        clientId: "pc_1",
+        label: "actanastudio",
+        scopes: ["read", "write", "admin"],
+        createdAt: "2026-09-15T00:00:00.000Z",
+        serialNumber: "0a1b2c3d",
+        schemaVersion: 2,
+      }),
+    };
+    const me = await client.whoami();
+    expect(last().method).toBe("GET");
+    expect(last().path).toBe("/v1/whoami");
+    expect(last().body.length).toBe(0);
+    expect(me.clientId).toBe("pc_1");
+    // Expanded, so a caller asks rather than re-implements the rank.
+    expect(me.scopes).toEqual(["read", "write", "admin"]);
+    expect(me.schemaVersion).toBe(2);
   });
 });
 

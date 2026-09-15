@@ -14,6 +14,7 @@
 
 export * from "./contracts/common.ts";
 export * from "./contracts/capabilities.ts";
+export * from "./contracts/whoami.ts";
 export * from "./contracts/kbs.ts";
 export * from "./contracts/documents.ts";
 export * from "./contracts/keywords.ts";

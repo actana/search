@@ -19,6 +19,7 @@
 
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import {
+  AttachBlobMultipartFieldsSchema,
   BulkDocumentsRequestSchema,
   IngestJsonRequestSchema,
   IngestMultipartFieldsSchema,
@@ -68,6 +69,23 @@ import type { SearchRouter } from "../routes.ts";
 import { documentToWire } from "../serialize.ts";
 
 const requestId = (): string => `rest-${generateShortId(8)}`;
+
+/**
+ * The statuses that mean a run is under way over this document's current bytes.
+ *
+ * `processing` is the legacy umbrella and the other four are the same run
+ * further along (`ProcessingStatusSchema`), so all five are one answer to one
+ * question: is something reading the object right now? `pending` is not among
+ * them — an upload made with `includedInKb: false` rests there with no job
+ * enqueued — and `completed` and `failed` are both settled.
+ */
+const PROCESSING_IN_FLIGHT: ReadonlySet<string> = new Set([
+  "processing",
+  "chunking",
+  "embedding",
+  "clustering",
+  "keywording",
+]);
 
 export function registerDocumentRoutes(router: SearchRouter): void {
   router.add(
@@ -190,6 +208,91 @@ export function registerDocumentRoutes(router: SearchRouter): void {
         sendJson(res, 200, documentToWire(await requireDocument(kbId!, docId!)));
       },
     ),
+  );
+
+  router.add(
+    /**
+     * `PUT /v1/kbs/:kbId/documents/:docId/blob` — the bytes of a document that
+     * already exists, with no pipeline behind them.
+     *
+     * **The one write on this surface that moves bytes and no meaning.** Every
+     * ingest route creates a document and enqueues work; this one repoints an
+     * existing row at a new object in this instance's bucket and leaves
+     * `processingStatus`, `chunkCount`, the chunks, their vectors and the
+     * keyword overlay exactly as they were. It exists for the migration
+     * (Studio's TASK-013): the rows move by SQL into `search.*`, and the
+     * objects they name are in Studio's bucket — so the bytes have to arrive
+     * separately, and a re-ingest would rewrite the chunk ids and embeddings
+     * that moved with them, which is not a move.
+     *
+     * Three columns change and they are the three that describe the object:
+     * `file_url`, `mime_type`, `file_size`. `filename` does not — it is the
+     * document's name, a rename is `PATCH …/documents/:docId`, and the
+     * `filename` *part* of this form names the object instead.
+     *
+     * **Idempotent in the row, not in the bucket.** The key scheme is ingest's
+     * (`kb/<timestamp>-<random>-<sanitised>`), so a second attach of the same
+     * bytes writes a second object and points the row at it; the row ends in
+     * the same state and nothing about the document changed, which is the
+     * idempotence a caller retrying a stream needs. The superseded object is
+     * **left in place** deliberately: a job holding the old `fileUrl` in its
+     * payload may still be reading it, and a migration that is re-run after a
+     * partial failure should not have had its source deleted underneath it.
+     */
+    route("PUT", "/v1/kbs/:kbId/documents/:docId/blob", "write", async (ctx, { kbId, docId }) => {
+      await requireKb(ctx.client, kbId!);
+      const row = await requireDocument(kbId!, docId!);
+
+      /**
+       * A document being processed right now keeps its old `fileUrl` in the
+       * job payload and in the worker's hands, so swapping the row underneath
+       * it would leave the chunks describing one object and the row naming
+       * another. Refused rather than raced.
+       *
+       * The whole in-flight set and not the literal `processing`: that value is
+       * the legacy umbrella (`ProcessingStatusSchema`) and `chunking`,
+       * `embedding`, `clustering` and `keywording` are the same run further
+       * along. `pending` is **not** in it — a document uploaded with
+       * `includedInKb: false` sits there with no job at all, and attaching its
+       * bytes is exactly what a caller would want to do next.
+       */
+      if (PROCESSING_IN_FLIGHT.has(row.processingStatus)) {
+        throw conflict(
+          `document ${docId} is ${row.processingStatus}: a running job is reading its current ` +
+            "bytes, so they cannot be replaced yet. Wait for `processingStatus` to settle " +
+            "(poll GET …/documents/:docId, or listen on GET /v1/events) and attach again",
+        );
+      }
+
+      const body = await readMultipartBody(ctx.req);
+      const file = body.files.find((f) => f.field === "file") ?? body.files[0];
+      if (!file) throw badRequest("the multipart body carries no `file` part");
+      // The same cap as ingest, from the same constant: a route must not accept
+      // a larger file through a different door.
+      if (file.bytes.length > MAX_UPLOAD_SIZE_BYTES) {
+        throw new HttpError(
+          413,
+          "payload-too-large",
+          `the file is over ${MAX_UPLOAD_SIZE_BYTES} bytes`,
+        );
+      }
+      const fields = parseWith(AttachBlobMultipartFieldsSchema, body.fields);
+      const mimeType = fields.mimeType ?? file.contentType;
+
+      const stored = await StorageService.uploadFile({
+        file: file.bytes,
+        fileName: fields.filename ?? file.filename,
+        contentType: mimeType,
+        context: "knowledge-base",
+      });
+
+      await db
+        .update(document)
+        .set({ fileUrl: stored.path, fileSize: file.bytes.length, mimeType })
+        .where(eq(document.id, docId!));
+
+      sendJson(ctx.res, 200, documentToWire(await requireDocument(kbId!, docId!)));
+    }),
   );
 
   router.add(
