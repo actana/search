@@ -125,6 +125,19 @@ export interface IngestDocumentArgs {
   tx?: typeof db
   /** Defaults to `false` — uploaded but not chunked. */
   includedInKb?: boolean
+  /**
+   * The id to give the new document, when the caller has already told somebody
+   * what it is.
+   *
+   * The REST ingest route answers `{ documentId }` before any of the work has
+   * happened and then enqueues a `kb.ingest.document` job, so the id has to
+   * exist before this function runs. {@link stageIngestedDocument} is
+   * idempotent, so the row the route wrote and the row this would have written
+   * are the same row.
+   */
+  documentId?: string
+  /** Tag slot values to stamp on the document row. */
+  tags?: Record<string, string | number | boolean | Date | null>
 }
 
 export interface IngestDocumentResult {
@@ -142,6 +155,61 @@ interface PerChunkResult {
 interface KbClusterRow {
   clusterId: number
   centroid: number[]
+}
+
+/** What {@link stageIngestedDocument} needs to write the row. */
+export interface StageIngestedDocumentArgs {
+  kbId: string
+  documentId: string
+  filename: string
+  mimeType?: string
+  /** Where the bytes are, for a document that has any. Empty for direct text. */
+  fileUrl?: string
+  fileSize?: number
+  characterCount?: number
+  includedInKb?: boolean
+  tags?: Record<string, string | number | boolean | Date | null>
+}
+
+/**
+ * Write the `document` row an ingest works against.
+ *
+ * Extracted from {@link ingestDocument} verbatim — same columns, same values —
+ * so the REST route can create the row, answer with its id, and hand the work
+ * to a job that calls `ingestDocument` with that same id. `onConflictDoNothing`
+ * is what makes calling it twice with one id harmless, and therefore what makes
+ * the route and the job agree on one row.
+ *
+ * The status is `pending` and not `processing` even when the document will be
+ * ingested: chunking and embedding happen outside the chunk-write transaction,
+ * and the document is only flipped to `completed` atomically with the chunk
+ * inserts. A `processing` row here would leave a `processing` document with
+ * zero chunks for the whole embed window if the process died — a `pending` row
+ * with `processing_started_at` set is the cleaner stuck state, and it is the one
+ * the document-timeout sweep reconciles.
+ */
+export async function stageIngestedDocument(args: StageIngestedDocumentArgs): Promise<void> {
+  const now = new Date()
+  await db
+    .insert(document)
+    .values({
+      id: args.documentId,
+      knowledgeBaseId: args.kbId,
+      filename: args.filename,
+      fileUrl: args.fileUrl ?? '',
+      fileSize: args.fileSize ?? 0,
+      mimeType: args.mimeType ?? 'application/octet-stream',
+      chunkCount: 0,
+      tokenCount: 0,
+      characterCount: args.characterCount ?? 0,
+      processingStatus: 'pending',
+      processingStartedAt: args.includedInKb ? now : null,
+      enabled: true,
+      includedInKb: args.includedInKb ?? false,
+      uploadedAt: now,
+      ...(args.tags ?? {}),
+    })
+    .onConflictDoNothing()
 }
 
 /**
@@ -173,32 +241,16 @@ export async function ingestDocument(args: IngestDocumentArgs): Promise<IngestDo
    * embedding endpoint ingests fine and is semantically searchable.
    */
 
-  const documentId = generateId()
-  const now = new Date()
-  /**
-   * Insert the document as `pending` (not `processing`) even when it will be
-   * ingested. Chunking + embedding happen outside the chunk-write transaction
-   * below, and the document is only flipped to `completed` atomically with the
-   * chunk inserts. Marking it `processing` here would leave a `processing` doc
-   * with zero chunks for the whole embed window if the process dies — a
-   * `pending` doc with `processing_started_at` set is the cleaner stuck state
-   * and is reconciled by the document-timeout sweep.
-   */
-  await db.insert(document).values({
-    id: documentId,
-    knowledgeBaseId: kbId,
+  const documentId = args.documentId ?? generateId()
+  await stageIngestedDocument({
+    kbId,
+    documentId,
     filename,
-    fileUrl: '',
+    mimeType,
     fileSize: file instanceof Buffer ? file.length : 0,
-    mimeType: mimeType ?? 'application/octet-stream',
-    chunkCount: 0,
-    tokenCount: 0,
     characterCount: directText?.length ?? 0,
-    processingStatus: 'pending',
-    processingStartedAt: includedInKb ? now : null,
-    enabled: true,
     includedInKb,
-    uploadedAt: now,
+    tags: args.tags,
   })
 
   if (!includedInKb) {

@@ -44,11 +44,107 @@ const result = await search.kbs.query(kb.id, {
 });
 ```
 
-The `kbs`, `documents`, `keywords`, `clusters`, `tags`, `endpoints`, `webhooks`
-and `events()` namespaces land with the REST surface in TASK-004 and throw
-`SearchApiError { code: "not-implemented" }` until then — so the snippet above
-is what the client will look like, not what it does yet. `health()`,
-`capabilities()`, `pairStatus()` and `request(method, path, …)` work today.
+Namespaces: `kbs`, `documents`, `keywords`, `clusters`, `tags`, `endpoints`,
+`webhooks`, plus `events()`, `capabilities()`, `health()`, `pairStatus()` and
+`request(method, path, …)` for a route with no method yet. Every route on the
+instance is reachable through one of them —
+[`docs/external-api.md`](https://github.com/actana/search/blob/main/docs/external-api.md)
+is the table.
+
+## Ingest is asynchronous, and the encoding is a choice about behaviour
+
+```ts
+// A file. Multipart, and the resumable worker pipeline: parse → chunk → plan
+// → embed → finalize → keyword.
+const fromFile = await search.kbs.ingest(kb.id, {
+  filename: "handbook.md",
+  file: await readFile("handbook.md"),          // Buffer, Uint8Array or Blob
+  tags: { tag1: "handbook" },
+});
+
+// A string. JSON, and `ingestDocument`: chunked and embedded in one pass,
+// written only to the KB's partition, and the only path that stores the
+// caller's `metadata` on every chunk.
+const fromText = await search.kbs.ingest(kb.id, {
+  filename: "notes.md",
+  text: "…",
+  metadata: { category: "handbook" },
+});
+```
+
+The two produce measurably different corpora from the same bytes, and both are
+frozen behaviour — so pick the one whose ranking you want rather than the one
+whose encoding is convenient.
+
+Either way what comes back is `{ documentId, processingStatus }` before any of
+the work has happened. Wait for it by polling, or by listening:
+
+```ts
+for await (const event of search.events()) {
+  if (event.event === "document.ingested" && event.documentId === fromFile.documentId) break;
+}
+```
+
+## One query route, two retrieval paths
+
+```ts
+// The hybrid blend: the instance picks the query's keywords out of this KB's
+// own vocabulary, then ranks keyword + semantic together.
+await search.kbs.query(kb.id, { text: "parental leave", topK: 5 });
+
+// Pure semantic, whatever `keywordWeight` says: an explicitly empty
+// `queryKeywords` blends nothing. Omitting it and sending `[]` are different
+// requests and return different documents.
+await search.kbs.query(kb.id, { text: "parental leave", queryKeywords: [] });
+
+// The v1 path: tag filter first, vector search over what survives. Rows carry
+// their tag columns and a cosine `distance` instead of a blended score.
+await search.kbs.query(kb.id, {
+  mode: "v1-tags",
+  text: "parental leave",
+  tags: [{ tagSlot: "tag1", fieldType: "text", operator: "eq", value: "handbook" }],
+});
+```
+
+The response is a discriminated union on `mode`, so narrowing on it gives you
+the right `matches`.
+
+## The wire, as schemas
+
+```ts
+import { QueryRequestSchema, SearchEventSchema } from "@actana/search/contracts";
+```
+
+Every request, response, error and event shape is a zod schema in
+`@actana/search/contracts`, and **the instance validates with those exact
+objects** — this package is where the protocol is defined, not a client written
+against it. Validate a webhook body you received, build a request you are about
+to send, or read a schema instead of a prose description.
+
+## Verifying a webhook
+
+```ts
+import { createHmac, timingSafeEqual } from "node:crypto";
+import { SEARCH_SIGNATURE_PREFIX, SearchEventSchema } from "@actana/search/contracts";
+
+// `raw` is the body as received. Never a re-encoding of the parsed JSON: two
+// encoders disagree on key order, and a check over your own re-encoding passes
+// on a body you never saw.
+function verify(secret: string, raw: Buffer, header: string): boolean {
+  const expected = createHmac("sha256", secret).update(raw).digest("hex");
+  const offered = Buffer.from(header.slice(SEARCH_SIGNATURE_PREFIX.length), "hex");
+  return (
+    header.startsWith(SEARCH_SIGNATURE_PREFIX) &&
+    offered.length === 32 &&
+    timingSafeEqual(offered, Buffer.from(expected, "hex"))
+  );
+}
+
+const event = SearchEventSchema.parse(JSON.parse(raw.toString("utf8")));
+```
+
+`x-search-event-id` is deterministic, so a redelivery after an ambiguous timeout
+carries the id you already saw — deduplicate on it.
 
 ## The fingerprint is not optional
 
@@ -96,10 +192,8 @@ is the instance's own machine-readable reason.
 | `@actana/search/pairing-csr` | the key pair and CSR, generated locally |
 | `@actana/search/registration-blob` | the credential's storage codec |
 | `@actana/search/errors` | `SearchApiError` |
-
-`@actana/search/contracts` — the zod request, response and event schemas — lands
-with the REST surface in TASK-004. It is not in this release and importing it
-fails; the table above is what resolves today.
+| `@actana/search/contracts` | every request, response, error and event schema — one definition, imported by the server too |
+| `@actana/search/contracts/kbs`, `/documents`, `/keywords`, `/clusters`, `/tags`, `/endpoints`, `/webhooks`, `/events`, `/capabilities`, `/common` | one family each, for a caller that wants one |
 
 ## Dependencies
 

@@ -148,7 +148,14 @@ export type SearchPairingRoutesOptions = {
 };
 
 /** A refusal, in the JSON shape every route here answers with. */
-type Refusal = { status: number; code: string; message: string; headers?: Record<string, string> };
+type Refusal = {
+  status: number;
+  code: string;
+  message: string;
+  /** Structured and route-specific — an error id on a `core-error`, and little else. */
+  detail?: unknown;
+  headers?: Record<string, string>;
+};
 
 /**
  * The single refusal every session-state and wrong-code failure answers with.
@@ -632,12 +639,28 @@ export function sendJson(res: ServerResponse, status: number, payload: unknown):
   res.end(body);
 }
 
+/**
+ * Write a refusal: `{ code, message, error }`, and `detail` where there is one.
+ *
+ * **All three keys, always.** `ErrorBodySchema` (`@actana/search/contracts`)
+ * requires `message`, and ADR 0009 D6 says `error` is written *beside* it with
+ * the same string — so a body carrying only `error`, which is what this wrote
+ * while the pre-auth surface was its only caller, does not validate against the
+ * contract the SDK infers its error type from. The router refuses through this
+ * function too (`api/server.ts`), so that gap was every scope, KB, route and
+ * certificate refusal on the authenticated surface.
+ */
 export function sendRefusal(res: ServerResponse, refusal: Refusal): void {
   if (res.headersSent) {
     res.destroy();
     return;
   }
-  const body = JSON.stringify({ code: refusal.code, error: refusal.message });
+  const body = JSON.stringify({
+    code: refusal.code,
+    message: refusal.message,
+    error: refusal.message,
+    ...(refusal.detail === undefined ? {} : { detail: refusal.detail }),
+  });
   res.writeHead(refusal.status, {
     "content-type": "application/json",
     "content-length": String(Buffer.byteLength(body)),

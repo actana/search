@@ -18,8 +18,11 @@
  *      is where a pairing code is minted. `SEARCH_ADMIN_PORT` adds a loopback
  *      TCP port beside it for a platform with no Unix sockets.
  *
- * The ingestion workers and the endpoint sources land in TASK-005; the rest of
- * the REST surface in TASK-004, through `registerRoutes`.
+ * The `/v1` REST surface is mounted at step 4 through `registerRoutes`
+ * (`api/routes/index.ts`). The ingestion **worker process** and the endpoint
+ * sources land in TASK-005: until then the jobs this API enqueues are picked up
+ * by a worker started beside it, or — in a test — by the inline runner
+ * (`SEARCH_INLINE_JOBS=1`, `queue/inline.ts`).
  */
 
 import { createLogger } from "@actana/search-shared/log";
@@ -29,6 +32,7 @@ import { createDatabase } from "./db/client.ts";
 import { runMigrations } from "./db/migrate.ts";
 import { adminSocketPath, startAdminServer } from "./api/admin-server.ts";
 import { startSearchServer } from "./api/server.ts";
+import { registerSearchRoutes } from "./api/routes/index.ts";
 import { SearchPairingStore } from "./pairing/pairing-store.ts";
 import { PairingRevocations, startPairingRevocationSweep } from "./pairing/pairing-revocation.ts";
 import { ensureMaterial } from "./pairing/self-register.ts";
@@ -61,6 +65,7 @@ export async function boot(): Promise<void> {
     port: cfg.SEARCH_PORT,
     publicHosts,
     devInsecure: cfg.SEARCH_DEV_INSECURE,
+    registerRoutes: registerSearchRoutes,
   });
 
   const admin = await startAdminServer({
@@ -78,7 +83,6 @@ export async function boot(): Promise<void> {
     adminSocket: admin.socketPath,
     adminPort: admin.port,
   });
-  logger.warn("No REST surface yet — the routes land in TASK-004.");
 }
 
 if (process.argv[1]?.endsWith("index.ts")) {

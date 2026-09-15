@@ -33,8 +33,12 @@ import * as http from "node:http";
 import * as https from "node:https";
 import type { AddressInfo } from "node:net";
 import { createLogger } from "@actana/search-shared/log";
+import { generateShortId } from "@actana/search-shared/short-id";
 import type { PairedClient } from "@actana/search-shared/pairing/pairing-code-digest";
 import type { SearchHealth, SearchPairStatus } from "@actana/search/pairing-wire";
+import { SEARCH_PROTOCOL_VERSION } from "@actana/search";
+import { SEARCH_FEATURES, type Capabilities } from "@actana/search/contracts";
+import { inATestEnvironment } from "../config.ts";
 import { SCHEMA_VERSION } from "../db/schema.ts";
 import {
   CLIENT_CERT_REFUSAL_CODE,
@@ -67,22 +71,14 @@ export const DEV_INSECURE_VAR = "SEARCH_DEV_INSECURE";
 export const DEV_CLIENT_HEADER = "x-paired-client";
 
 /**
- * Is this a process the insecure mode is for?
+ * Is this a process a test-only mode may run in?
  *
- * **Allow-list, not a deny-list, and that is the change.** Refusing only under
- * `NODE_ENV=production` made every environment that forgot to set `NODE_ENV` —
- * a bare `node src/index.ts`, a container whose entrypoint drops it, a staging
- * box nobody labelled — a environment where one variable turns the mTLS wall
- * off and makes `x-paired-client` an identity. An unset `NODE_ENV` is the
- * default, so the default has to be the refusal.
- *
- * Two ways in, both of which a test run has and a deployment does not:
- * `NODE_ENV=test`, which every runner sets, and `SEARCH_TEST_DATABASE_URL`,
- * which is what this repository's integration suites gate on.
+ * **Defined in `config.ts` now**, because `SEARCH_INLINE_JOBS` asks the same
+ * question of the same environment and two copies of that answer are two things
+ * to get wrong. Re-exported here, where the question was first asked and where
+ * a reader of the insecure mode goes looking for it.
  */
-export function inATestEnvironment(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.NODE_ENV === "test" || (env.SEARCH_TEST_DATABASE_URL ?? "") !== "";
-}
+export { inATestEnvironment };
 
 /** Refuse to serve plain HTTP outside a test, and say what it would have done. */
 function assertNotInsecure(): never {
@@ -191,14 +187,14 @@ export async function startSearchServer(opts: SearchServerOptions): Promise<Sear
   });
 
   server.on("request", (req, res) => {
-    void serve(req, res, { routes, pairing, opts, insecure });
+    void serveGuarded(req, res, { routes, pairing, opts, insecure });
   });
   server.on("checkContinue", (req, res) => {
     if (!mayServe(req, opts.revocations)) return respondClientCertRequired(res);
     if (pairing.handleContinue(req, res)) return;
     // Everything else gets the continue and then the ordinary path.
     res.writeContinue();
-    void serve(req, res, { routes, pairing, opts, insecure });
+    void serveGuarded(req, res, { routes, pairing, opts, insecure });
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -242,6 +238,47 @@ type ServeContext = {
   opts: SearchServerOptions;
   insecure: boolean;
 };
+
+/**
+ * {@link serve}, with the net under it.
+ *
+ * **Nothing the listener calls may reject.** `server.on("request")` can only
+ * `void` the promise it gets, so a throw anywhere in `serve` that is not inside
+ * a route's own try — the router's `routes.find` walking a predicate, a URL
+ * that cannot be parsed, the identity branch itself — became an
+ * `unhandledRejection` and took the process down. One malformed URL from any
+ * paired client was enough. Everything that gets this far is this instance's
+ * fault, so it is logged with an id and answered `500 core-error` (ADR 0009
+ * D7), and the listener keeps listening.
+ */
+async function serveGuarded(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  ctx: ServeContext,
+): Promise<void> {
+  try {
+    await serve(req, res, ctx);
+  } catch (err) {
+    const errorId = `err_${generateShortId(10)}`;
+    logger.error("Request handling failed", {
+      errorId,
+      method: req.method ?? "GET",
+      url: req.url ?? "/",
+      error: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack : undefined,
+    });
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    sendRefusal(res, {
+      status: 500,
+      code: "core-error",
+      message: "this instance failed",
+      detail: { errorId },
+    });
+  }
+}
 
 async function serve(
   req: http.IncomingMessage,
@@ -298,7 +335,7 @@ async function serve(
     if (route.scope !== null && !scopeAllows(client.scope, route.scope)) {
       return sendRefusal(res, {
         status: 403,
-        code: "forbidden",
+        code: "scope-forbidden",
         message: `this client is scoped \`${client.scope}\` and this route needs \`${route.scope}\``,
       });
     }
@@ -491,21 +528,26 @@ function registerBuiltinRoutes(router: SearchRouter, opts: SearchServerOptions):
   });
 
   /**
-   * What this instance can do. TASK-004 fills the feature list out; the shape
-   * is fixed now because the SDK reads it to decide whether it is newer than
-   * the instance it is holding.
+   * What this instance can do.
+   *
+   * The feature list is `SEARCH_FEATURES` in the contracts — the whole closed
+   * enum, because this build serves all of it. It is a list rather than a
+   * version number so that a caller tests membership (`features.includes
+   * ("v1-tags")`) instead of inferring capability from an ordering nobody
+   * agreed on.
    */
   router.add({
     method: "GET",
     path: "/v1/capabilities",
     scope: "read",
     handle: ({ res }) => {
-      sendJson(res, 200, {
-        protocol: 1,
+      const body: Capabilities = {
+        protocol: SEARCH_PROTOCOL_VERSION,
         schemaVersion: SCHEMA_VERSION,
-        features: [] as string[],
+        features: [...SEARCH_FEATURES],
         publicHost: opts.publicHosts[0] ?? "localhost",
-      });
+      };
+      sendJson(res, 200, body);
     },
   });
 }

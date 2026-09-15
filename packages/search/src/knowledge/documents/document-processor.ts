@@ -745,6 +745,19 @@ async function parseWithFileParser(fileUrl: string, filename: string, mimeType: 
 
     if (fileUrl.startsWith('data:')) {
       content = await parseDataURI(fileUrl, filename, mimeType)
+    } else if (isInternalFileUrl(fileUrl)) {
+      /**
+       * A blob in Search's own bucket (ADR 0006). Studio's `file_url` for an
+       * uploaded document was an absolute URL, so this branch had no work to do
+       * there and the reference landed in `parseFile` below — a local path that
+       * does not exist, which is why a REST ingest could not have parsed
+       * anything without it. Added rather than lifted; the branch it precedes
+       * is unchanged, and no path that worked before reaches a different
+       * parser.
+       */
+      const result = await parseBlobFile(fileUrl, filename, mimeType)
+      content = result.content
+      metadata = result.metadata || {}
     } else if (fileUrl.startsWith('http')) {
       const result = await parseHttpFile(fileUrl, filename, mimeType)
       content = result.content
@@ -782,6 +795,17 @@ async function parseDataURI(fileUrl: string, filename: string, mimeType: string)
   const buffer = Buffer.from(base64Data, 'base64')
   const result = await parseBuffer(buffer, extension)
   return result.content
+}
+
+/** Parse a blob this instance holds: download the bytes, then parse them. */
+async function parseBlobFile(
+  fileUrl: string,
+  filename: string,
+  mimeType?: string
+): Promise<{ content: string; metadata?: FileParseMetadata }> {
+  const buffer = await downloadFileFromUrl(fileUrl, TIMEOUTS.FILE_DOWNLOAD)
+  const extension = resolveParserExtension(filename, mimeType)
+  return parseBuffer(buffer, extension)
 }
 
 async function parseHttpFile(

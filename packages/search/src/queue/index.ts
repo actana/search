@@ -21,6 +21,7 @@ import { FlowProducer, Queue } from 'bullmq'
 import { createLogger } from '@actana/search-shared/log'
 import { generateId } from '@actana/search-shared/short-id'
 import { getQueueConnection } from './redis.ts'
+import { inlineFlowProducer, inlineJobQueue, inlineJobsEnabled } from './inline.ts'
 
 const logger = createLogger('queue')
 
@@ -135,9 +136,17 @@ const backend: JobQueueBackend = {
   },
 }
 
-/** The queue. Async to keep the lifted `await getJobQueue()` call sites intact. */
+/**
+ * The queue. Async to keep the lifted `await getJobQueue()` call sites intact.
+ *
+ * **`SEARCH_INLINE_JOBS=1` swaps the backend here and nowhere else.** That is
+ * the seam TASK-005 replaces with a real worker process: the engine enqueues
+ * through this one function, so which side of it does the work is a decision
+ * this file makes and no call site sees. `queue/inline.ts` says what the inline
+ * side is for and why it refuses to be a deployment.
+ */
 export async function getJobQueue(): Promise<JobQueueBackend> {
-  return backend
+  return inlineJobsEnabled() ? inlineJobQueue : backend
 }
 
 let flowProducer: FlowProducer | undefined
@@ -149,6 +158,10 @@ let flowProducer: FlowProducer | undefined
  * last batch, whichever batch that turns out to be.
  */
 export function getFlowProducer(): FlowProducer {
+  // The inline stand-in implements the one method the fan-out calls. It is not
+  // a `FlowProducer` and cannot be — the cast is the honest shape of "this is
+  // the seam", and `queue/inline.ts` is where it is justified.
+  if (inlineJobsEnabled()) return inlineFlowProducer as unknown as FlowProducer
   if (flowProducer) return flowProducer
   flowProducer = new FlowProducer({
     connection: getQueueConnection(),
@@ -175,3 +188,10 @@ export async function closeQueue(): Promise<void> {
 }
 
 export { getQueueConnection, resetQueueConnection } from './redis.ts'
+export {
+  INLINE_JOBS_VAR,
+  inlineJobFailures,
+  inlineJobsEnabled,
+  inlineJobsSettled,
+  resetInlineJobs,
+} from './inline.ts'

@@ -7,8 +7,12 @@
  * one the plan's snippet uses. This barrel exists for a caller that wants one
  * import; nothing in the package imports it.
  *
- * The zod contracts (`@actana/search/contracts`) land with the REST surface in
- * TASK-004, and the client's typed namespaces fill in with them.
+ * The zod contracts are `@actana/search/contracts` (and one module per family
+ * beneath it). They are **not** re-exported here: they are three hundred
+ * exported names, most of them schemas a given caller will never touch, and a
+ * barrel that pulled them in would make `import { SearchClient } from
+ * "@actana/search"` pay for all of them. Import the contracts by their own
+ * path.
  */
 
 /** The wire protocol version this SDK speaks. Reported by `GET /capabilities`. */
