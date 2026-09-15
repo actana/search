@@ -1,0 +1,13 @@
+# What must not reach a build context.
+#
+# `node_modules` above all: `deploy/Dockerfile` runs `pnpm install --prod`
+# inside the image and then `COPY packages/ packages/`, so a host tree left in
+# the context is copied over an install that has already happened — with this
+# machine's symlinks and this machine's dev dependencies in it.
+.git
+node_modules
+**/node_modules
+
+# `deploy/` is deliberately NOT ignored: the image copies
+# `deploy/healthcheck.mjs`, which is what its own HEALTHCHECK runs. Ignoring the
+# directory would put the "Cannot find module" back.
