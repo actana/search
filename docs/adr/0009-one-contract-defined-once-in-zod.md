@@ -155,6 +155,16 @@ being diffable against Studio's. `jobs/run.ts` reads the row the engine just
 wrote and publishes from there, which is correct for every path into that state
 including ones added later, and which costs the lifted files nothing.
 
+**Which needs one thing from the transport, and ADR 0010 says what.** "The row
+the engine just wrote" is `failed` as soon as an attempt gives up, and under
+ADR 0010 D4 an attempt giving up is usually not the end of the story. So the
+runner is told how many attempts are left and a `document.failed` waits for the
+last one; a *terminal* failure the engine never recorded is announced by the
+worker's failure handler instead, carrying the typed `reason` that ADR 0010 D3
+defines and that `SearchEventSchema.reason` exists to hold. Both paths derive the
+event id from the same facts (D8a) and claim it from one set, so the two doors
+cannot produce two events for one document.
+
 ## Consequences
 
 - A new field is one edit: the schema. The route gets it validated and the SDK
@@ -167,6 +177,14 @@ including ones added later, and which costs the lifted files nothing.
 - Studio's wrapper layer (TASK-009) is a mapper for dates and envelopes and
   nothing else — every field it needs is on the wire under the name it already
   uses.
+- `/v1/endpoints` is the one route whose body is not only a request shape but a
+  *declaration*: `GET`'s `source` is the object the client last declared,
+  `resolverScope` included, because that field is the one Search, the client and
+  the client's resolver all have to agree on (ADR 0010 D5, D9). The registry
+  behind it is `models/endpoint-registry.ts`, and everything the route adds is
+  the three things a route owes a caller — the contract, the reconciliation of
+  the declared *set*, and a status code for a refusal a module underneath it
+  raised as a plain error.
 - The `v1-tags` mode keeps the older retrieval path alive on the new surface.
   Retiring it is a separate ADR with its own callers to find, which is exactly
   what ADR 0005 asked for.

@@ -177,7 +177,11 @@ inventing language the project does not use, or there is a real gap to record.
   `document.failed`, `clusters.retrained`. One payload, carrying the KB and —
   where there is one — the document, and a **deterministic id** derived from
   what happened rather than from when it was noticed, so the same event
-  announced twice is recognisably one event.
+  announced twice is recognisably one event. A `document.failed` may also carry
+  a `reason`, which is the **Worker**'s classification of the failure
+  (`unknown-endpoint`, `resolver-error`, …) as distinct from `error`, which is
+  the operator's sentence. It is announced only once the job is out of attempts:
+  a Document the engine marked `failed` on a retryable attempt is not news.
 
 **Webhook**
 : A URL a paired client asked to be told at. A delivery is signed

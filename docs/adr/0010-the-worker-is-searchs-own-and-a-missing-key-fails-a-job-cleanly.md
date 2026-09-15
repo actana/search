@@ -58,7 +58,13 @@ succeed"**, and only the code that made the call knows.
 ## Decisions
 
 **D1 — One worker, one queue, one prefix.** `search-knowledge`, under
-`SEARCH_QUEUE_PREFIX` (default `search`). Studio ran four queues for four
+`SEARCH_QUEUE_PREFIX` (default `search`). The worker does **not** own the
+routing table: `jobs/run.ts` maps a job name to a handler, to a per-attempt
+wall-clock budget and to the event that follows, and both transports — this
+worker and the in-process runner the fixture suites use (`SEARCH_INLINE_JOBS=1`,
+which also stops this worker from starting) — go through it. Two tables would be
+two spellings of every job name, in a service whose job names are also sitting
+in Redis. Studio ran four queues for four
 products; Search has one, and the concurrency (20), the lock duration (5
 minutes), the stall interval and `maxStalledCount: 2` are the numbers Studio used
 for *its* knowledge queue, because these are the same jobs. A stall is tolerated
@@ -262,9 +268,15 @@ unhealthy while working perfectly: `--wait` never returns, a
 healthy worker in a loop.
 
 `healthcheck: { disable: true }` on the worker service would have been one line,
-and it buys a container with no liveness signal at all. Instead
-`SEARCH_ROLE=worker` switches `deploy/healthcheck.mjs` to `PING` the Redis the
-worker dials — hand-rolled RESP over a socket, because the probe must not depend
+and it buys a container with no liveness signal at all. And the probe was not *there*: the image copied `packages/` and `scripts/` and
+never `deploy/`, so `HEALTHCHECK CMD node /app/deploy/healthcheck.mjs` failed
+with "Cannot find module" on every container this image has produced — both
+roles, not just the worker. `COPY deploy/healthcheck.mjs deploy/` fixes it, and
+only that file: `Dockerfile`, `docker-compose.yml` and the deploy README are
+what *builds and runs* the image rather than what runs inside it.
+
+Instead of disabling the check, `SEARCH_ROLE=worker` switches
+`deploy/healthcheck.mjs` to `PING` the Redis the worker dials — hand-rolled RESP over a socket, because the probe must not depend
 on anything a `--prod` install could leave out. Queue *depth* is deliberately
 not part of it: a backlog is a capacity problem and restarting the container is
 the wrong answer to it.
@@ -293,8 +305,32 @@ resolver call has a ten-second budget inside a five-minute job lock, so a
 pathological client can reduce throughput without failing anything, which will
 look like Search being slow.
 
-`document.ingested`, `document.failed` and `clusters.retrained` are emitted
-through a small in-process emitter (`events.ts`) that the webhook delivery and
-the SSE stream subscribe to. It is a listener list and a `for` loop — no
-ordering, no durability, nothing that would make it look like a bus. Durable
-delivery to a client's URL is the webhook ledger's job (ADR 0006).
+**Where the events come from, now that both halves exist.** This branch carried
+its own `events.ts` — a listener list and a `for` loop — because the worker had
+to be able to say `document.ingested` before there was anything listening. ADR
+0009 D8/D9 is the answer that survived: one payload, two transports
+(`events/publish.ts` over `events/emitter.ts` and the webhook ledger), and the
+announcement made from the **job's completion** in `jobs/run.ts` rather than
+from inside the frozen engine. `events.ts` is gone and the worker publishes
+through that one door.
+
+Which leaves one thing this ADR has to decide, because it is where the two
+designs actually met. Announcing from the job's completion means reading the row
+the engine just wrote — and the engine writes `failed` the moment *an attempt*
+gives up, which under D4 is routinely a resolver that will answer on the next
+one. Published as-is, every rolling restart on a wired client would raise
+`document.failed` on that client's own stream, and Studio's trigger would act on
+it. So **a `document.failed` is announced only from the terminal attempt**: the
+worker tells `runSearchJob` how many attempts BullMQ has left and the
+announcement is held back while that is above zero (a success is announced
+whatever the number). The event that a *terminal* reason produces — where the
+engine never got as far as the row — comes from the failure handler instead,
+with the typed `reason` on it, and both paths derive the event id from the same
+facts and claim it from the same set, so a document that fails is one event and
+not two.
+
+The cost is named rather than hidden: a document is `failed` in the database
+before it is `failed` on the wire, so a client polling `GET
+/v1/kbs/:id/documents/:docId` can see a state the stream has not mentioned. That
+is the right way round — the row is the truth and the event is the notification
+— and the alternative is a notification that is wrong four times out of five.
