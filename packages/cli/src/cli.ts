@@ -6,12 +6,13 @@
 // flag refusal and every exit code reachable from a unit test without a
 // subprocess.
 //
-// **Two machines, one command.** `pair new|ls|revoke` and `endpoint add|ls` run
-// on the machine that IS the instance and reach it through a 0600 Unix socket;
-// `pair redeem`, `status`, `kb`, `ingest` and `query` run on a paired machine
-// and go over mTLS through `@actana/search`. The help says which is which on
-// every verb, because the only thing separating them is which words an operator
-// types.
+// **Two machines, one command.** `pair new|ls|revoke` run on the machine that IS
+// the instance and reach it through a 0600 Unix socket; `pair redeem`,
+// `status`, `endpoint`, `kb`, `ingest` and `query` run on a paired machine and
+// go over mTLS through `@actana/search`. The help says which is which on every
+// verb, because the only thing separating them is which words an operator
+// types. `endpoint` was on the first list until `PUT /v1/endpoints` existed to
+// put it on the second.
 
 import { SEARCH_PROTOCOL_VERSION } from "@actana/search/index";
 import { parseArgs, type ParsedArgs } from "./cli-args.ts";
@@ -42,15 +43,15 @@ On the instance (through its admin Unix socket, mode 0600)
                               mint a one-time pairing code and print it
   pair ls [--json]            pending codes, and the clients already paired
   pair revoke <id>            unpair a client, or cancel a pending code
-  endpoint add --kind <k> --provider <p> --model <m> --key-stdin
-                              register a model endpoint with a literal key
-  endpoint ls [--client <id>] [--json]
-                              the endpoints this instance knows
 
 On a paired machine (mTLS, through @actana/search)
   pair redeem <address> <ticket> [--fingerprint <fp>] [--profile <name>]
                               spend a code and store the credential
   status [--json]             is this credential good, and what does it grant
+  endpoint add --kind <k> --provider <p> --model <m> --key-stdin
+                              register a model endpoint with a literal key
+  endpoint ls [--json]        the endpoints this client has, and where their
+                              keys come from
   kb ls | kb create <name> | kb rm <id>
   ingest <kb> <file>          put a document into a knowledge base
   query <kb> "<text>" [--top-k <n>] [--keyword-weight <0..1>]

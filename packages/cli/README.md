@@ -24,8 +24,6 @@ service runs on. There is deliberately no `--host`.
 | `pair new [--label <n>] [--scope <s>] [--kbs <a,b>] [--ttl <d>]` | mint a one-time code and print it |
 | `pair ls [--json]` | pending codes, and the clients already paired |
 | `pair revoke <id>` | unpair a client, or cancel a pending code |
-| `endpoint add --kind <k> --provider <p> --model <m> --key-stdin` | register a model endpoint with a literal key |
-| `endpoint ls [--client <id>] [--json]` | the endpoints this instance knows |
 
 **On a paired machine** — these build an mTLS client from the credential
 `pair redeem` stored and go through [`@actana/search`](../sdk/README.md). No
@@ -35,6 +33,8 @@ consumer reads a table and there is no second HTTP client in this package.
 |---|---|
 | `pair redeem <address> <ticket> [--fingerprint <fp>] [--profile <n>]` | spend a code and store the credential |
 | `status [--json]` | is this credential good, and what does it grant |
+| `endpoint add --kind <k> --provider <p> --model <m> --key-stdin` | register a model endpoint with a literal key |
+| `endpoint ls [--json]` | the endpoints this client has, and where their keys come from |
 | `kb ls` / `kb create <name>` / `kb rm <id>` | the knowledge bases |
 | `ingest <kb> <file>` | put a document in |
 | `query <kb> "<text>" [--top-k <n>] [--keyword-weight <0..1>]` | ask |
@@ -96,7 +96,14 @@ Omitting `--fingerprint` is not "skip the check": the command refuses with
 A knowledge base is bound to an embedding endpoint (required) and an inference
 endpoint (optional — without one, keyword extraction is skipped rather than
 failed). A standalone instance holds those keys itself, sealed under
-`SEARCH_ENCRYPTION_KEY`:
+`SEARCH_ENCRYPTION_KEY`.
+
+`endpoint` is a **paired-machine** verb: it goes over mTLS to
+`GET`/`PUT /v1/endpoints` with the credential `pair redeem` stored, and the
+certificate is what says which paired client the endpoint belongs to (which is
+why there is no `--client`). It went through the admin socket for as long as
+there was no authenticated route to reach; there is one now
+([ADR 0009](../../docs/adr/0009-one-contract-defined-once-in-zod.md)).
 
 ```bash
 echo -n "$OPENAI_API_KEY" | actana-search endpoint add \
@@ -112,11 +119,20 @@ runs. A pipe is in none of them. There is no `--key`.
 The key is sealed on the instance and is never printed back — `endpoint ls`
 reports whether a row has one, not what it is.
 
+`PUT /v1/endpoints` is declarative — the body is the set of endpoints the client
+wants to exist — so `endpoint add` reads the current set, appends to it and
+pushes the whole thing back. The endpoints already there are re-declared
+*without* their keys, which the registry reads as "said nothing about it" and
+leaves the sealed ciphertext alone. `--external-id <id>` is the key the upsert
+runs on; without one it is derived from the kind, the provider and the model, so
+running the same command twice updates one row rather than accumulating them.
+
 When a paired client mirrors its own catalog instead (`PUT /v1/endpoints`), its
 endpoints appear as `mirrored` and have no key on this side at all: the instance
 asks that client's resolver for one per job and forgets it within a minute
 ([ADR 0004](../../docs/adr/0004-model-endpoints-flow-both-ways.md)). There is
-nothing to add by hand.
+nothing to add by hand, and `endpoint add` against such a client says so rather
+than writing a row the next push would replace.
 
 ## Exit codes
 

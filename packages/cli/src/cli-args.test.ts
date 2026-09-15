@@ -95,7 +95,7 @@ describe("parseArgs", () => {
       "--ttl", "5m",
       "--fingerprint", "AA:BB",
       "--session", "s-1",
-      "--client", "c-1",
+      "--external-id", "e-1",
       "--kind", "embedding",
       "--provider", "openai",
       "--template", "openai",
@@ -114,7 +114,7 @@ describe("parseArgs", () => {
       ttl: "5m",
       fingerprint: "AA:BB",
       session: "s-1",
-      client: "c-1",
+      externalId: "e-1",
       kind: "embedding",
       provider: "openai",
       template: "openai",
@@ -181,9 +181,8 @@ describe("parseInteger and parseFraction", () => {
 
 describe("the help names the flags that work", () => {
   /**
-   * Two small gaps, both of the kind that gets a working CLI reported as
-   * broken: `-v` was accepted and only `-V` was documented, and `endpoint ls`
-   * takes `--client` and the top-level help did not say so.
+   * The kind of gap that gets a working CLI reported as broken: `-v` was
+   * accepted and only `-V` was documented.
    */
   it("documents both short forms of --version", async () => {
     const { HELP } = await import("./cli.ts");
@@ -193,8 +192,15 @@ describe("the help names the flags that work", () => {
     expect(parseArgs(["-v"]).version).toBe(true);
   });
 
-  it("names --client on endpoint ls", async () => {
+  it("lists endpoint under the paired-machine verbs, not the instance's", async () => {
+    // `endpoint` moved sides when `PUT /v1/endpoints` landed: it is mTLS with a
+    // redeemed profile now, and the certificate is the paired client — so there
+    // is no `--client` to document either.
     const { HELP } = await import("./cli.ts");
-    expect(HELP).toMatch(/endpoint ls \[--client <id>\] \[--json\]/);
+    const [onInstance, onClient] = HELP.split("On a paired machine");
+    expect(onInstance).not.toContain("endpoint");
+    expect(onClient).toMatch(/endpoint ls \[--json\]/);
+    expect(HELP).not.toContain("--client <id>");
+    expect(parseArgs(["--client", "c-1"]).unknown).toEqual(["--client"]);
   });
 });

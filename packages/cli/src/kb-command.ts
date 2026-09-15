@@ -26,6 +26,7 @@
 
 import { SearchApiError } from "@actana/search/errors";
 import type { SearchClient } from "@actana/search/client";
+import type { QueryRequest } from "@actana/search/contracts";
 import { parseFraction, parseInteger, type ParsedArgs } from "./cli-args.ts";
 import { formatJson, formatTable, orDash, relativeTime } from "./cli-output.ts";
 import { configDirFor, loadProfileBlob, readCliConfig } from "./cli-config.ts";
@@ -73,8 +74,16 @@ Flags
   --profile <name>         which stored credential to use
   --json                   machine-readable output`;
 
-/** Open a client for the named profile, or say why not. */
-async function withClient(
+/**
+ * Open a client for the named profile, or say why not.
+ *
+ * Exported because `endpoint add`/`endpoint ls` are client-side verbs too now
+ * that `PUT /v1/endpoints` exists — profile resolution, the mTLS client, the
+ * error mapping and the `close()` are the same four lines for all of them, and
+ * a second copy in `endpoint-command.ts` is a second place a profile could be
+ * resolved differently.
+ */
+export async function withClient(
   deps: SearchCliDeps,
   flags: ParsedArgs,
   verb: string,
@@ -313,7 +322,10 @@ export async function runQueryCommand(
     return EXIT_USAGE;
   }
 
-  const body: Record<string, unknown> = { text };
+  // Typed as the contract's request rather than a bag: the SDK's `query` takes
+  // `QueryRequest` now that TASK-004's surface exists, and a `Record` would
+  // have made "did the CLI send a field this instance reads?" unanswerable.
+  const body: QueryRequest = { text };
   if (flags.topK) {
     const parsed = parseInteger(flags.topK, "--top-k");
     if ("error" in parsed) {

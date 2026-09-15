@@ -8,11 +8,15 @@
 // `process`.
 //
 // The bag has two halves, marked below, because the two kinds of verb reach
-// different machines. `pair new`, `pair ls`, `pair revoke`, `endpoint add` and
-// `endpoint ls` run **on the machine that IS the instance** and go through the
-// admin Unix socket; `pair redeem`, `status`, `kb`, `ingest` and `query` run on
-// a **client** machine and go over mTLS through the SDK. Two halves, one help
+// different machines. `pair new`, `pair ls` and `pair revoke` run **on the
+// machine that IS the instance** and go through the admin Unix socket;
+// `pair redeem`, `status`, `endpoint`, `kb`, `ingest` and `query` run on a
+// **client** machine and go over mTLS through the SDK. Two halves, one help
 // text, one command — the same arrangement Control landed on.
+//
+// `endpoint add|ls` were in the first half until `PUT /v1/endpoints` existed;
+// they are in the second now, which is why `adminClient` is the operator half's
+// only entry and `clientFor` carries one more verb.
 
 import type { SearchClient } from "@actana/search/client";
 import type { PairWithSearchOptions } from "@actana/search/pairing";

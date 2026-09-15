@@ -1,7 +1,7 @@
 // The operator's half: HTTP over the instance's admin Unix socket.
 //
 // `POST /admin/pair/new`, `GET /admin/pair/clients`, `GET /admin/pair/codes`,
-// `POST /admin/pair/revoke`, and `GET|POST /admin/endpoints`.
+// `POST /admin/pair/revoke`, and `GET /admin/pair/codes`.
 //
 // **This surface has no authentication, and that is the design** (ADR 0008 D6).
 // The socket is mode 0600 inside a 0700 directory, so reaching it *is* the
@@ -198,7 +198,7 @@ function adminDialError(err: NodeJS.ErrnoException, socketPath: string): AdminEr
   return new AdminError("admin-error", 0, `${socketPath}: ${err.message}`);
 }
 
-// ─── The four pairing routes, and the two endpoint ones ─────────────────────
+// ─── The four pairing routes ────────────────────────────────────────────────
 
 export type MintedCode = {
   sessionId: string;
@@ -244,22 +244,6 @@ export type RevokedRow = {
   revokedAt: string | null;
 };
 
-export type AdminEndpointRow = {
-  id: string;
-  externalId: string | null;
-  kind: "embedding" | "inference";
-  provider: string;
-  template: string;
-  model: string | null;
-  dimensions: number | null;
-  baseUrl: string | null;
-  label: string | null;
-  source: "local" | "mirrored";
-  hasKey: boolean;
-  createdAt: string;
-  updatedAt: string;
-};
-
 export function mintPairingCode(
   client: AdminClient,
   body: { label?: string; scope?: string; kbIds?: string[] | null; ttlMs?: number },
@@ -280,19 +264,4 @@ export function revokePairing(
   id: string,
 ): Promise<{ revoked: RevokedRow }> {
   return client.request({ method: "POST", path: "/admin/pair/revoke", body: { id } });
-}
-
-export function createAdminEndpoint(
-  client: AdminClient,
-  body: Record<string, unknown>,
-): Promise<{ endpoint: AdminEndpointRow }> {
-  return client.request({ method: "POST", path: "/admin/endpoints", body });
-}
-
-export function listAdminEndpoints(
-  client: AdminClient,
-  pairedClientId?: string | null,
-): Promise<{ pairedClientId: string; endpoints: AdminEndpointRow[] }> {
-  const query = pairedClientId ? `?client=${encodeURIComponent(pairedClientId)}` : "";
-  return client.request({ method: "GET", path: `/admin/endpoints${query}` });
 }

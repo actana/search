@@ -43,9 +43,10 @@ export type ParsedArgs = {
    * `--admin-socket <path>` — the instance's admin Unix socket, overriding
    * `SEARCH_ADMIN_SOCKET` and `$SEARCH_STATE_DIR/admin.sock`.
    *
-   * The operator verbs (`pair new`, `pair ls`, `pair revoke`, `endpoint add`)
-   * run **on the machine that is the instance**: reaching that socket is the
-   * credential (ADR 0008 D6), and there is nothing else to authenticate with.
+   * The operator verbs (`pair new`, `pair ls`, `pair revoke`) run **on the
+   * machine that is the instance**: reaching that socket is the credential
+   * (ADR 0008 D6), and there is nothing else to authenticate with. Everything
+   * else, `endpoint` included, goes over mTLS with a redeemed profile.
    */
   adminSocket: string | null;
   /** `--profile <name>` — which stored registration blob the mTLS verbs use. */
@@ -66,8 +67,15 @@ export type ParsedArgs = {
   session: string | null;
 
   // ─── `endpoint` ──────────────────────────────────────────────────────────
-  /** `--client <id>`: which paired client an operator verb acts for. */
-  client: string | null;
+  /**
+   * `--external-id <id>`: the client's own stable id for an endpoint.
+   *
+   * The reconciliation key `PUT /v1/endpoints` upserts on, so running the same
+   * `endpoint add` twice updates one row rather than accumulating them. There
+   * is no `--client` beside it: the certificate is the paired client (ADR 0003),
+   * so there is nothing to name and nothing to mistype.
+   */
+  externalId: string | null;
   /** `--kind embedding|inference`. */
   kind: string | null;
   /** `--provider <id>`: catalog provider — `openai`, `voyage`, `google`, … */
@@ -111,7 +119,7 @@ const VALUE_FLAGS: Record<string, keyof ParsedArgs> = {
   "--ttl": "ttl",
   "--fingerprint": "fingerprint",
   "--session": "session",
-  "--client": "client",
+  "--external-id": "externalId",
   "--kind": "kind",
   "--provider": "provider",
   "--template": "template",
@@ -138,7 +146,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     ttl: null,
     fingerprint: null,
     session: null,
-    client: null,
+    externalId: null,
     kind: null,
     provider: null,
     template: null,
