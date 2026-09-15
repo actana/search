@@ -26,7 +26,23 @@ import dns from 'node:dns/promises'
 import http from 'node:http'
 import https from 'node:https'
 import type { LookupFunction } from 'node:net'
-import * as ipaddr from 'ipaddr.js'
+/**
+ * A **default** import, and it has to be.
+ *
+ * `ipaddr.js` is CommonJS whose named exports `cjs-module-lexer` cannot detect,
+ * so under plain Node ESM `import * as ipaddr` gives a namespace holding
+ * nothing but `default` and `module.exports`: `ipaddr.isValid` is `undefined`
+ * and every call below throws `ipaddr.isValid is not a function`. vitest's
+ * interop shims paper over that, which is why this suite was green while every
+ * URL-validating write on a live instance answered `400` — the endpoint push,
+ * the webhook registration, every URL ingest. The deploy image runs this file
+ * under plain `node`, so the namespace form was broken in exactly the
+ * configuration that ships.
+ *
+ * `scripts/import-runtime-modules.mjs` calls `validateExternalUrl` under plain
+ * `node` so this cannot come back unnoticed.
+ */
+import ipaddr from 'ipaddr.js'
 import { createLogger } from '@actana/search-shared/log'
 
 const logger = createLogger('security/url-guard')
