@@ -95,11 +95,7 @@ export function registerChunkRoutes(router: SearchRouter): void {
           client!.id,
         );
       } catch (err) {
-        // Nothing to embed the content with: the request is fine, the KB is not
-        // configured — which is a `400` naming what to set, not a `500`.
-        if (err instanceof Error && /no embedding endpoint configured/i.test(err.message)) {
-          throw badRequest(err.message);
-        }
+        refuseIfNoEmbeddingEndpoint(err, kbId!);
         if (err instanceof Error && /document not found/i.test(err.message)) {
           throw notFound(`no document ${docId} in ${kbId}`);
         }
@@ -136,7 +132,21 @@ export function registerChunkRoutes(router: SearchRouter): void {
         await requireDocument(kbId!, docId!);
         await requireChunk(docId!, chunkId!);
         const body = parseWith(UpdateChunkRequestSchema, await readJsonBody(req));
-        const updated = await updateChunk(chunkId!, body, requestId(), client!.id);
+        let updated;
+        try {
+          updated = await updateChunk(chunkId!, body, requestId(), client!.id);
+        } catch (err) {
+          /**
+           * The same refusal the `POST` above makes, for the same reason: this
+           * route **re-embeds** the content it is given, so a KB with no
+           * embedding endpoint has nothing to do that with. Unmapped, the
+           * engine's plain `Error` became a `500` on the one edit a caller
+           * could have fixed itself — and the two routes that embed disagreed
+           * about the same condition.
+           */
+          refuseIfNoEmbeddingEndpoint(err, kbId!);
+          throw err;
+        }
         sendJson(res, 200, chunkToWire(updated));
       },
     ),
@@ -226,6 +236,30 @@ export function registerChunkRoutes(router: SearchRouter): void {
       },
     ),
   );
+}
+
+/**
+ * "This KB has no embedding endpoint" as a `400`, on every route that embeds.
+ *
+ * The request is fine and the instance is fine; the knowledge base is not
+ * configured, and the caller is the one who can configure it — so it is a
+ * refusal with an instruction, not a `core-error`. Both routes that embed
+ * (`POST …/chunks` and the re-embedding `PATCH`) go through here, because a
+ * condition that two routes answer two ways is a condition a caller cannot
+ * handle.
+ *
+ * **The sentence is the wire's own.** The engine's message ends "Set one in the
+ * KB settings.", which is Studio's UI telling a person where to click; there is
+ * no KB settings page on this surface. What a paired client needs is the two
+ * calls that fix it, so that is what it is told.
+ */
+function refuseIfNoEmbeddingEndpoint(err: unknown, kbId: string): void {
+  if (err instanceof Error && /no embedding endpoint configured/i.test(err.message)) {
+    throw badRequest(
+      `knowledge base ${kbId} has no embedding endpoint; declare one with ` +
+        `PUT /v1/endpoints and set it on the knowledge base`,
+    );
+  }
 }
 
 /**

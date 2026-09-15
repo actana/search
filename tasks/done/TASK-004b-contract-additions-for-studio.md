@@ -168,3 +168,62 @@ node packages/sdk/scripts/rehearse-npm-pack.mjs
 ```
 
 1014 → 1055 passing, no new reds, no dependency added and no version bumped.
+
+## Review fix round (2026-09-15)
+
+The review read the ten additions against the frozen functions behind them and
+found eight places where the wire and the engine disagreed. **Six of the eight
+were a `500` on a request the contract had just accepted** — which is the worst
+shape a seam can take, because the caller is told it did nothing wrong and the
+log says this instance failed. Two were a field that reported something that had
+not happened. Nothing under `src/{kb,knowledge,v1}/**` was touched here either:
+every fix is a bound on the contract, a branch in a route, or a sentence.
+
+| # | Was | Is |
+|---|---|---|
+| 1 | `distanceThreshold: z.number().min(0)`, and a stated `0` reached `!distanceThreshold` in the frozen guard — "was one given?" — which throws a plain `Error`: **`500`** | `.gt(0).max(2)`, a `400` on the field |
+| 2 | `text` with no `tags` called `handleTagAndVectorSearch` with `structuredFilters: []` and hit its "Tag filters are required…" guard: **`500` on Studio's ordinary wired v1 search** | the third v1 engine, `handleVectorOnlySearch`, with the same vector, threshold and `topK` |
+| 3 | `TagFilterConditionSchema.operator` was `z.string().min(1)`: an operator the engine cannot build was **dropped**, and a *filtered* listing was answered with the *unfiltered* one. A slot/`fieldType` mismatch was a Postgres type error: **`500`** | the eleven operators the engine implements, bound to the slot's own type, `between` bound to `valueTo` |
+| 4 | `pagination.total` was `COUNT(*)` as Postgres sent it — a **string**, so the listing did not satisfy its own `PaginationSchema` | cast in the route; the test parses the response with the schema instead of wrapping the field in `Number(…)` |
+| 5 | the bulk pre-check asked `deleted_at IS NULL` while the engine's own predicate also wants `userExcluded = false AND archived_at IS NULL`, so an id it would skip passed the check and the call answered `200` with a short `affected` — or **`500`** out of "No valid documents found to update" | the engine's predicate, exactly (additive: every id that used to pass and be acted on still passes) |
+| 6 | `PATCH …/chunks/:chunkId` re-embeds and had **no mapping** for "no embedding endpoint": `500`, on the one condition a caller can fix, while the new `POST` next to it answered `400` | one helper, both routes, `400` — and the wire's own sentence, naming `PUT /v1/endpoints` rather than the engine's "Set one in the KB settings.", which is Studio's UI telling a person where to click |
+| 7 | the tag-only answer echoed `strategy.distanceThreshold` though that path embeds nothing and thresholds nothing | the field is **absent** there, including when the request stated one; the rest of `strategy` is still what ran |
+| 8 | the restore mapped the engine's `'Knowledge base not found'` to **`409`** through a shared regex, telling a caller whose KB had just been hard-deleted to go and un-archive it | `'not found'` → `404`, `'not archived'` → `409` — the same two answers the route gives when it is not racing |
+
+### Two notes on the scope
+
+- **Item 3 closes one more hole than the review named.** An operator that is in
+  the enum but that the *type's* branch does not implement (`contains` on a
+  number, `gt` on a boolean) is dropped by `buildTagFilterCondition` exactly as
+  an unknown one is, and so answers a filtered listing with an unfiltered one —
+  the same bug, by the same mechanism. `OPERATORS_BY_FIELD_TYPE` is therefore
+  read off the four branches of that function and bound too.
+- **Item 8 is not separately testable over the wire.** Both mappings are
+  reached only by losing a race with a concurrent delete or restore of the same
+  KB — outside the race, `requireKbIncludingArchived` and the `deletedAt` check
+  above answer `404` and `409` themselves, which the existing test asserts and
+  which is unchanged.
+
+### Tests
+
+`contracts.test.ts` — 25 → 30. `distanceThreshold` refused at `0` and accepted
+just above it; the operator enum in both directions; `fieldType` bound to the
+slot's prefix, with the issue landing on `fieldType`; `valueTo` required for
+`between` on both types that have it.
+
+`fixture-suite.rest.test.ts` — +3, and three amended. The new vector-only case
+is asserted **row for row against the lifted `handleVectorOnlySearch` called in
+process**, with the arguments the route hands it: the frozen fixture corpus has
+no vector-only v1 query to compare against (q01–q15 are the two v2 engines and
+one tag+vector search), so the in-process call is the oracle — the same kind of
+evidence the fixture is, one step closer in. It also proves the two engines are
+different by reaching a row the tag filter excludes. Beside it: `0` refused on
+both v1 shapes, and the chunk `PATCH`/`POST` pair refused with the wire's
+sentence on a KB whose endpoint was taken away. Amended: the tag-only answer's
+missing `distanceThreshold`, `pagination.total` parsed by
+`ListDocumentsResponseSchema` rather than cast in the test, the ten condition
+refusals over the wire beside the combinations that still work, and a bulk id
+the engine would skip refused with a `404` and then accepted once the row is
+back.
+
+q01–q15 unchanged and green.

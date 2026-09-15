@@ -146,7 +146,20 @@ export function registerDocumentRoutes(router: SearchRouter): void {
           .map((d) => rows.get(d.id))
           .filter((row) => row !== undefined)
           .map(documentToWire),
-        pagination: listed.pagination,
+        /**
+         * `total` is a **number** on the wire, and it takes a cast to be one:
+         * the lifted `getDocuments` hands `COUNT(*)` back as the string
+         * Postgres sent, on every listing filtered or not, so passing
+         * `pagination` straight through answered with a body that did not
+         * satisfy the `PaginationSchema.total` (`z.number().int()`) this
+         * route's own contract defines it by.
+         *
+         * Cast **here** rather than in the engine, which is frozen (ADR 0005),
+         * and cast rather than widening the schema to `string | number`, which
+         * would have made every caller do this instead. Turning a column into
+         * the shape the wire promised is exactly this layer's job.
+         */
+        pagination: { ...listed.pagination, total: Number(listed.pagination.total) },
       });
     }),
   );
@@ -628,13 +641,22 @@ function metadataField(raw: string | undefined): Record<string, unknown> | undef
 }
 
 /**
- * Every one of these ids has to be a live document in this KB, or nothing
- * happens.
+ * Every one of these ids has to be a document this bulk call **would act on**,
+ * or nothing happens.
  *
  * One `IN` read, and the refusal names none of the ids: a `404` that said
  * *which* one is not yours would confirm that the others are (ADR 0009 D5), and
  * a bulk call is exactly where a caller could walk an id space cheaply. The
  * count is safe to state — the caller sent the list.
+ *
+ * **The predicate is the engine's own**, and it has to be: `bulkDocumentOperation`
+ * selects and updates under `userExcluded = false AND archived_at IS NULL AND
+ * deleted_at IS NULL`, and it *acts on the rows it finds and logs the rest*.
+ * Checking only `deleted_at` here therefore let an id through that the engine
+ * would then skip — and the route answered `200` with an `affected` short of
+ * what the caller asked for, silently, which is the whole thing this check
+ * exists to prevent. Additive: every id this used to accept and the engine
+ * would have acted on is still accepted.
  */
 async function requireEveryDocument(kbId: string, ids: string[]): Promise<void> {
   const rows = await db
@@ -644,6 +666,8 @@ async function requireEveryDocument(kbId: string, ids: string[]): Promise<void> 
       and(
         eq(document.knowledgeBaseId, kbId),
         inArray(document.id, ids),
+        eq(document.userExcluded, false),
+        isNull(document.archivedAt),
         isNull(document.deletedAt),
       ),
     );

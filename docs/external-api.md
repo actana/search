@@ -68,7 +68,10 @@ identity — and it answers with the knowledge base rather than an
 acknowledgement because the restore may have had to **rename** it: a KB whose
 name was taken while it was archived comes back as `…_restored`, then a
 suffixed variant. A KB that is not archived is `409 conflict`; one that is not
-this client's, or does not exist, is `404` like every other KB route.
+this client's, or does not exist, is `404` like every other KB route — and that
+holds for a restore that loses a race with a concurrent delete or restore of
+the same KB, which is answered by what the row turned out to be rather than by
+`409` for both.
 
 `embeddingEndpointId` and `inferenceEndpointId` must name **this client's own**
 endpoints (`GET /v1/endpoints` is the list). An id that is not is `404
@@ -89,9 +92,15 @@ One route, two engines, discriminated by `mode` on the way in and on the way out
   `{ id, documentId, chunkIndex, content, metadata, score, semanticScore,
   keywordScore }`, plus `usage` and, with `includeDiagnostics`, `diagnostics`.
 - **`v1-tags`** — `V1TagQueryResponseSchema`. The pre-v2 path over the shared
-  `embedding` table: `tags[]` filters first (two filters on different slots are
-  ANDed), then a vector search over what survives. Rows carry their seventeen
-  tag columns and a cosine `distance`, ascending.
+  `embedding` table. Rows carry their seventeen tag columns and a cosine
+  `distance`, ascending. It is **three** engines, and what a request carries
+  picks between them — they are the v1 surface's own three shapes:
+
+  | Request | Engine | What it does |
+  |---|---|---|
+  | `text` **and** `tags` | `handleTagAndVectorSearch` | `tags[]` filters first (two filters on different slots are ANDed), then a vector search over what survives. |
+  | `tags`, no `text` | `handleTagOnlySearch` | Filters by tag and answers with what survives. **Embeds nothing** — `usage.embed` is zero and every `distance` is `0`. |
+  | `text`, no `tags` | `handleVectorOnlySearch` | A plain vector search over the KB. This is the ordinary v1 search, and what a caller with no tag filter to apply sends. |
 
 `queryKeywords` picks between the two frozen v2 entry points and is not a tuning
 knob: **omitted** selects the query's keywords from the KB's vocabulary first,
@@ -102,20 +111,30 @@ exactly those (ADR 0009 D4a).
 search routes accept.
 
 **`text` is optional for one shape only: `mode: 'v1-tags'` with a non-empty
-`tags`.** That is the tag-only search — it filters by tag, returns what
-survives, and **embeds nothing** (`usage.embed` is zero and every `distance` is
-`0`) — and it is the one v1 request that ranks by nothing. `hybrid` and a
-tag-less `v1-tags` both embed, so both still require `text`, and `text: ''` is a
-`400` everywhere.
+`tags`.** That is the tag-only search, the one v1 request that ranks by
+nothing. `hybrid` embeds, and so does a tag-less `v1-tags` — which is the
+vector-only search in the table above — so both still require `text`, and
+`text: ''` is a `400` everywhere.
 
-**`distanceThreshold` (0–2) is `v1-tags` only.** Present, it replaces the
-threshold `getQueryStrategy` would have computed and `strategy.distanceThreshold`
-reports the one that ran. It exists because a caller fanning a single logical
-search out over several KBs computes one threshold for the whole call — `0.8`
-above three KBs, `1.0` otherwise — and a per-KB route can only ever infer
-`1.0`. Sent with `hybrid` it is `400 validation-failed`: that path ranks by a
-blended score, whose floor is `minScore`, and a threshold silently dropped looks
-exactly like one that was applied.
+**`distanceThreshold` (above `0`, up to `2`) is `v1-tags` only.** Present, it
+replaces the threshold `getQueryStrategy` would have computed and
+`strategy.distanceThreshold` reports the one that ran. It exists because a
+caller fanning a single logical search out over several KBs computes one
+threshold for the whole call — `0.8` above three KBs, `1.0` otherwise — and a
+per-KB route can only ever infer `1.0`. Sent with `hybrid` it is `400
+validation-failed`: that path ranks by a blended score, whose floor is
+`minScore`, and a threshold silently dropped looks exactly like one that was
+applied.
+
+`0` is a `400` as well, and not because a zero-distance threshold is
+meaningless (it is: a row is kept for being `< threshold`). The two frozen
+vector engines test this with `!distanceThreshold` — "was one given?" — so a
+stated `0` reads there as one left out and the guard refuses the call.
+
+**`strategy.distanceThreshold` is absent on the tag-only search.** That shape
+embeds nothing and thresholds nothing, so no row was kept or dropped for its
+distance and there is no threshold that ran to report — including when the
+request stated one. The rest of `strategy` is still what ran.
 
 ## Documents
 
@@ -157,13 +176,30 @@ in flight arrives on `document.ingested` or from `GET …/documents/:docId`.
 field type, operator, `value` as a string whatever the column's type is, and
 `valueTo` for `between` — and it is encoded rather than flattened to `tag1=…`
 because a flat parameter cannot carry an operator, a second bound, or two
-conditions on one slot. A slot outside the seventeen is `400` rather than a
-condition the engine would drop, which would answer a filtered listing with an
-unfiltered one. Conditions on different slots are ANDed.
+conditions on one slot. Conditions on different slots are ANDed.
+
+**Every field of a condition is closed**, because the engine answers a
+condition it cannot build with nothing and a missing condition answers a
+*filtered* listing with the *unfiltered* one — which a caller cannot tell from
+the rows. So all four of these are `400 validation-failed` naming the field,
+rather than a listing that quietly ignored the filter:
+
+| Rule | Why |
+|---|---|
+| `tagSlot` is one of the seventeen | A slot the engine does not recognise is dropped. |
+| `operator` is `eq`, `neq`, `contains`, `not_contains`, `starts_with`, `ends_with`, `gt`, `gte`, `lt`, `lte` or `between` | Exactly what the engine implements. There is no `in`, no `is_null` and no `regex`. |
+| `fieldType` is the one the slot's prefix names — `tag*` text, `number*` number, `date*` date, `boolean*` boolean — and it implements the `operator` | A mismatch is worse than dropped: `number1` read as text reaches Postgres as a text comparison against an integer column, which is a `500`. And each type has its own operators: text has the `LIKE` forms and no ordering, `boolean` has only `eq`/`neq`, `number` and `date` have the comparisons and `between`. |
+| `between` carries `valueTo` | It is an inclusive range, and the engine drops one with no upper bound. |
+
+`pagination.total` is a number, like the rest of `PaginationSchema`. The lifted
+`getDocuments` hands `COUNT(*)` back as the string Postgres sent it and the
+route casts it, on every listing filtered or not.
 
 **Bulk** takes `{ operation: 'enable' | 'disable' | 'delete' }` with exactly one
-of `documentIds` (at most 500, and **every** one must be in this KB or the call
-is `404` and writes nothing — the message names none of them) or `enabledFilter`
+of `documentIds` (at most 500, and **every** one must be a document this call
+would act on — in this KB, not archived, not user-excluded and not deleted,
+which is the frozen service's own predicate — or the call is `404` and writes
+nothing; the message names none of them) or `enabledFilter`
 (`all | enabled | disabled`, uncapped). The answer is `{ affected }`. Those two
 forms and no others because the frozen service has exactly two
 (`bulkDocumentOperation`, `bulkDocumentOperationByFilter`) and the by-filter one
@@ -218,11 +254,12 @@ unchanged.
 
 Editing a chunk's `content` re-embeds it through the KB's embedding endpoint.
 That is not optional: a chunk whose text and vector disagree ranks for the wrong
-query. `POST …/documents/:docId/chunks` writes one by hand on the same terms: the
+query. So a KB with no embedding endpoint answers **both** routes that embed —
+the `PATCH` and the `POST` below — with `400 bad-request` naming the two calls
+that fix it (`PUT /v1/endpoints`, then set it on the knowledge base). `POST …/documents/:docId/chunks` writes one by hand on the same terms: the
 content is embedded before it is stored, the chunk lands at the next
 `chunkIndex`, it inherits every tag value from its document, and the document's
-`chunkCount`, `tokenCount` and `characterCount` go up by what it added. A KB
-with no embedding endpoint has nothing to embed it with and answers `400`.
+`chunkCount`, `tokenCount` and `characterCount` go up by what it added.
 
 **A chunk is addressable twice: through its document, and by its own id**
 (ADR 0009 D10). The last three rows are the second: a chunk id is unique across

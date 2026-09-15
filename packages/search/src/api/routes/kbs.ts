@@ -42,6 +42,7 @@ import {
   getQueryStrategy,
   handleTagAndVectorSearch,
   handleTagOnlySearch,
+  handleVectorOnlySearch,
   type SearchResult as V1SearchResult,
 } from "../../v1/knowledge-search-utils.ts";
 import type { StructuredFilter } from "../../knowledge/types.ts";
@@ -279,9 +280,21 @@ export function registerKbRoutes(router: SearchRouter): void {
         await restoreKnowledgeBase(kbId!, requestId());
       } catch (err) {
         if (err instanceof KnowledgeBaseConflictError) throw conflict(err.message);
-        if (err instanceof Error && /not found|not archived/i.test(err.message)) {
-          // Lost a race with a concurrent restore or delete of the same KB.
+        /**
+         * Lost a race with a concurrent delete or restore of the same KB —
+         * `requireKbIncludingArchived` and the `deletedAt` check above both
+         * passed, and then the row moved. The two outcomes are two answers,
+         * because they are the same two this route gives when it is not racing:
+         * the row is **gone** (`404`, as on every KB route) or the row is
+         * **live** (`409`, as the check above says). Mapping both to `409`
+         * told a caller whose KB had just been hard-deleted to go and
+         * un-archive it.
+         */
+        if (err instanceof Error && /not archived/i.test(err.message)) {
           throw conflict(err.message);
+        }
+        if (err instanceof Error && /not found/i.test(err.message)) {
+          throw notFound(`no knowledge base ${kbId}`);
         }
         throw err;
       }
@@ -347,17 +360,29 @@ export function registerKbRoutes(router: SearchRouter): void {
 }
 
 /**
- * The v1 path, over the shared `embedding` table. Two engines, and which one
- * runs is read off the request rather than decided here.
+ * The v1 path, over the shared `embedding` table. **Three** engines, and which
+ * one runs is read off the request rather than decided here — the v1 surface
+ * has always had three shapes and they are the three combinations of the two
+ * things a v1 caller can bring:
  *
- * With `text`, it is `handleTagAndVectorSearch`: the query vector comes from
- * the KB's own embedding endpoint, which is what the v1 route did, and the tag
- * filter runs first. Without `text` — which the contract permits only when
- * `tags` is non-empty — it is `handleTagOnlySearch`, the one v1 shape that
- * ranks by nothing: tag filter, then whatever survives, and **no embedding
- * call at all**. That is not an optimisation of the other path, it is the
- * function Studio's own tag-only search has always called, and a route that
- * embedded the tag values instead would be a different ranking (ADR 0005).
+ *   - `text` **and** `tags` → `handleTagAndVectorSearch`. The tag filter runs
+ *     first and the vector search runs over what survived.
+ *   - `tags` and no `text` → `handleTagOnlySearch`, the one v1 shape that ranks
+ *     by nothing: tag filter, then whatever survives, and **no embedding call
+ *     at all**.
+ *   - `text` and no `tags` → `handleVectorOnlySearch`. **This is Studio's
+ *     ordinary wired search**: its own `handleVectorOnlySearch` is what a
+ *     query with no tag filters reaches, and over the seam it sends
+ *     `{ text, topK }` and nothing else. Routing it to
+ *     `handleTagAndVectorSearch` with an empty filter list — which is what this
+ *     function used to do — hits that function's own first guard ("Tag filters
+ *     are required for tag and vector search"), a plain `Error` and so a `500`
+ *     on the request a wired workspace makes most often.
+ *
+ * Each one is the function Studio's own handler of that shape calls, with the
+ * arguments it passes; none of the three is an optimisation or a special case
+ * of another, and a route that embedded the tag values or filtered on an empty
+ * list would be a different ranking (ADR 0005).
  *
  * `getQueryStrategy` decides the distance threshold unless the caller stated
  * one. One KB per request here — the v1 route could search several, and Search
@@ -392,7 +417,21 @@ async function runV1TagQuery(
     // Tag-only. No endpoint is resolved and no vector is asked for, so a KB
     // with no embedding endpoint answers this request rather than refusing it.
     const rows = await handleTagOnlySearch({ knowledgeBaseIds: [kbId], topK, structuredFilters });
-    return { mode: "v1-tags", matches: rows.map(matchToWire), strategy, usage: noUsage };
+    /**
+     * `distanceThreshold` is **left out** of the answer, and that is the whole
+     * of what this path can honestly say: nothing was embedded, nothing was
+     * ranked and nothing was kept or dropped for being inside a distance. The
+     * rest of `strategy` is still what ran — `handleTagOnlySearch` reads
+     * `useParallel` off the same `getQueryStrategy` — so the field that did
+     * nothing is the only one that goes.
+     */
+    const { distanceThreshold: _unused, ...tagOnlyStrategy } = strategy;
+    return {
+      mode: "v1-tags",
+      matches: rows.map(matchToWire),
+      strategy: tagOnlyStrategy,
+      usage: noUsage,
+    };
   }
 
   if (!embeddingEndpointId) {
@@ -407,13 +446,22 @@ async function runV1TagQuery(
   const vector = embedded.embeddings[0];
   if (!vector) throw new HttpError(500, "core-error", "the embedding provider returned nothing");
 
-  const results = await handleTagAndVectorSearch({
+  /**
+   * One vector, one threshold, one `topK` — and the only difference between the
+   * two vector engines is whether there is a tag filter to run first. The
+   * arguments are the same because `SearchParams` is the same, which is how
+   * Studio's own two handlers call them.
+   */
+  const vectorArgs = {
     knowledgeBaseIds: [kbId],
     topK,
-    structuredFilters,
     queryVector: `[${vector.join(",")}]`,
     distanceThreshold: strategy.distanceThreshold,
-  });
+  };
+  const results =
+    structuredFilters.length === 0
+      ? await handleVectorOnlySearch(vectorArgs)
+      : await handleTagAndVectorSearch({ ...vectorArgs, structuredFilters });
 
   return {
     mode: "v1-tags",

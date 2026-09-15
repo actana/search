@@ -131,6 +131,7 @@ import type {
   V1TagQueryResponse,
 } from "@actana/search/contracts";
 import {
+  ListDocumentsResponseSchema,
   SEARCH_EVENT_ID_HEADER,
   SEARCH_SIGNATURE_HEADER,
 } from "@actana/search/contracts";
@@ -142,9 +143,12 @@ import {
 } from "@actana/search-shared/testing/hash-ngram-embedder";
 import { resetConfig } from "../config.ts";
 import { db } from "../db/client.ts";
-import { knowledgeBase, modelEndpoint, pairedClient } from "../db/schema.ts";
+import { document, knowledgeBase, modelEndpoint, pairedClient } from "../db/schema.ts";
 import { runMigrations } from "../db/migrate.ts";
 import { dropKbPartition } from "../kb/ddl.ts";
+import { resolveKbEmbeddingEndpoint } from "../kb/provider-context.ts";
+import { executeWorkspaceEmbedding } from "../models/embedding.ts";
+import { getQueryStrategy, handleVectorOnlySearch } from "../v1/knowledge-search-utils.ts";
 import { TOPIC_VOCABULARY } from "../kb/testing/deterministic-keywords.ts";
 import { inlineJobFailures, inlineJobsSettled, resetQueueConnection } from "../queue/index.ts";
 import { onSearchEvent } from "../events/emitter.ts";
@@ -732,12 +736,15 @@ describeDb("KB behaviour freeze, over REST (fixture suite)", () => {
     });
     expect(result.matches.length).toBeGreaterThan(0);
     expect(result.matches.length).toBeLessThanOrEqual(params.topK);
+    // Present on this path — it is the one the threshold ran on — and the
+    // `toEqual` above is what proves it; `!` is that assertion, not a guess.
+    const ranThreshold = result.strategy.distanceThreshold!;
     for (const row of result.matches) {
       expect(row.tag1).toBe("handbook");
       expect(row.tag2).toBe("people");
       expect(row.knowledgeBaseId).toBe(kbIds[v1Query.knowledgeBase]);
       expect(typeof row.content).toBe("string");
-      expect(row.distance).toBeLessThan(result.strategy.distanceThreshold);
+      expect(row.distance).toBeLessThan(ranThreshold);
     }
     for (let i = 1; i < result.matches.length; i++) {
       expect(result.matches[i - 1]!.distance).toBeLessThanOrEqual(result.matches[i]!.distance);
@@ -1128,6 +1135,30 @@ describeDb("KB behaviour freeze, over REST (fixture suite)", () => {
       expect(row.distance).toBe(0);
     }
 
+    /**
+     * And `strategy` says so: **no `distanceThreshold`**, because nothing was
+     * thresholded. Echoing the `1.0` `getQueryStrategy` computes — or a value
+     * the caller stated — would report a threshold that never ran, on the one
+     * path where no row was kept or dropped for its distance.
+     */
+    expect(result.strategy.distanceThreshold).toBeUndefined();
+    expect(result.strategy).toEqual({
+      useParallel: false,
+      parallelLimit: 25 + 5,
+      singleQueryOptimized: true,
+    });
+    // Stating one does not bring it back: there is still nothing to threshold.
+    expect(
+      (
+        (await client.kbs.query(kbIds[v1Query.knowledgeBase], {
+          mode: "v1-tags",
+          topK: 25,
+          tags: tags as never,
+          distanceThreshold: 0.5,
+        })) as V1TagQueryResponse
+      ).strategy.distanceThreshold,
+    ).toBeUndefined();
+
     // It is the same *set* the tag filter selects, so the tag+vector search
     // over the same filters can only be a subset of it — the vector step
     // narrows and orders, it never adds a row the filter excluded.
@@ -1140,6 +1171,119 @@ describeDb("KB behaviour freeze, over REST (fixture suite)", () => {
     const tagOnlyIds = new Set(result.matches.map((m) => m.id));
     for (const row of ranked.matches) expect(tagOnlyIds.has(row.id)).toBe(true);
     expect(ranked.usage?.embed.totalTokens).toBeGreaterThan(0);
+  }, 120_000);
+
+  it("runs the vector-only v1 search, and gets the lifted function's own rows", async () => {
+    /**
+     * **`text` and no tags is Studio's ordinary wired v1 search.** Its own
+     * `handleVectorOnlySearch` is what a query with no tag filters reaches, and
+     * over the seam it sends `{ text, topK }` and nothing else — so this is the
+     * v1 request a wired workspace makes most often.
+     *
+     * It used to be a `500`. The route sent every request that had `text` to
+     * `handleTagAndVectorSearch`, with `structuredFilters: []`, and that
+     * function's first line is a guard — "Tag filters are required for tag and
+     * vector search" — a plain `Error`, so a `core-error` on the wire.
+     *
+     * The assertion is **row for row against the lifted function itself**,
+     * called in process with the arguments the route hands it. The frozen
+     * fixture corpus has no vector-only v1 query to compare against (q01–q15
+     * are the two v2 engines and one tag+vector search), so the in-process call
+     * *is* the oracle — which is the same kind of evidence the fixture is, one
+     * step closer in.
+     */
+    const kbId = kbIds[v1Query.knowledgeBase];
+    const topK = 10;
+    const text = v1Query.text;
+
+    const overRest = (await client.kbs.query(kbId, {
+      mode: "v1-tags",
+      text,
+      topK,
+    })) as V1TagQueryResponse;
+
+    const endpoint = await resolveKbEmbeddingEndpoint(endpointIds.embedding);
+    const embedded = await executeWorkspaceEmbedding({ endpoint, input: text });
+    const inProcess = await handleVectorOnlySearch({
+      knowledgeBaseIds: [kbId],
+      topK,
+      queryVector: `[${embedded.embeddings[0]!.join(",")}]`,
+      distanceThreshold: getQueryStrategy(1, topK).distanceThreshold,
+    });
+
+    expect(overRest.mode).toBe("v1-tags");
+    expect(overRest.matches.length).toBeGreaterThan(0);
+    expect(overRest.matches.map((m) => m.id)).toEqual(inProcess.map((r) => r.id));
+    expect(overRest.matches.map((m) => m.distance)).toEqual(
+      inProcess.map((r) => Number(r.distance)),
+    );
+    // It embedded, unlike the tag-only path, and it thresholded — unlike it too.
+    expect(overRest.usage?.embed.totalTokens).toBeGreaterThan(0);
+    expect(overRest.strategy.distanceThreshold).toBe(1.0);
+    for (let i = 1; i < overRest.matches.length; i++) {
+      expect(overRest.matches[i - 1]!.distance).toBeLessThanOrEqual(
+        overRest.matches[i]!.distance,
+      );
+    }
+
+    // Not tag-filtered: it reaches rows the tag filter of the frozen v1 query
+    // excludes, which is the difference between the two engines.
+    const filtered = (await client.kbs.query(kbId, {
+      mode: "v1-tags",
+      text,
+      topK,
+      tags: (v1Query.params as { structuredFilters: Array<Record<string, unknown>> })
+        .structuredFilters as never,
+    })) as V1TagQueryResponse;
+    const filteredIds = new Set(filtered.matches.map((m) => m.id));
+    expect(overRest.matches.some((m) => !filteredIds.has(m.id))).toBe(true);
+
+    // And a stated threshold still applies on this path.
+    const tight = (await client.kbs.query(kbId, {
+      mode: "v1-tags",
+      text,
+      topK,
+      distanceThreshold: 0.000001,
+    })) as V1TagQueryResponse;
+    expect(tight.strategy.distanceThreshold).toBe(0.000001);
+    expect(tight.matches).toEqual([]);
+  }, 120_000);
+
+  it("refuses a `distanceThreshold` of 0, which the frozen guard reads as absent", async () => {
+    /**
+     * `handleVectorOnlySearch` and `handleTagAndVectorSearch` both test their
+     * threshold with `!distanceThreshold` — "was one given?" — so a stated `0`
+     * is indistinguishable there from one left out and the guard throws, which
+     * on this wire was a `500` on a request the contract had accepted. `.gt(0)`
+     * is where that belongs: the engine is frozen (ADR 0005) and the honest
+     * answer is a `400` on the field.
+     */
+    for (const body of [
+      { mode: "v1-tags", text: "parental leave", topK: 5, distanceThreshold: 0 },
+      {
+        mode: "v1-tags",
+        text: "parental leave",
+        topK: 5,
+        distanceThreshold: 0,
+        tags: [{ tagSlot: "tag1", fieldType: "text", operator: "eq", value: "handbook" }],
+      },
+    ]) {
+      await expect(
+        client.request("POST", `/v1/kbs/${kbIds.hybrid}/query`, { json: body }),
+      ).rejects.toMatchObject({ status: 400, code: "validation-failed" });
+    }
+    // The smallest thing above it is still accepted, so the bound moved rather
+    // than the field going away.
+    expect(
+      (
+        (await client.kbs.query(kbIds.hybrid, {
+          mode: "v1-tags",
+          text: "parental leave",
+          topK: 5,
+          distanceThreshold: 0.000001,
+        })) as V1TagQueryResponse
+      ).strategy.distanceThreshold,
+    ).toBe(0.000001);
   }, 120_000);
 
   it("keeps `text` required everywhere a query still embeds", async () => {
@@ -1380,11 +1524,20 @@ describeDb("KB behaviour freeze, over REST (fixture suite)", () => {
       tagFilters: [{ tagSlot: "tag1", fieldType: "text", operator: "eq", value: "runbook" }],
     });
     expect(byTag.documents.map((d) => d.id)).toEqual([mine.documentId]);
-    // `Number(…)`: the lifted `getDocuments` hands `COUNT(*)` back as the
-    // string Postgres sent, on every listing filtered or not. Frozen engine
-    // code and a pre-existing mismatch with `PaginationSchema.total`; recorded
-    // in this task's file rather than quietly fixed here.
-    expect(Number(byTag.pagination.total)).toBe(1);
+    /**
+     * `total` is a **number**, with no `Number(…)` around it. The lifted
+     * `getDocuments` hands `COUNT(*)` back as the string Postgres sent, on
+     * every listing filtered or not, and the route now casts it — so the
+     * answer satisfies the `ListDocumentsResponseSchema` it is defined by,
+     * which is the assertion below and which it did not use to.
+     */
+    expect(byTag.pagination.total).toBe(1);
+    const raw = await client.request("GET", `/v1/kbs/${sandboxKbId}/documents`, {
+      query: { limit: "200" },
+    });
+    const parsed = ListDocumentsResponseSchema.parse(raw);
+    expect(parsed.pagination.total).toBe(parsed.pagination.total | 0);
+    expect(parsed.documents.length).toBe(parsed.documents.length | 0);
 
     // Two slots are ANDed, `between` reads `valueTo`, and a filter that matches
     // nothing answers with nothing rather than with everything — which is what
@@ -1411,11 +1564,59 @@ describeDb("KB behaviour freeze, over REST (fixture suite)", () => {
 
     // A slot the engine would drop, and a parameter that is not JSON, are both
     // refused rather than answered with the unfiltered list.
-    for (const raw of ["not json at all", JSON.stringify([{ tagSlot: "tag8", fieldType: "text", operator: "eq", value: "x" }])]) {
+    for (const bad of ["not json at all", JSON.stringify([{ tagSlot: "tag8", fieldType: "text", operator: "eq", value: "x" }])]) {
       await expect(
-        client.request("GET", `/v1/kbs/${sandboxKbId}/documents`, { query: { tagFilters: raw } }),
+        client.request("GET", `/v1/kbs/${sandboxKbId}/documents`, { query: { tagFilters: bad } }),
       ).rejects.toMatchObject({ status: 400, code: "validation-failed" });
     }
+
+    /**
+     * **And so is every other field of a condition**, for the same reason the
+     * slot is: `buildTagFilterCondition` answers a condition it cannot build
+     * with `undefined`, an undefined condition is dropped, and a dropped
+     * condition answers a *filtered* listing with the *unfiltered* one — which
+     * a caller cannot tell from the rows. The slot/`fieldType` mismatch is
+     * worse still: `number1` read as text reaches Postgres as a text
+     * comparison against an integer column, which is a type error and a `500`.
+     *
+     * Each of these used to be answered with every document in the KB (or, for
+     * the third, with a `500`); each is a `400` naming the field now.
+     */
+    for (const condition of [
+      // No such operator anywhere in the engine.
+      { tagSlot: "tag1", fieldType: "text", operator: "regex", value: "run" },
+      { tagSlot: "tag1", fieldType: "text", operator: "in", value: "run" },
+      // A real operator, on a type whose branch does not implement it.
+      { tagSlot: "tag1", fieldType: "text", operator: "gt", value: "run" },
+      { tagSlot: "boolean1", fieldType: "boolean", operator: "contains", value: "true" },
+      { tagSlot: "number1", fieldType: "number", operator: "starts_with", value: "7" },
+      // The slot's prefix is its type, and this one disagrees with it.
+      { tagSlot: "number1", fieldType: "text", operator: "eq", value: "7" },
+      { tagSlot: "tag1", fieldType: "number", operator: "eq", value: "7" },
+      { tagSlot: "date1", fieldType: "text", operator: "eq", value: "2026-09-15" },
+      // `between` is a range and the engine drops one with no upper bound.
+      { tagSlot: "number1", fieldType: "number", operator: "between", value: "1" },
+      { tagSlot: "date1", fieldType: "date", operator: "between", value: "2026-01-01" },
+    ]) {
+      await expect(
+        client.request("GET", `/v1/kbs/${sandboxKbId}/documents`, {
+          query: { tagFilters: JSON.stringify([condition]) },
+        }),
+      ).rejects.toMatchObject({ status: 400, code: "validation-failed" });
+    }
+
+    // The matching combinations still work, on every column type the KB has.
+    expect(
+      (
+        await client.documents.list(sandboxKbId, {
+          limit: 200,
+          tagFilters: [
+            { tagSlot: "tag2", fieldType: "text", operator: "ends_with", value: "form" },
+            { tagSlot: "number1", fieldType: "number", operator: "gte", value: "7" },
+          ],
+        })
+      ).documents.map((d) => d.id),
+    ).toEqual([mine.documentId]);
   }, 180_000);
 
   it("restores an archived knowledge base, under a free name", async () => {
@@ -1660,6 +1861,77 @@ describeDb("KB behaviour freeze, over REST (fixture suite)", () => {
     ).rejects.toMatchObject({ status: 400, code: "validation-failed" });
   }, 180_000);
 
+  it("refuses a chunk edit a KB has nothing to re-embed with, as the create does", async () => {
+    /**
+     * **Editing a chunk's `content` re-embeds it** — that is the lifted
+     * behaviour and it is not a flag — so a KB with no embedding endpoint has
+     * nothing to do the edit with. `POST …/chunks` already said so as a `400`;
+     * the `PATCH` did not map the same engine error at all and answered `500`,
+     * so the same condition had two answers on two routes that embed and the
+     * one a caller could fix itself was the one that looked like our fault.
+     *
+     * The sentence is the **wire's** own. The engine's ends "Set one in the KB
+     * settings.", which is Studio's UI telling a person where to click; there
+     * is no settings page on this surface, so a paired client is told the two
+     * calls that fix it instead.
+     */
+    const kb = await client.kbs.create({
+      name: `zz-noembed-${RUN}`,
+      ownerId: ids.owner,
+      embeddingModel: "hash-ngram-256",
+      embeddingEndpointId: endpointIds.embedding,
+      clusterCount: 8,
+    });
+    extraKbIds.push(kb.id);
+    // A file ingest: the chunk routes are v1 code over the shared `embedding`
+    // table, which the file pipeline writes and the `text` path does not.
+    const doc = await client.kbs.ingest(kb.id, {
+      filename: "unembeddable.md",
+      mimeType: "text/markdown",
+      file: Buffer.from("# Unembeddable\n\nA chunk to try to edit.\n", "utf8"),
+    });
+    await waitForDocument(kb.id, doc.documentId);
+    await inlineJobsSettled();
+    const listed = await client.documents.chunks(kb.id, doc.documentId);
+    const chunkId = listed.chunks[0]!.id;
+
+    // Now take the endpoint away. No wire route unbinds one — a KB keeps the
+    // endpoint it was created with — so this is the column, directly.
+    await db
+      .update(knowledgeBase)
+      .set({ embeddingEndpointId: null })
+      .where(eq(knowledgeBase.id, kb.id));
+
+    // Thunks, not promises: two rejections made up front and handled one at a
+    // time is an unhandled rejection for as long as the first `await` takes.
+    for (const attempt of [
+      () =>
+        client.request(
+          "PATCH",
+          `/v1/kbs/${kb.id}/documents/${doc.documentId}/chunks/${chunkId}`,
+          { json: { content: "Edited, and so in need of a new vector." } },
+        ),
+      () =>
+        client.request("POST", `/v1/kbs/${kb.id}/documents/${doc.documentId}/chunks`, {
+          json: { content: "Written by hand, and so in need of a vector." },
+        }),
+    ]) {
+      const refused = attempt();
+      await expect(refused).rejects.toMatchObject({ status: 400, code: "bad-request" });
+      await expect(refused).rejects.toSatisfy(
+        (err: { message: string }) =>
+          err.message.includes("PUT /v1/endpoints") && !err.message.includes("KB settings"),
+      );
+    }
+
+    // Give it back, so the KB tears down the way every other one does.
+    await db
+      .update(knowledgeBase)
+      .set({ embeddingEndpointId: endpointIds.embedding })
+      .where(eq(knowledgeBase.id, kb.id));
+    await inlineJobsSettled();
+  }, 180_000);
+
   it("enables, disables and deletes documents in bulk — by id, and by filter", async () => {
     /**
      * Studio's two bulk paths were N requests for N documents on a wired
@@ -1730,6 +2002,39 @@ describeDb("KB behaviour freeze, over REST (fixture suite)", () => {
     await expect(client.documents.get(kb.id, documentIds[0]!)).rejects.toMatchObject({
       status: 404,
     });
+
+    /**
+     * **The pre-check's predicate is the engine's.** `bulkDocumentOperation`
+     * selects and updates under `userExcluded = false AND archived_at IS NULL
+     * AND deleted_at IS NULL`, and it acts on the rows it finds and only *logs*
+     * the rest. Checking `deleted_at` alone let an id through that the engine
+     * would then skip, and the route answered `200` with an `affected` short of
+     * what was asked for — or, for the last id in a call, a `500` out of the
+     * engine's "No valid documents found to update". Either way silently, which
+     * is the whole thing this check exists to prevent.
+     *
+     * Neither column is reachable from the wire (an archive is a KB-level
+     * delete, and `userExcluded` is the connector soft-delete Studio kept), so
+     * this is the row put into the state the engine will skip, directly.
+     */
+    const survivor = documentIds[1]!;
+    for (const state of [{ archivedAt: new Date() }, { userExcluded: true }]) {
+      await db.update(document).set(state).where(eq(document.id, survivor));
+      await expect(
+        client.documents.bulk(kb.id, { operation: "disable", documentIds: [survivor] }),
+      ).rejects.toMatchObject({ status: 404, code: "not-found" });
+      await db
+        .update(document)
+        .set({ archivedAt: null, userExcluded: false })
+        .where(eq(document.id, survivor));
+    }
+    // And with the row back, the very same call goes through.
+    expect(
+      await client.documents.bulk(kb.id, { operation: "disable", documentIds: [survivor] }),
+    ).toEqual({ affected: 1 });
+    expect(
+      await client.documents.bulk(kb.id, { operation: "enable", documentIds: [survivor] }),
+    ).toEqual({ affected: 1 });
 
     // The contract's own refusals, over the wire.
     for (const json of [
