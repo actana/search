@@ -28,7 +28,9 @@ transforms what it loads and applies CJS/ESM interop shims.
 **The audit the fix asks for.** Every runtime import of an external package in
 `packages/*/src` (tests excluded) was checked by importing it under plain `node`
 from its own package directory and asking whether the names the code reads are
-on the namespace: 26 specifiers over the 167 runtime modules. **`ipaddr.js`
+on the namespace: the 23 distinct external specifiers named in this paragraph
+(22 across the 167 runtime modules of `search`, `shared` and `cli`, plus
+`undici` from `sdk`). **`ipaddr.js`
 was the only one.** `bullmq`, `drizzle-orm` (and `/pg-core`, `/postgres-js`,
 `/postgres-js/migrator`), `ioredis`, `@aws-sdk/client-s3`,
 `@aws-sdk/s3-request-presigner`, `pdf-lib`, `unpdf`, `zod`, `undici`,
@@ -41,7 +43,8 @@ they are used by — the CommonJS ones because the lexer does find their exports
 **The regression gate, which cannot be fooled by vitest.**
 `scripts/import-runtime-modules.mjs` walks `packages/{search,shared,cli}/src`
 (skipping `*.test.ts`, `__tests__`, `__fixtures__`, `testing/`), imports every
-runtime module — 167 of them — in one child `node`, and then *calls*
+runtime module — 167 of them (186 since the train review fix round added
+`packages/sdk/src`) — in one child `node`, and then *calls*
 `validateExternalUrl('https://example.com')` — because the import never failed;
 only the call did. It runs in two places:
 
@@ -112,7 +115,7 @@ Three changes, and the third is the one that makes the failure legible:
 3. **`SEARCH_STATE_DIR` is measured at configuration time.**
    `api/admin-socket.ts`
    is a new leaf module holding `ADMIN_SOCKET_FILENAME`, `adminSocketPath`,
-   `SUN_PATH_MAX_BYTES` (104 on macOS, 107 on Linux) and `socketPathProblem`;
+   `SUN_PATH_MAX_BYTES` (104 on macOS, 108 on Linux — corrected from 107 in the train review fix round) and `socketPathProblem`;
    `config()` refuses a state directory whose `admin.sock` would be too long,
    with the length, the limit, the path and both ways out. `startAdminServer`
    asks the same question about a `socketPath` handed straight to it, and now
@@ -157,3 +160,44 @@ packages (shared 358, core 651, sdk 73, cli 60; 6 skipped, 1 todo), with the
 fixture suite's q01–q15 green in both replays. `node
 packages/sdk/scripts/rehearse-npm-pack.mjs` still installs and imports every
 entry point from a tarball.
+
+## Train review fix round
+
+A Fable review of `3c59994..f937702` (the `beta/0.1.0` train) returned one
+blocker, one should-fix and three nits. Fixed on
+`fix/sun-path-and-blob-attach-race`.
+
+| Finding | What changed | Where | Test |
+|---|---|---|---|
+| BLOCKER: `SUN_PATH_MAX_BYTES` was 107 on Linux, so "limit+1 → EINVAL" was red on Linux CI | Linux limit is 108. The comment now gives the real reason: libuv's `uv_pipe_bind2` with `UV_PIPE_NO_TRUNCATE` refuses only a name longer than `sizeof(sun_path)`, and Linux accepts a 108-byte path with no trailing NUL. macOS is 104. The refusal message says "the size of sun_path" and no longer says the kernel refuses it. README wording matches. | `packages/search/src/api/admin-socket.ts:31-43`, `:59`; `README.md:61-66` | `admin-socket.test.ts` › "accepts a path at the limit and refuses one past it" (`:57`), "is the length the kernel actually enforces" (`:95`) |
+| SHOULD-FIX: blob attach treated `pending` as settled, but ingest and include leave a `pending` row with a job already queued. The `UPDATE` was also check-then-act. | Only `completed`, `failed`, and `pending` with `includedInKb: false` can be attached (`blobAttachRefusal`). The same rule, written as SQL (`blobAttachableSql`), is in the `UPDATE`'s `WHERE` (`repointDocumentBlob`). If zero rows update, the route re-reads the row: a deleted row gets 404, anything else 409. Updated the route doc, `docs/external-api.md` and the SDK `attachBlob` docstring to list exactly which documents can be attached. | `packages/search/src/api/routes/documents.ts:73-168`, `:335-342`, `:366-379`; `docs/external-api.md:317-333`; `packages/sdk/src/client.ts:464-470` | `fixture-suite.rest.test.ts` › "attaches new bytes to a document without re-ingesting it" (`:2241`): pending+included → 409 (`:2337`), pending+not-included → 200, lost race (status set to `embedding` / `pending`+included after the check) → `repointDocumentBlob` returns `false` and `fileUrl` stays the same (`:2366`) |
+| Docs: orphaned objects | The blob attach docs now say that a replaced object, or one stored by an attach that loses the race, is left orphaned. There is no GC or reaper and no route calls `deleteFile`. No GC was built. | `docs/external-api.md:308-312`; `documents.ts:321-323`; `client.ts:461-462` | docs only |
+| NIT: walker `ROOTS` did not include `packages/sdk/src` | Added it. `sdk/scripts` is outside `src` and is not walked. Coverage assertion now covers four packages and also checks for `packages/sdk/src/index.ts`. The walker exits 0 over **186** modules (search 114, shared 42, sdk 19, cli 11), with 0 failures. | `scripts/import-runtime-modules.mjs:50-55`; `plain-node-imports.test.ts:100-120` | `plain-node-imports.test.ts` › "covers all four runtime packages" (`:105`) |
+| NIT: "26 specifiers" could not be reproduced | Replaced it with a count you can check. I took every `from '…'`, side-effect `import '…'` and `import('…')` specifier in the walker's module list. I dropped relative paths, `@actana/*` and anything `module.isBuiltin` accepts, plus one hit that was inside a comment (`@/providers/models`, `models/catalog.ts:16`). That leaves 23 distinct packages: exactly the ones the paragraph names. 22 are in search/shared/cli and `undici` is in sdk. | this file, "The audit the fix asks for" | n/a |
+
+**Linux measurement** (`docker run --rm -v "$PWD":/w node:24-slim node
+<probe>`, a plain-node copy of the test's `pathOfLength` and `bind` helpers
+that imports the real module):
+
+```
+before: node v24.21.0 libuv 1.52.1 platform linux SUN_PATH_MAX_BYTES=107
+bind 107 bytes -> OK; guard -> accepts
+bind 108 bytes -> OK; guard -> refuses     # limit+1 bound: the red test
+bind 109 bytes -> EINVAL; guard -> refuses
+after:  node v24.21.0 libuv 1.52.1 platform linux SUN_PATH_MAX_BYTES=108
+bind 107 bytes -> OK; guard -> accepts
+bind 108 bytes -> OK; guard -> accepts
+bind 109 bytes -> EINVAL; guard -> refuses
+```
+
+**Left as recorded, not in scope:** the `SEARCH_ADMIN_PORT` double listen, a KB
+`language` that is refused only after the row is inserted, and an empty part
+filename (ingest has the same behaviour).
+
+**Gates.** `pnpm typecheck`, `pnpm lint` and `node scripts/check-strip-types.mjs`
+pass (277 files strippable). `pnpm audit --prod --audit-level high` finds 3
+moderate issues and nothing high. `pnpm test` against `search_test_b` passes
+1155 tests (shared 358, core 655 with 6 skipped and 1 todo, sdk 82, cli 60).
+The test count did not change because the new assertions were added to existing
+`it` blocks. `rehearse-npm-pack.mjs` installs and imports from a tarball, and
+`import-runtime-modules.mjs` exits 0.

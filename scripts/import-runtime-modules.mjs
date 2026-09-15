@@ -41,8 +41,18 @@ import { pathToFileURL } from "node:url";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 
-/** The packages whose modules a deployment loads under plain `node`. */
-const ROOTS = ["packages/search/src", "packages/shared/src", "packages/cli/src"];
+/**
+ * The packages whose modules a deployment loads under plain `node`. The SDK is
+ * one of them: it is what a client imports, and its `exports` map points at
+ * `src/*.ts` itself. Its `scripts/` (the npm-pack rehearsal) sits outside
+ * `src` and so is never walked, like every other package's.
+ */
+const ROOTS = [
+  "packages/search/src",
+  "packages/shared/src",
+  "packages/cli/src",
+  "packages/sdk/src",
+];
 
 /** Test scaffolding, which the runtime never loads. */
 const SKIP_DIRS = new Set(["__tests__", "__fixtures__", "testing", "node_modules", "dist"]);

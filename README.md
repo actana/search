@@ -60,9 +60,10 @@ commands: mint a code on the instance, redeem it on the client.
 
 > **Keep `SEARCH_STATE_DIR` short.** The admin listener binds a Unix domain
 > socket at `$SEARCH_STATE_DIR/admin.sock`, and a socket path is capped by
-> `sun_path` — 104 bytes on macOS, 108 on Linux. A longer one is refused by the
-> kernel with `EINVAL`, so Search refuses the variable at startup with the
-> length and the limit rather than failing halfway through its boot. Somewhere
+> `sun_path` — 104 bytes on macOS, 108 on Linux (a path may fill the array
+> exactly). A longer one fails to bind with `EINVAL`, so Search refuses the
+> variable at startup with the length and the limit rather than failing halfway
+> through its boot. Somewhere
 > with no room to spare can put the admin surface on a loopback port instead
 > (`SEARCH_ADMIN_PORT`).
 

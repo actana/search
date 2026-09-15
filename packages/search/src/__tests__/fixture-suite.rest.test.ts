@@ -166,6 +166,7 @@ import {
 import { verifyWebhookSignature } from "../events/webhook-signature.ts";
 import { startSearchServer, type SearchServer } from "../api/server.ts";
 import { registerSearchRoutes } from "../api/routes/index.ts";
+import { repointDocumentBlob } from "../api/routes/documents.ts";
 import { SearchPairingStore } from "../pairing/pairing-store.ts";
 import { PairingRevocations } from "../pairing/pairing-revocation.ts";
 import { ensureMaterial } from "../pairing/self-register.ts";
@@ -2333,11 +2334,25 @@ describeDb("KB behaviour freeze, over REST (fixture suite)", () => {
         }),
       ).rejects.toMatchObject({ status: 409, code: "conflict" });
     }
-    // `pending` is not refused: an upload made with `includedInKb: false` rests
-    // there with no job at all, and attaching its bytes is the obvious move.
+    // `pending` with `includedInKb: true` is refused: `POST …/documents` and
+    // `POST …/include` both leave the row there WITH a job queued that carries
+    // the current `fileUrl`, so repointing it now would have that job chunk
+    // the old bytes under a row that names the new ones.
     await db
       .update(document)
-      .set({ processingStatus: "pending" })
+      .set({ processingStatus: "pending", includedInKb: true })
+      .where(eq(document.id, doc.documentId));
+    await expect(
+      client.documents.attachBlob(sandboxKbId, doc.documentId, {
+        file: replacement,
+        filename: "attach-me.md",
+      }),
+    ).rejects.toMatchObject({ status: 409, code: "conflict" });
+    // `pending` with `includedInKb: false` stays attachable: an upload made that
+    // way rests there with no job at all, which is the migration's case.
+    await db
+      .update(document)
+      .set({ includedInKb: false })
       .where(eq(document.id, doc.documentId));
     expect(
       (
@@ -2347,10 +2362,43 @@ describeDb("KB behaviour freeze, over REST (fixture suite)", () => {
         })
       ).processingStatus,
     ).toBe("pending");
+
+    // ── The write itself carries the predicate, so a lost race is a 409 ──
+    // The route checks the row, then streams and uploads the bytes, then
+    // writes. A run that starts in between must not be overwritten: the
+    // conditional update is driven directly, with the status changed after
+    // the check would have passed.
+    const guarded = await client.documents.get(sandboxKbId, doc.documentId);
+    const raceValues = {
+      fileUrl: "/api/files/serve/s3/kb/race-lost",
+      fileSize: 1,
+      mimeType: "text/plain",
+    };
+    for (const [status, includedInKb] of [
+      ["embedding", false],
+      ["pending", true],
+    ] as const) {
+      await db
+        .update(document)
+        .set({ processingStatus: status, includedInKb })
+        .where(eq(document.id, doc.documentId));
+      expect(await repointDocumentBlob(sandboxKbId, doc.documentId, raceValues)).toBe(false);
+      expect((await client.documents.get(sandboxKbId, doc.documentId)).fileUrl).toBe(
+        guarded.fileUrl,
+      );
+    }
+    // And the same write wins when the row is still attachable.
     await db
       .update(document)
-      .set({ processingStatus: "completed" })
+      .set({ processingStatus: "completed", includedInKb: true })
       .where(eq(document.id, doc.documentId));
+    expect(
+      await repointDocumentBlob(sandboxKbId, doc.documentId, {
+        fileUrl: guarded.fileUrl,
+        fileSize: guarded.fileSize,
+        mimeType: guarded.mimeType,
+      }),
+    ).toBe(true);
 
     // ── 404, and it says nothing about whose document it is ───────────────
     await expect(

@@ -99,18 +99,24 @@ describe("every runtime module loads under plain node", () => {
 
   /**
    * A walk that quietly stopped finding modules would be a green gate over
-   * nothing, so the coverage is asserted rather than assumed: all three
+   * nothing, so the coverage is asserted rather than assumed: all four
    * packages, and the file the defect was in.
    */
-  it("covers all three runtime packages", () => {
+  it("covers all four runtime packages", () => {
     const { modules } = run.summary;
     expect(modules.length).toBeGreaterThan(150);
-    for (const root of ["packages/search/src/", "packages/shared/src/", "packages/cli/src/"]) {
+    for (const root of [
+      "packages/search/src/",
+      "packages/shared/src/",
+      "packages/cli/src/",
+      "packages/sdk/src/",
+    ]) {
       expect(modules.filter((m) => m.startsWith(root)).length).toBeGreaterThan(5);
     }
     expect(modules).toContain("packages/search/src/core/security/url-guard.ts");
     expect(modules).toContain("packages/search/src/index.ts");
     expect(modules).toContain("packages/search/src/worker.ts");
+    expect(modules).toContain("packages/sdk/src/index.ts");
   });
 
   /** Test scaffolding is not what a deployment loads, and must not be walked. */

@@ -458,11 +458,15 @@ export class SearchClient {
      * it is safe to retry: attaching the same bytes twice leaves the row in the
      * same state (a second object is written and the row points at it — the key
      * scheme is ingest's, so the previous object is superseded rather than
-     * overwritten, and it is left in the bucket).
+     * overwritten, and it is left in the bucket). Known cost: a replaced
+     * object is orphaned — the instance has no GC or reaper for it yet.
      *
      * `404` for a document that is not this client's or does not exist, like
-     * every other document route, and `409 conflict` while the document's
-     * `processingStatus` says a run is reading its current bytes — poll
+     * every other document route. The attachable set is exactly `completed`,
+     * `failed`, and `pending` with `includedInKb: false`; anything else — the
+     * in-flight statuses, or `pending` with `includedInKb: true`, which has a
+     * job queued over the current bytes — is `409 conflict`, including when the
+     * document leaves the set while the bytes are uploading. Poll
      * {@link SearchClient.documents.get} until it settles.
      */
     attachBlob: (

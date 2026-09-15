@@ -9,7 +9,9 @@
  * The boundary asserted here was measured rather than read: on this machine a
  * bind at 104 bytes succeeds and one at 105 is `EINVAL`, which is `sun_path`
  * being 104 bytes on macOS with no room demanded for the terminator. Linux's
- * is 108 and does demand it, hence 107. The binding half of that is asserted
+ * is 108 and, through libuv's `UV_PIPE_NO_TRUNCATE` bound, an unterminated
+ * 108-byte path binds and 109 is `EINVAL` (measured under `node:24-slim`, libuv
+ * 1.52.1). The binding half of that is asserted
  * against a real socket below, so the constant cannot drift from the kernel.
  */
 import * as net from "node:net";
