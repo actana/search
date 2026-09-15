@@ -17,7 +17,8 @@
  *   5. **The admin listener** on a Unix socket under `SEARCH_STATE_DIR`, which
  *      is where a pairing code is minted. `SEARCH_ADMIN_PORT` adds a loopback
  *      TCP port beside it for a platform with no Unix sockets.
- *   6. **The ingestion workers**, unless `SEARCH_WORKERS=off`.
+ *   6. **The ingestion workers**, unless `SEARCH_WORKERS=off` — or
+ *      `SEARCH_INLINE_JOBS=1`, which is the test-only in-process runner.
  *
  * The `/v1` REST surface is mounted at step 4 through `registerRoutes`
  * (`api/routes/index.ts`).
@@ -103,8 +104,16 @@ export async function boot(): Promise<void> {
    * `SEARCH_WORKERS=off` is read straight from the environment rather than
    * through the config schema: it is a deployment shape, not a tuning knob, and
    * the only two things that ever set it are `start:api` and a compose file.
+   *
+   * `SEARCH_INLINE_JOBS` turns them off as well, and that one is not a shape —
+   * it is the test-only mode that runs the jobs inside the enqueue
+   * (`queue/inline.ts`), refused outside a test by `config()` itself. Starting
+   * a BullMQ worker beside it would mean the fixture suites needed a Redis to
+   * boot a server, which is exactly what that mode exists to avoid, and the two
+   * runners would then race for the same job.
    */
-  const workersOff = /^(off|0|false|no)$/i.test(process.env.SEARCH_WORKERS ?? "");
+  const workersOff =
+    cfg.SEARCH_INLINE_JOBS || /^(off|0|false|no)$/i.test(process.env.SEARCH_WORKERS ?? "");
   const workers = workersOff ? null : await startWorkers();
 
   /**
@@ -127,7 +136,11 @@ export async function boot(): Promise<void> {
     api: api.origin,
     adminSocket: admin.socketPath,
     adminPort: admin.port,
-    workers: workersOff ? "off (SEARCH_WORKERS=off)" : "in this process",
+    workers: cfg.SEARCH_INLINE_JOBS
+      ? "off (SEARCH_INLINE_JOBS=1 — the jobs run in the enqueue)"
+      : workersOff
+        ? "off (SEARCH_WORKERS=off)"
+        : "in this process",
   });
 }
 

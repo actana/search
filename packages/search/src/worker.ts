@@ -2,19 +2,18 @@
  * Search's ingestion worker (ADR 0006, ADR 0010).
  *
  * One BullMQ `Worker` on one queue — `search-knowledge`, under the prefix
- * `SEARCH_QUEUE_PREFIX` — routing by job name to the handlers the engine
- * already has. Studio's `worker/index.ts` ran four queues for four products;
- * Search has one, and the concurrency, the lock duration and the stall settings
- * are the ones Studio used for *its* knowledge queue, because the jobs are the
- * same jobs.
+ * `SEARCH_QUEUE_PREFIX`. Studio's `worker/index.ts` ran four queues for four
+ * products; Search has one, and the concurrency, the lock duration and the
+ * stall settings are the ones Studio used for *its* knowledge queue, because
+ * the jobs are the same jobs.
  *
- *   knowledge-process-document  → planDocumentEmbedding   (parse, stage, fan out)
- *   kb.embed.batch              → processEmbedBatch       (one resumable range)
- *   kb.embed.finalize           → finalizeDocumentEmbedding (fan-in)
- *   kb-keywords-extract         → handleKeywordsExtract
- *   kb.clusters.validate        → handleClustersValidate
- *   kb.ingest.document          → ingestDocument          (the synchronous path)
- *   kb.document.timeout-sweep   → runDocumentTimeoutSweep (repeatable)
+ * **The routing table is not here.** `jobs/run.ts` owns it — one job name, one
+ * handler, one wall-clock budget, one announcement — and this file hands a job
+ * over to {@link runSearchJob} exactly the way the inline runner does. It used
+ * to be a `switch` here beside a second table there, which is two spellings of
+ * every job name and two places for an event to be announced from; the worker's
+ * job is the half `jobs/run.ts` cannot do, which is deciding what a *failure*
+ * means.
  *
  * **Why the worker is Search's own, and what that costs.** ADR 0006 settled it:
  * the thing that owns the work owns the queue it recovers through. What this
@@ -54,28 +53,20 @@ import {
   queuePrefix,
   type JobType,
 } from './queue/index.ts'
-import { emitSearchEvent, eventTimestamp } from './events.ts'
+import { publishSearchEvent, searchEventId } from './events/publish.ts'
 import { assertEncryptionKeyConfigured } from './core/security/encryption.ts'
 import {
   isEndpointKeyUnavailable,
   type EndpointKeyUnavailableError,
 } from './models/endpoint-key-errors.ts'
-import { ingestDocument } from './kb/ingest.ts'
-import { handleClustersValidate } from './kb/jobs/clusters-validate.ts'
-import { handleKeywordsExtract, type KeywordsExtractPayload } from './kb/jobs/keywords-extract.ts'
-import { runDocumentTimeoutSweep } from './kb/jobs/document-timeout-sweep.ts'
 import {
-  finalizeDocumentEmbedding,
-  planDocumentEmbedding,
-  processEmbedBatch,
-  type EmbedBatchPayload,
-  type EmbedFinalizePayload,
-} from './knowledge/documents/embed-pipeline.ts'
-import {
-  computeProcessingTimeoutMs,
-  NON_TERMINAL_PROCESSING_STATUSES,
-} from './knowledge/documents/service.ts'
-import type { DocumentProcessingPayload } from './jobs/types.ts'
+  claimAnnouncedEvent,
+  documentRow,
+  isKnownJobName,
+  runSearchJob,
+} from './jobs/run.ts'
+import { NON_TERMINAL_PROCESSING_STATUSES } from './knowledge/documents/service.ts'
+import type { KbIngestDocumentPayload } from './jobs/types.ts'
 
 const logger = createLogger('Worker')
 
@@ -96,30 +87,8 @@ export const WORKER_LOCK_TUNING = {
   maxStalledCount: 2,
 } as const
 
-/**
- * Wall-clock budget for one fanned-out embed batch. Bounds a stuck provider
- * request; the work is resumable, so a timeout is a retry rather than a loss.
- */
-export const EMBED_BATCH_TIMEOUT_MS = 15 * 60 * 1000
-
 /** How often the stranded-document sweep runs, when it is registered. */
 export const TIMEOUT_SWEEP_INTERVAL_MS = 5 * 60 * 1000
-
-/** The payload of a `kb.ingest.document` job. */
-export interface KbIngestDocumentPayload {
-  knowledgeBaseId: string
-  filename: string
-  /** The document's text. One of `text` or `fileUrl`. */
-  text?: string
-  /** A URL in Search's own bucket, fetched before the ingest. */
-  fileUrl?: string
-  mimeType?: string
-  metadata?: Record<string, unknown>
-  /** Defaults to `true` for a job — an enqueued ingest means "make it searchable". */
-  includedInKb?: boolean
-  /** The paired client that asked, for the event. */
-  pairedClientId?: string
-}
 
 /** What a job's envelope looks like. `queue/index.ts` writes it. */
 interface JobEnvelope {
@@ -137,20 +106,6 @@ function correlationOf(job: Job | undefined): Record<string, unknown> {
     queue: QUEUE_NAME,
     attempt: job?.attemptsMade,
     requestId: data?.metadata?.correlation?.requestId,
-  }
-}
-
-/** Run `fn` under an abort signal that fires after `timeoutMs`. */
-async function withTimeout<T>(
-  fn: (signal: AbortSignal) => Promise<T>,
-  timeoutMs: number
-): Promise<T> {
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
-  try {
-    return await fn(controller.signal)
-  } finally {
-    clearTimeout(timer)
   }
 }
 
@@ -222,131 +177,104 @@ function asBullMqFailure(error: unknown): unknown {
  * The processor. Exported so a unit test can drive it with a fake job rather
  * than a Redis.
  *
- * One `try` around the routing table, and it is not cosmetic: it is where a
- * terminal failure stops being a retry (see {@link asBullMqFailure}).
+ * Three lines of its own and then {@link runSearchJob}, which is the whole
+ * point: the dispatch table, the per-job budget and the terminal-state
+ * announcement are shared with the inline runner rather than written twice.
+ * What is local to this transport is the two things BullMQ needs and the inline
+ * runner has no concept of — how many attempts are left, and whether this
+ * failure should consume them (see {@link asBullMqFailure}).
  */
 export const processSearchJob: Processor = async (job: Job): Promise<unknown> => {
+  logger.info('Job started', correlationOf(job))
   try {
-    return await routeSearchJob(job)
+    assertRunnable(job)
+    return await runSearchJob(
+      { type: job.name, payload: (job.data ?? {}).payload },
+      { attemptsRemaining: attemptsRemaining(job) },
+    )
   } catch (err) {
     throw asBullMqFailure(err)
   }
 }
 
-/** The routing table itself. */
-async function routeSearchJob(job: Job): Promise<unknown> {
-  const { payload } = (job.data ?? {}) as JobEnvelope
-  logger.info('Job started', correlationOf(job))
-
-  switch (job.name) {
-    case 'knowledge-process-document': {
-      /**
-       * On the BullMQ backend this job is the *planner*: it parses, stages every
-       * chunk and fans out the resumable batches. The embedding is no longer
-       * here, but parsing a large file still is, so it keeps the size-scaled
-       * budget Studio gave it.
-       */
-      const docPayload = payload as DocumentProcessingPayload
-      return withTimeout(
-        (signal) => planDocumentEmbedding(docPayload, signal),
-        computeProcessingTimeoutMs(docPayload?.docData?.fileSize)
-      )
-    }
-
-    case 'kb.embed.batch':
-      return withTimeout(
-        (signal) => processEmbedBatch(payload as EmbedBatchPayload, signal),
-        EMBED_BATCH_TIMEOUT_MS
-      )
-
-    case 'kb.embed.finalize':
-      return finalizeDocumentEmbedding(payload as EmbedFinalizePayload)
-
-    case 'kb-keywords-extract':
-      return handleKeywordsExtract(payload as KeywordsExtractPayload)
-
-    case 'kb.clusters.validate':
-      return handleClustersValidate(payload as { kbId: string })
-
-    case 'kb.ingest.document':
-      return runKbIngestDocument(payload as KbIngestDocumentPayload)
-
-    case 'kb.document.timeout-sweep':
-      return runDocumentTimeoutSweep()
-
-    default:
-      // Not a retry: a name this build does not know will not become one on the
-      // fourth attempt. It fails loudly so an operator sees a version skew
-      // rather than a queue that silently grows.
-      throw new NotRunnableJobError(`Unknown search job name: ${job.name}`)
-  }
+/**
+ * How many further attempts BullMQ will give this job if this one throws.
+ *
+ * `attemptsMade` is the count of attempts *already finished* while the processor
+ * runs — `Job` increments it in `moveToFailed`/`moveToCompleted`, after the
+ * handler has returned — and BullMQ's own retry test is
+ * `attemptsMade + 1 < opts.attempts`. This is that subtraction, and it is what
+ * `jobs/run.ts` holds a `document.failed` back on: the engine marks a document
+ * failed the moment an attempt gives up, which on attempt one of five is not
+ * news anybody should act on.
+ */
+function attemptsRemaining(job: Job): number {
+  const allowed = job.opts?.attempts ?? JOB_TYPE_ATTEMPTS[job.name as JobType] ?? 1
+  return Math.max(0, allowed - ((job.attemptsMade ?? 0) + 1))
 }
 
 /**
- * The single-shot ingest, as a job.
+ * The two payload shapes that are not runnable at all, checked before dispatch.
  *
- * `ingestDocument` is the synchronous path — parse, chunk, embed and write in
- * one call — and it is what the CLI's `ingest` and a small `POST
- * /kbs/:id/documents` reach. Running it on the queue is what makes it
- * non-blocking without a second code path: same function, same ranking, one
- * `await`.
+ * Both are the same decision as an unknown key failure — a retry cannot change
+ * the answer — and both used to be plain `Error`s, which BullMQ cheerfully
+ * re-queued. `jobs/run.ts` throws an untyped error for a name it has no handler
+ * for; the name is asked about *here*, before the job runs, so that the refusal
+ * is an {@link NotRunnableJobError} and therefore terminal.
  */
-async function runKbIngestDocument(payload: KbIngestDocumentPayload): Promise<unknown> {
-  // Not runnable rather than failed: a payload that is missing its knowledge
-  // base is missing it on every attempt.
-  if (!payload?.knowledgeBaseId || !payload.filename) {
-    throw new NotRunnableJobError('kb.ingest.document: knowledgeBaseId and filename are required')
+function assertRunnable(job: Job): void {
+  if (!isKnownJobName(job.name)) {
+    // Not a retry: a name this build does not know will not become one on the
+    // fourth attempt. It fails loudly so an operator sees a version skew
+    // rather than a queue that silently grows.
+    throw new NotRunnableJobError(`Unknown search job name: ${job.name}`)
   }
-  if (payload.text === undefined && !payload.fileUrl) {
-    throw new NotRunnableJobError('kb.ingest.document: one of text or fileUrl is required')
+  if (job.name !== 'kb.ingest.document') return
+  /**
+   * `kb.ingest.document` is the one job whose payload this file still reads,
+   * because it is the one the frozen `ingestDocument` destructures directly
+   * (`jobs/types.ts`'s `KbIngestDocumentPayload`). A payload missing its
+   * knowledge base is missing it on every attempt.
+   *
+   * The `fileUrl` branch this used to have is gone with the shape: nothing
+   * enqueues it. A file-backed document goes to `knowledge-process-document`,
+   * which reads its bytes from the row the route staged.
+   */
+  const payload = ((job.data ?? {}).payload ?? {}) as Partial<KbIngestDocumentPayload>
+  if (!payload.kbId || !payload.filename) {
+    throw new NotRunnableJobError('kb.ingest.document: kbId and filename are required')
   }
-
-  let file: Buffer | undefined
-  if (payload.fileUrl && payload.text === undefined) {
-    const response = await fetch(payload.fileUrl)
-    if (!response.ok) {
-      throw new Error(
-        `kb.ingest.document: the document's bytes could not be read (${response.status})`
-      )
-    }
-    file = Buffer.from(await response.arrayBuffer())
+  if (payload.text === undefined) {
+    throw new NotRunnableJobError('kb.ingest.document: text is required')
   }
-
-  const result = await ingestDocument({
-    kbId: payload.knowledgeBaseId,
-    filename: payload.filename,
-    ...(payload.text === undefined ? {} : { text: payload.text }),
-    ...(file ? { file } : {}),
-    ...(payload.mimeType ? { mimeType: payload.mimeType } : {}),
-    ...(payload.metadata ? { metadata: payload.metadata } : {}),
-    includedInKb: payload.includedInKb ?? true,
-  })
-
-  emitSearchEvent({
-    type: 'document.ingested',
-    pairedClientId:
-      payload.pairedClientId ?? (await pairedClientOfKb(payload.knowledgeBaseId)),
-    knowledgeBaseId: payload.knowledgeBaseId,
-    documentId: result.documentId,
-    chunkCount: result.chunkCount,
-    at: eventTimestamp(),
-  })
-  return result
 }
 
 // ---------------------------------------------------------------------------
 // Failure handling — the half ADR 0010 is about
 // ---------------------------------------------------------------------------
 
-/** The document a job was working on, when the payload names one. */
+/**
+ * The document a job was working on, when the payload names one.
+ *
+ * Under **either** spelling of the knowledge base id: the worker-flow payloads
+ * say `knowledgeBaseId` and `kb.ingest.document`'s says `kbId`, because that is
+ * what the frozen `ingestDocument` destructures (ADR 0005). Reading only the
+ * first meant an ingest job that ran out of attempts left its document in
+ * `pending` for the sweep to find, with nothing said about it.
+ */
 function documentOf(job: Job): { documentId: string; knowledgeBaseId: string } | null {
   const payload = (job.data as JobEnvelope | undefined)?.payload as
-    | { documentId?: unknown; knowledgeBaseId?: unknown }
+    | { documentId?: unknown; knowledgeBaseId?: unknown; kbId?: unknown }
     | undefined
-  if (typeof payload?.documentId !== 'string' || typeof payload.knowledgeBaseId !== 'string') {
-    return null
-  }
-  return { documentId: payload.documentId, knowledgeBaseId: payload.knowledgeBaseId }
+  if (typeof payload?.documentId !== 'string') return null
+  const kbId =
+    typeof payload.knowledgeBaseId === 'string'
+      ? payload.knowledgeBaseId
+      : typeof payload.kbId === 'string'
+        ? payload.kbId
+        : null
+  if (kbId === null) return null
+  return { documentId: payload.documentId, knowledgeBaseId: kbId }
 }
 
 /** Whether BullMQ has any attempts left for this job. */
@@ -373,6 +301,14 @@ async function pairedClientOfKb(kbId: string): Promise<string | null> {
  * second failing job writes nothing. Best-effort: a database that is down is
  * the reason the job failed, and a throw here would only replace one failure
  * with another.
+ *
+ * **This is the second of the two places a `document.failed` comes from, and
+ * they share one id space.** `jobs/run.ts` announces the state the *engine*
+ * wrote, which is the ordinary path; this one covers the failures the engine
+ * never saw — a key that could not be resolved before any row was touched — and
+ * adds the typed `reason`, which is not on the row. Both derive the event id
+ * from the same facts and both go through `claimAnnouncedEvent`, so a document
+ * that fails is one event rather than two.
  */
 async function failDocument(job: Job, error: Error, reason?: string): Promise<void> {
   const target = documentOf(job)
@@ -397,16 +333,40 @@ async function failDocument(job: Job, error: Error, reason?: string): Promise<vo
         )
       )
       .returning({ id: document.id })
-    if (updated.length === 0) return
 
-    emitSearchEvent({
-      type: 'document.failed',
-      pairedClientId: await pairedClientOfKb(target.knowledgeBaseId),
-      knowledgeBaseId: target.knowledgeBaseId,
+    if (updated.length === 0) {
+      /**
+       * Nothing to write — but possibly something still to say.
+       *
+       * Two ways here. A sibling carried the document to `completed`, in which
+       * case this job's failure is not news and the early return is right. Or
+       * the engine had already marked it `failed` on *this* attempt — and if
+       * this attempt had attempts left (a terminal error, refused before
+       * BullMQ's counter ran out), `jobs/run.ts` deliberately held the
+       * announcement back. Somebody has to make it, and the claim below is what
+       * stops it being made twice.
+       */
+      const row = await documentRow(target.documentId)
+      if (row?.processingStatus !== 'failed') return
+    }
+
+    const id = searchEventId('document.failed', target.documentId, 'failed')
+    if (!claimAnnouncedEvent(id)) return
+    const pairedClientId = await pairedClientOfKb(target.knowledgeBaseId)
+    // No paired client is no addressee: the KB was deleted under the job, and
+    // there is nobody to tell.
+    if (!pairedClientId) return
+    await publishSearchEvent(pairedClientId, {
+      id,
+      event: 'document.failed',
+      occurredAt: new Date().toISOString(),
+      kbId: target.knowledgeBaseId,
       documentId: target.documentId,
-      error: message,
+      error: message.slice(0, 2000),
+      // The machine-readable half of ADR 0010 D3, and the reason this path
+      // exists beside the one in `jobs/run.ts`: the row carries the operator's
+      // sentence and not the typed reason behind it.
       ...(reason ? { reason } : {}),
-      at: eventTimestamp(),
     })
   } catch (err) {
     logger.error('Could not mark a document failed after its job gave up', {

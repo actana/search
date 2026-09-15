@@ -20,10 +20,14 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { UnrecoverableError, type Job } from 'bullmq'
+import type { SearchEvent } from '@actana/search/contracts'
 
 const handlers = vi.hoisted(() => ({
-  planDocumentEmbedding: vi.fn(async () => 'planned'),
-  processEmbedBatch: vi.fn(async () => 'batched'),
+  publishSearchEvent: vi.fn(async () => {}),
+  // Two arguments, because the dispatch table hands a budget's `AbortSignal`
+  // to the two handlers that accept one, and that is asserted below.
+  planDocumentEmbedding: vi.fn(async (_payload: unknown, _signal?: AbortSignal) => 'planned'),
+  processEmbedBatch: vi.fn(async (_payload: unknown, _signal?: AbortSignal) => 'batched'),
   finalizeDocumentEmbedding: vi.fn(async () => 'finalized'),
   handleKeywordsExtract: vi.fn(async () => 'keyworded'),
   handleClustersValidate: vi.fn(async () => 'clustered'),
@@ -85,9 +89,22 @@ vi.mock('./kb/jobs/document-timeout-sweep.ts', () => ({
   runDocumentTimeoutSweep: handlers.runDocumentTimeoutSweep,
 }))
 vi.mock('./kb/ingest.ts', () => ({ ingestDocument: handlers.ingestDocument }))
+/**
+ * The publish seam, not the emitter under it.
+ *
+ * `events/publish.ts` is the one door an event leaves through — the SSE
+ * fan-out and the webhook ledger are both behind it — so mocking it is what
+ * makes "who was told, and what" a single assertion. `searchEventId` is the
+ * real one: the id is derived from the facts and both announcement paths have
+ * to agree on it (ADR 0009 D8a).
+ */
+vi.mock('./events/publish.ts', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./events/publish.ts')>()
+  return { ...real, publishSearchEvent: handlers.publishSearchEvent }
+})
 
-import { clearSearchEventListeners, onSearchEvent, type SearchEvent } from './events.ts'
 import { EndpointKeyUnavailableError } from './models/endpoint-key-errors.ts'
+import { resetAnnouncedEvents } from './jobs/run.ts'
 import {
   drainAndClose,
   handleJobFailure,
@@ -126,35 +143,66 @@ function queueSelect(rows: unknown[]) {
   })
 }
 
+/** Every event the worker published, as `(pairedClientId, event)`. */
+function published(): Array<[string, SearchEvent]> {
+  return handlers.publishSearchEvent.mock.calls as unknown as Array<[string, SearchEvent]>
+}
+
+/** Just the events, which is what most assertions are about. */
+function publishedEvents(): SearchEvent[] {
+  return published().map(([, event]) => event)
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
-  clearSearchEventListeners()
+  /**
+   * `clearAllMocks` forgets the *calls*; it does not forget a queued
+   * `mockReturnValueOnce`. The two database fakes are queued per test — one
+   * answer per `select`, in order — so a test that queues an answer it does not
+   * reach would hand it to the next test and be diagnosed there.
+   */
+  handlers.select.mockReset()
+  handlers.update.mockReset()
+  // Event ids are derived from the facts, so two tests about the same document
+  // would otherwise be one announcement and one silent no-op.
+  resetAnnouncedEvents()
 })
 
 describe('routing', () => {
+  /**
+   * The table itself is `jobs/run.ts`'s, and these go through the processor
+   * because that is the path a job actually takes: what is being asserted is
+   * that the worker hands every name over rather than knowing any of them.
+   */
   it('sends knowledge-process-document to the planner', async () => {
     await processSearchJob(job('knowledge-process-document', { docData: { fileSize: 1024 } }))
     expect(handlers.planDocumentEmbedding).toHaveBeenCalledOnce()
+    // With the size-scaled budget's signal, which used to be the worker's own
+    // `withTimeout` and is now the dispatch table's.
+    expect(handlers.planDocumentEmbedding.mock.calls[0]![1]).toBeInstanceOf(AbortSignal)
   })
 
   it('sends kb.embed.batch to the resumable range handler', async () => {
     await processSearchJob(job('kb.embed.batch', { batchId: 'b-1' }))
     expect(handlers.processEmbedBatch).toHaveBeenCalledOnce()
+    expect(handlers.processEmbedBatch.mock.calls[0]![1]).toBeInstanceOf(AbortSignal)
   })
 
   it('sends kb.embed.finalize to the fan-in handler', async () => {
     // The name the flow producer actually uses. It was mistyped
     // `kb.document.finalize` in the JobType union, and a worker routing on
-    // that would silently never finalize a document.
+    // that would silently never finalize a document. Both spellings are in the
+    // table, because both are already sitting in Redis.
     await processSearchJob(job('kb.embed.finalize', { documentId: 'd-1' }))
-    expect(handlers.finalizeDocumentEmbedding).toHaveBeenCalledOnce()
+    await processSearchJob(job('kb.document.finalize', { documentId: 'd-2' }))
+    expect(handlers.finalizeDocumentEmbedding).toHaveBeenCalledTimes(2)
   })
 
   it('sends kb-keywords-extract and kb.clusters.validate to theirs', async () => {
     await processSearchJob(job('kb-keywords-extract', { documentId: 'd-1' }))
     await processSearchJob(job('kb.clusters.validate', { kbId: 'kb-1' }))
     expect(handlers.handleKeywordsExtract).toHaveBeenCalledOnce()
-    expect(handlers.handleClustersValidate).toHaveBeenCalledWith({ kbId: 'kb-1' })
+    expect(handlers.handleClustersValidate).toHaveBeenCalledWith({ kbId: 'kb-1' }, undefined)
   })
 
   it('runs the stranded-document sweep', async () => {
@@ -170,39 +218,147 @@ describe('routing', () => {
 })
 
 describe('kb.ingest.document', () => {
+  /** The row `announce()` reads back after the handler returned. */
+  function queueDocument(overrides: Record<string, unknown> = {}) {
+    queueSelect([
+      {
+        id: 'doc-new',
+        knowledgeBaseId: 'kb-1',
+        filename: 'handbook.md',
+        chunkCount: 3,
+        processingStatus: 'completed',
+        processingError: null,
+        ...overrides,
+      },
+    ])
+    queueSelect([{ pairedClientId: 'pc-1', kmeansUpdatedAt: null }])
+  }
+
   it('ingests text and announces the document', async () => {
-    const seen: SearchEvent[] = []
-    onSearchEvent((e) => seen.push(e))
-    queueSelect([{ pairedClientId: 'pc-1' }])
+    queueDocument()
 
     const result = await processSearchJob(
       job('kb.ingest.document', {
-        knowledgeBaseId: 'kb-1',
+        kbId: 'kb-1',
+        documentId: 'doc-new',
         filename: 'handbook.md',
         text: '# Handbook',
+        tags: { tag_1: 'people' },
       })
     )
 
     expect(result).toEqual({ documentId: 'doc-new', chunkCount: 3 })
+    /**
+     * The payload goes to the frozen `ingestDocument` as it stands — including
+     * `documentId` and `tags`, which is what makes a retry resume the row the
+     * route staged instead of inserting another one.
+     */
     expect(handlers.ingestDocument).toHaveBeenCalledWith(
-      expect.objectContaining({ kbId: 'kb-1', filename: 'handbook.md', includedInKb: true })
-    )
-    expect(seen).toEqual([
       expect.objectContaining({
-        type: 'document.ingested',
-        knowledgeBaseId: 'kb-1',
+        kbId: 'kb-1',
         documentId: 'doc-new',
-        chunkCount: 3,
-        pairedClientId: 'pc-1',
+        filename: 'handbook.md',
+        tags: { tag_1: 'people' },
+      }),
+      undefined
+    )
+    expect(published()).toEqual([
+      [
+        'pc-1',
+        expect.objectContaining({
+          event: 'document.ingested',
+          kbId: 'kb-1',
+          documentId: 'doc-new',
+          chunkCount: 3,
+        }),
+      ],
+    ])
+  })
+
+  it('refuses a payload with no knowledge base, and one with no text', async () => {
+    await expect(
+      processSearchJob(job('kb.ingest.document', { filename: 'x.md', text: 'hi' }))
+    ).rejects.toThrow(/kbId and filename are required/)
+    await expect(
+      processSearchJob(job('kb.ingest.document', { kbId: 'kb-1', filename: 'x.md' }))
+    ).rejects.toThrow(/text is required/)
+    expect(handlers.ingestDocument).not.toHaveBeenCalled()
+  })
+})
+
+describe('a document that is failed but not finished', () => {
+  /**
+   * The post-merge behaviour this rebase had to decide.
+   *
+   * TASK-004 announces from the job's completion, reading the row the engine
+   * wrote — and the engine writes `failed` as soon as *this attempt* gave up,
+   * which on attempt one of five is a resolver that was away for a second. A
+   * `document.failed` on the wire is a thing Studio's trigger acts on, so it is
+   * held back until the attempt that really is the last one.
+   */
+  const payload = { kbId: 'kb-1', documentId: 'doc-7', filename: 'x.md', text: 'hi' }
+
+  function queueFailedRow() {
+    queueSelect([
+      {
+        id: 'doc-7',
+        knowledgeBaseId: 'kb-1',
+        filename: 'x.md',
+        chunkCount: 0,
+        processingStatus: 'failed',
+        processingError: 'the resolver was not answering',
+      },
+    ])
+    queueSelect([{ pairedClientId: 'pc-1', kmeansUpdatedAt: null }])
+  }
+
+  it('says nothing while BullMQ still has attempts for the job', async () => {
+    queueFailedRow()
+    handlers.ingestDocument.mockRejectedValueOnce(new Error('the resolver was not answering'))
+
+    await expect(
+      processSearchJob(job('kb.ingest.document', payload, { attempts: 5, attemptsMade: 0 }))
+    ).rejects.toThrow(/not answering/)
+
+    expect(published()).toEqual([])
+  })
+
+  it('announces it on the attempt that is the last one', async () => {
+    queueFailedRow()
+    handlers.ingestDocument.mockRejectedValueOnce(new Error('the resolver was not answering'))
+
+    await expect(
+      processSearchJob(job('kb.ingest.document', payload, { attempts: 5, attemptsMade: 4 }))
+    ).rejects.toThrow(/not answering/)
+
+    expect(publishedEvents()).toEqual([
+      expect.objectContaining({
+        event: 'document.failed',
+        documentId: 'doc-7',
+        error: 'the resolver was not answering',
       }),
     ])
   })
 
-  it('refuses a payload with neither text nor a file url', async () => {
-    await expect(
-      processSearchJob(job('kb.ingest.document', { knowledgeBaseId: 'kb-1', filename: 'x.md' }))
-    ).rejects.toThrow(/one of text or fileUrl/)
-    expect(handlers.ingestDocument).not.toHaveBeenCalled()
+  it('announces a success whatever the attempt number', async () => {
+    // Only the failure is held back: a document that ingested on attempt two of
+    // five has ingested.
+    queueSelect([
+      {
+        id: 'doc-7',
+        knowledgeBaseId: 'kb-1',
+        filename: 'x.md',
+        chunkCount: 2,
+        processingStatus: 'completed',
+        processingError: null,
+      },
+    ])
+    queueSelect([{ pairedClientId: 'pc-1', kmeansUpdatedAt: null }])
+
+    await processSearchJob(job('kb.ingest.document', payload, { attempts: 5, attemptsMade: 1 }))
+    expect(publishedEvents()).toEqual([
+      expect.objectContaining({ event: 'document.ingested', documentId: 'doc-7' }),
+    ])
   })
 })
 
@@ -216,32 +372,53 @@ describe('a failure retries or fails the document', () => {
       externalId: 'ws-1',
       pairedClientId: 'pc-1',
     })
-    const seen: SearchEvent[] = []
-    onSearchEvent((e) => seen.push(e))
 
     await handleJobFailure(job('kb.embed.batch', target, { attempts: 5, attemptsMade: 1 }), err)
 
     expect(handlers.update).not.toHaveBeenCalled()
-    expect(seen).toEqual([])
+    expect(published()).toEqual([])
   })
 
   it('fails the document once the retryable failure runs out of attempts', async () => {
     const err = new EndpointKeyUnavailableError('resolver 503', { reason: 'resolver-error' })
-    const seen: SearchEvent[] = []
-    onSearchEvent((e) => seen.push(e))
     queueUpdate([{ id: 'doc-7' }])
     queueSelect([{ pairedClientId: 'pc-1' }])
 
     await handleJobFailure(job('kb.embed.batch', target, { attempts: 5, attemptsMade: 5 }), err)
 
     expect(handlers.update).toHaveBeenCalledOnce()
-    expect(seen).toEqual([
-      expect.objectContaining({
-        type: 'document.failed',
-        documentId: 'doc-7',
-        knowledgeBaseId: 'kb-1',
-        reason: 'resolver-error',
-      }),
+    expect(published()).toEqual([
+      [
+        'pc-1',
+        expect.objectContaining({
+          event: 'document.failed',
+          documentId: 'doc-7',
+          kbId: 'kb-1',
+          reason: 'resolver-error',
+        }),
+      ],
+    ])
+  })
+
+  it('finds the document under `kbId` as well as `knowledgeBaseId`', async () => {
+    // `kb.ingest.document`'s payload says `kbId`, because that is what the
+    // frozen `ingestDocument` destructures. Reading only the other spelling
+    // left an ingest job's document in `pending` with nothing said about it.
+    queueUpdate([{ id: 'doc-7' }])
+    queueSelect([{ pairedClientId: 'pc-1' }])
+
+    await handleJobFailure(
+      job(
+        'kb.ingest.document',
+        { documentId: 'doc-7', kbId: 'kb-9' },
+        { attempts: 1, attemptsMade: 1 }
+      ),
+      new Error('this PDF is a picture of a PDF')
+    )
+
+    expect(handlers.update).toHaveBeenCalledOnce()
+    expect(publishedEvents()).toEqual([
+      expect.objectContaining({ event: 'document.failed', kbId: 'kb-9', documentId: 'doc-7' }),
     ])
   })
 
@@ -259,32 +436,90 @@ describe('a failure retries or fails the document', () => {
   })
 
   it('fails the document on an ordinary error with no attempts left', async () => {
-    const seen: SearchEvent[] = []
-    onSearchEvent((e) => seen.push(e))
     queueUpdate([{ id: 'doc-7' }])
-    queueSelect([{ pairedClientId: null }])
+    queueSelect([{ pairedClientId: 'pc-1' }])
 
     await handleJobFailure(
       job('knowledge-process-document', target, { attempts: 3, attemptsMade: 3 }),
       new Error('this PDF is a picture of a PDF')
     )
 
-    expect(seen[0]).toMatchObject({ type: 'document.failed', error: expect.stringContaining('PDF') })
-    expect(seen[0]).not.toHaveProperty('reason')
+    expect(publishedEvents()[0]).toMatchObject({
+      event: 'document.failed',
+      error: expect.stringContaining('PDF'),
+    })
+    expect(publishedEvents()[0]).not.toHaveProperty('reason')
   })
 
-  it('emits nothing when the document was already terminal', async () => {
-    const seen: SearchEvent[] = []
-    onSearchEvent((e) => seen.push(e))
-    // The narrowed UPDATE matched no row: a sibling already settled it.
+  it('tells nobody when the knowledge base has no paired client left', async () => {
+    // The KB was deleted under the job: there is no addressee.
+    queueUpdate([{ id: 'doc-7' }])
+    queueSelect([{ pairedClientId: null }])
+
+    await handleJobFailure(
+      job('kb.embed.batch', target, { attempts: 1, attemptsMade: 1 }),
+      new Error('too late')
+    )
+    expect(published()).toEqual([])
+  })
+
+  it('emits nothing when a sibling already carried the document to completed', async () => {
+    // The narrowed UPDATE matched no row, and the row is not `failed` either —
+    // so this job's failure is not this document's news.
     queueUpdate([])
+    queueSelect([
+      {
+        id: 'doc-7',
+        knowledgeBaseId: 'kb-1',
+        filename: 'x.md',
+        chunkCount: 4,
+        processingStatus: 'completed',
+        processingError: null,
+      },
+    ])
 
     await handleJobFailure(
       job('kb.embed.batch', target, { attempts: 1, attemptsMade: 1 }),
       new Error('too late')
     )
 
-    expect(seen).toEqual([])
+    expect(published()).toEqual([])
+  })
+
+  it('still says so when the engine had already written `failed` itself', async () => {
+    /**
+     * The gap the two announcement paths leave between them. A *terminal*
+     * failure on attempt one of five: `jobs/run.ts` held the announcement back
+     * because BullMQ had attempts left, and the narrowed UPDATE here then
+     * matched nothing because the engine had already marked the row. Somebody
+     * has to make the announcement, and `claimAnnouncedEvent` is what stops it
+     * being made twice.
+     */
+    queueUpdate([])
+    queueSelect([
+      {
+        id: 'doc-7',
+        knowledgeBaseId: 'kb-1',
+        filename: 'x.md',
+        chunkCount: 0,
+        processingStatus: 'failed',
+        processingError: 'the mirror is stale',
+      },
+    ])
+    queueSelect([{ pairedClientId: 'pc-1' }])
+
+    await handleJobFailure(
+      job('kb.embed.batch', target, { attempts: 5, attemptsMade: 1 }),
+      new EndpointKeyUnavailableError('the mirror is stale', { reason: 'unknown-endpoint' })
+    )
+
+    expect(publishedEvents()).toEqual([
+      expect.objectContaining({
+        event: 'document.failed',
+        documentId: 'doc-7',
+        reason: 'unknown-endpoint',
+      }),
+    ])
   })
 
   it('says nothing about a document when the payload names none', async () => {
@@ -326,7 +561,7 @@ describe('a terminal failure is unrecoverable, not retried', () => {
    */
   const ingestJob = () =>
     job('kb.ingest.document', {
-      knowledgeBaseId: 'kb-1',
+      kbId: 'kb-1',
       filename: 'handbook.md',
       text: '# Handbook',
       documentId: 'doc-7',
@@ -393,7 +628,7 @@ describe('a terminal failure is unrecoverable, not retried', () => {
       .then(() => null)
       .catch((e: unknown) => e)) as Error
     expect(err).toBeInstanceOf(UnrecoverableError)
-    expect(err.message).toMatch(/knowledgeBaseId and filename are required/)
+    expect(err.message).toMatch(/kbId and filename are required/)
   })
 
   it('classifies through the wrapper as well as the raw error', () => {
@@ -417,8 +652,6 @@ describe('a terminal failure is unrecoverable, not retried', () => {
     })
     const wrapped = new UnrecoverableError(terminal.message)
     wrapped.cause = terminal
-    const seen: SearchEvent[] = []
-    onSearchEvent((e) => seen.push(e))
     queueUpdate([{ id: 'doc-7' }])
     queueSelect([{ pairedClientId: 'pc-1' }])
 
@@ -430,9 +663,9 @@ describe('a terminal failure is unrecoverable, not retried', () => {
     )
 
     expect(handlers.update).toHaveBeenCalledOnce()
-    expect(seen).toEqual([
+    expect(publishedEvents()).toEqual([
       expect.objectContaining({
-        type: 'document.failed',
+        event: 'document.failed',
         documentId: 'doc-7',
         reason: 'unknown-endpoint',
       }),
