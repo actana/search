@@ -23,13 +23,14 @@ export const EXIT_FAILURE = 1;
 export const EXIT_USAGE = 2;
 
 /**
- * The verb exists and this build cannot do it yet.
+ * The verb exists and the **instance** cannot do it.
  *
- * Distinct from {@link EXIT_USAGE} on purpose, and in this build it is reachable:
- * `kb`, `ingest` and `query` go through the SDK's typed namespaces, which throw
- * `not-implemented` until TASK-004's REST surface lands. A script that reaches
- * for one of them should be able to tell "this instance is too old / this build
- * is too early" from "you typed it wrong" without reading a sentence.
+ * Distinct from {@link EXIT_USAGE} on purpose. Every verb here works against
+ * the current contract now that TASK-004's REST surface has landed, so what
+ * reaches this code is an instance that does not serve a route one of them
+ * calls — an older deployment, answering `not-implemented`. A script should be
+ * able to tell "that instance is too old" from "you typed it wrong" without
+ * reading a sentence.
  */
 export const EXIT_UNIMPLEMENTED = 3;
 

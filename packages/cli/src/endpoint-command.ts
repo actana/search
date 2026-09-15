@@ -111,23 +111,51 @@ export async function runEndpointCommand(
 }
 
 /**
- * An endpoint this client already has, as a declaration to push back.
+ * An endpoint this client already has, as a declaration to push back — or the
+ * reason it cannot be re-declared faithfully.
  *
  * **No `apiKey`.** A sealed key stays sealed precisely because this says
  * nothing about it (`models/endpoint-registry.ts`), and a row the instance
  * resolves through a mirror has no key here to say anything about.
+ *
+ * **And nothing is invented.** `model` and `label` used to fall back to
+ * `provider` when the row had neither — which is not a re-declaration, it is an
+ * edit: every `endpoint add` silently rewrote the `model` of every *other*
+ * endpoint on the instance that had none, to the string `openai`. A model is
+ * the one field on an embedding endpoint that decides what a stored vector
+ * means, so a push that changes it is a push that changes what a corpus is. The
+ * contract requires both fields, so a row that has neither cannot be sent at
+ * all: `add` refuses with the ids rather than guessing, and the operator
+ * declares that row properly (or deletes it) first.
  */
-function redeclare(endpoint: GetEndpointsResponse["endpoints"][number]): EndpointDeclaration {
+type Redeclared =
+  | { ok: true; declaration: EndpointDeclaration }
+  | { ok: false; reason: string };
+
+function redeclare(endpoint: GetEndpointsResponse["endpoints"][number]): Redeclared {
+  const missing = [
+    endpoint.model === null ? "--model" : null,
+    endpoint.label === null ? "--label" : null,
+  ].filter((f): f is string => f !== null);
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      reason: `${endpoint.id} (${endpoint.externalId ?? "no external id"}) has no ${missing.join(" and no ")}`,
+    };
+  }
   return {
-    externalId: endpoint.externalId!,
-    kind: endpoint.kind,
-    provider: endpoint.provider,
-    template: endpoint.template,
-    model: endpoint.model ?? endpoint.provider,
-    ...(endpoint.dimensions === null ? {} : { dimensions: endpoint.dimensions }),
-    ...(endpoint.baseUrl === null ? {} : { baseUrl: endpoint.baseUrl }),
-    label: endpoint.label ?? endpoint.provider,
-    config: endpoint.config,
+    ok: true,
+    declaration: {
+      externalId: endpoint.externalId!,
+      kind: endpoint.kind,
+      provider: endpoint.provider,
+      template: endpoint.template,
+      model: endpoint.model!,
+      ...(endpoint.dimensions === null ? {} : { dimensions: endpoint.dimensions }),
+      ...(endpoint.baseUrl === null ? {} : { baseUrl: endpoint.baseUrl }),
+      label: endpoint.label!,
+      config: endpoint.config,
+    },
   };
 }
 
@@ -224,9 +252,27 @@ async function endpointAdd(deps: SearchCliDeps, flags: ParsedArgs): Promise<numb
     // The set as it is, minus the one being declared, plus it. A row with no
     // `externalId` cannot be re-declared and is left alone by the route's
     // reconciliation for the same reason.
-    const kept = current.endpoints
-      .filter((e) => e.externalId !== null && e.externalId !== externalId)
-      .map(redeclare);
+    const kept: EndpointDeclaration[] = [];
+    const unredeclarable: string[] = [];
+    for (const existing of current.endpoints) {
+      if (existing.externalId === null || existing.externalId === externalId) continue;
+      const result = redeclare(existing);
+      if (result.ok) kept.push(result.declaration);
+      else unredeclarable.push(result.reason);
+    }
+    if (unredeclarable.length > 0) {
+      /**
+       * `PUT /v1/endpoints` is declarative, so `add` has to send the whole set
+       * — and a set it cannot describe faithfully is a set it must not send.
+       * Refusing is the honest answer: the alternative is what this used to do,
+       * which is to invent a `model` for somebody else's endpoint.
+       */
+      deps.err("actana-search endpoint add: another endpoint cannot be re-declared as it is.");
+      for (const reason of unredeclarable) deps.err(`  ${reason}`);
+      deps.err("`endpoint add` re-sends the whole set, and it will not invent a value for one.");
+      deps.err("Declare that endpoint with a model and a label (or remove it), then try again.");
+      return EXIT_FAILURE;
+    }
 
     const { endpoints } = await client.endpoints.put({
       source: { kind: "local" },

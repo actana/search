@@ -10,19 +10,20 @@
 // SDK. CONTEXT rule 4 — "the SDK is the only way in" — is why there is no
 // second HTTP client in this package, and why nothing here knows a route.
 //
-// **`kb`, `ingest` and `query` do not work yet, on purpose.** They call the
-// SDK's typed namespaces (`client.kbs`, `client.kbs.ingest`, `client.kbs.query`),
-// which throw `SearchApiError` with code `not-implemented` until TASK-004's REST
-// surface exists. They are written now rather than stubbed out because the
-// wiring — profile, client, argument shapes, output, exit codes — is the part
-// this task owns, and when the branches merge these verbs start working without
-// being touched. Until then {@link reportApi} turns that one code into a
-// sentence that says which build is missing what, and {@link EXIT_UNIMPLEMENTED}
-// so a script can tell it from a typo.
+// **These verbs work.** They call the SDK's typed namespaces (`client.kbs`,
+// `client.kbs.ingest`, `client.kbs.query`) against the REST surface TASK-004
+// landed. They were written before it existed — the wiring is what TASK-005
+// owned — and started working on the merge without being touched, which is what
+// writing them against the contract rather than against a route bought.
 //
-// `status` is the exception and works today: `health` and `pairStatus` are on
-// the client already, which makes it the verb that answers "is this credential
-// good?" — the first thing anybody asks after pairing.
+// {@link reportApi} still answers for `not-implemented`, and it is now a
+// statement about the *instance* rather than about this build: an older one that
+// does not serve a route these verbs call answers with that code, and
+// {@link EXIT_UNIMPLEMENTED} is how a script tells "that instance is too old"
+// from "you typed it wrong".
+//
+// `status` is the one that answers "is this credential good?" — `health` and
+// `pairStatus`, the first thing anybody asks after pairing.
 
 import { SearchApiError } from "@actana/search/errors";
 import type { SearchClient } from "@actana/search/client";
@@ -119,17 +120,17 @@ export async function withClient(
  * Report an SDK failure and pick an exit code.
  *
  * `not-implemented` is the one that gets a paragraph: it is not the operator's
- * mistake, it is this build being early, and the sentence has to say so without
- * making it sound like the instance is broken.
+ * mistake and it is not this command being broken, it is the instance not
+ * serving that route — so the sentence has to name the instance and say what to
+ * do about it.
  */
 export function reportApi(deps: SearchCliDeps, verb: string, err: unknown): number {
   if (err instanceof SearchApiError && err.code === "not-implemented") {
-    deps.err(`actana-search ${verb}: this build cannot do that yet.`);
+    deps.err(`actana-search ${verb}: that instance does not serve this route.`);
     deps.err(
-      "The REST surface these verbs call lands with TASK-004; the CLI is wired to it already " +
-        "and starts working the moment the instance and the SDK have it.",
+      "This command is wired to the current contract, so the instance is the older half — " +
+        "`actana-search status` prints its schema version.",
     );
-    deps.err("`actana-search pair` and `actana-search endpoint` work now.");
     return EXIT_UNIMPLEMENTED;
   }
   if (err instanceof SearchApiError) {
@@ -288,10 +289,11 @@ export async function runIngestCommand(
   return withClient(deps, flags, "ingest", async (client) => {
     const result = (await client.kbs.ingest(kbId, {
       filename,
-      // The bytes as text. A binary document goes through the REST route's
-      // multipart form, which the SDK grows with TASK-004 — until then this is
-      // the shape the route takes for text, and the verb says so if it is asked
-      // for something else.
+      // The bytes as text, which is what this verb does: the SDK's multipart
+      // branch (`{ file }`) and the route behind it both exist, and reaching
+      // for them from here is a change to what `ingest` *is* rather than a
+      // doc fix — a PDF read as UTF-8 is a document nobody wants ingested, so
+      // it wants the refusal that goes with it.
       text: bytes.toString("utf8"),
     })) as unknown as Record<string, unknown>;
     deps.out(

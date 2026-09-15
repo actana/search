@@ -3,7 +3,7 @@
  * keys sealed under `SEARCH_ENCRYPTION_KEY` (ADR 0004).
  *
  * This is how a standalone Search runs, and how the CLI's
- * `actana-search endpoints add` stores a key it was handed literally. The
+ * `actana-search endpoint add` stores a key it was handed literally. The
  * bodies are Studio's `lib/kb/provider-context.ts`, against Search's table:
  * `workspace_model_endpoints` becomes `model_endpoint`, and the workspace
  * scoping is gone because the paired client's scope is checked in the API layer

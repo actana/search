@@ -149,13 +149,16 @@ than writing a row the next push would replace.
 for that address that is not the instance you were told about, or the instance
 has been re-issued and your fingerprint is stale.
 
-## What this build cannot do yet
+## `3` and when it is reachable
 
-`kb`, `ingest` and `query` call the SDK's typed namespaces, which throw
-`not-implemented` until the REST surface lands (TASK-004). The wiring is here
-already — profile, client, arguments, output, exit codes — so they start working
-when the branches merge, without being touched. Until then they exit `3` with a
-sentence saying so. `pair`, `endpoint` and `status` work now.
+Every verb works: `kb`, `ingest` and `query` call the SDK's typed namespaces
+against the REST surface TASK-004 landed, and `pair`, `endpoint` and `status`
+reach their own halves of the instance.
+
+`3` is therefore about the *instance*, not about this build. An older instance
+that does not serve a route these verbs call answers `not-implemented`, and this
+command turns that one code into exit `3` so a script can tell "that instance is
+too old" from "you typed it wrong" (`2`) and from "it refused" (`1`).
 
 ## Notes
 
