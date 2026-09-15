@@ -112,7 +112,7 @@ Three changes, and the third is the one that makes the failure legible:
 3. **`SEARCH_STATE_DIR` is measured at configuration time.**
    `api/admin-socket.ts`
    is a new leaf module holding `ADMIN_SOCKET_FILENAME`, `adminSocketPath`,
-   `SUN_PATH_MAX_BYTES` (104 on macOS, 107 on Linux) and `socketPathProblem`;
+   `SUN_PATH_MAX_BYTES` (104 on macOS, 108 on Linux — corrected from 107 in the train review fix round) and `socketPathProblem`;
    `config()` refuses a state directory whose `admin.sock` would be too long,
    with the length, the limit, the path and both ways out. `startAdminServer`
    asks the same question about a `socketPath` handed straight to it, and now
