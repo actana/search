@@ -63,7 +63,7 @@ export async function withParseTimeout<T>(
  *
  * lifted: Studio built this lazily, inside a `getParserInstances()` that
  * `require()`d each parser in its own `try`/`catch` — a Next.js bundling
- * concern, keeping `xlsx`, `mammoth`, `cheerio` and the PDF stack out of a
+ * concern, keeping SheetJS, `mammoth`, `cheerio` and the PDF stack out of a
  * route's graph until something asked for them. Here it is a plain ESM object
  * built from static imports.
  *
@@ -79,6 +79,9 @@ export async function withParseTimeout<T>(
  * a hard failure at startup instead. For a service whose entire job is reading
  * documents, a parser that cannot load is a deployment fault worth stopping
  * for, not one worth discovering on a user's upload.
+ *
+ * `xls` is not registered: SheetJS was the only parser for legacy binary Excel
+ * and it is gone (ADR 0012). `.xlsx` has its own dependency-free parser.
  */
 const parserInstances: Record<string, FileParser> = {
   pdf: new PdfParser(),
@@ -88,7 +91,6 @@ const parserInstances: Record<string, FileParser> = {
   txt: new TxtParser(),
   md: new MdParser(),
   xlsx: new XlsxParser(),
-  xls: new XlsxParser(),
   pptx: new PptxParser(),
   ppt: new PptxParser(),
   html: new HtmlParser(),

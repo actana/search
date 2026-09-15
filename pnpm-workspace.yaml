@@ -23,24 +23,6 @@ overrides:
   # gamble with a security fix's name on it.
   "pdfjs-dist": "5.5.207"
 
-# Two advisories are acknowledged rather than fixed, because there is nothing on
-# npm to move to. Both are against SheetJS (`xlsx`), which stopped publishing to
-# npm at 0.18.5 — the fixed 0.19.3 and 0.20.2 exist only on the vendor's own
-# CDN, and a tarball URL is a dependency form SECURITY.md forbids. The
-# alternative, dropping SheetJS, changes what a spreadsheet parses into and so
-# what it chunks into, which is the behaviour ADR 0005 exists to hold still.
-#
-# The reasoning, the exposure and what would end the exception are in
-# docs/adr/0007-the-sheetjs-exception.md. Read it before adding a third entry
-# here: this list is a place decisions go to be forgotten, and two is already
-# two more than it should have.
-auditConfig:
-  ignoreGhsas:
-    # Prototype pollution in SheetJS — fixed in 0.19.3, not on npm.
-    - GHSA-4r6h-8v6p-xvw6
-    # ReDoS in SheetJS — fixed in 0.20.2, not on npm.
-    - GHSA-5pgg-2g8v-p4x9
-
 # Allow-list, not a switch. Every package that is allowed to run an install
 # script is named here; everything else installs with its scripts disabled.
 allowBuilds:

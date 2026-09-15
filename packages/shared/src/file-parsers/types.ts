@@ -32,7 +32,6 @@ export type SupportedFileType =
   | 'txt'
   | 'md'
   | 'xlsx'
-  | 'xls'
   | 'html'
   | 'htm'
   | 'pptx'

@@ -1,5 +1,9 @@
 # The SheetJS exception
 
+> **Superseded by [ADR 0012](0012-spreadsheets-parse-without-sheetjs.md).** SheetJS
+> is removed, both advisories are no longer ignored, and `.xls` is no longer
+> supported. The text below is the original record, kept unchanged.
+
 `pnpm audit --prod --audit-level high` is a required CI job, and two advisories
 against SheetJS (`xlsx@0.18.5`) are **acknowledged in `pnpm-workspace.yaml`
 rather than fixed**: prototype pollution (GHSA-4r6h-8v6p-xvw6, fixed in 0.19.3)

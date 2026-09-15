@@ -46,7 +46,6 @@ export const SUPPORTED_DOCUMENT_EXTENSIONS = [
   'txt',
   'md',
   'xlsx',
-  'xls',
   'ppt',
   'pptx',
   'html',
@@ -56,6 +55,23 @@ export const SUPPORTED_DOCUMENT_EXTENSIONS = [
   'yaml',
   'yml',
 ] as const
+
+/**
+ * Extensions the engine once parsed and deliberately no longer does, with the
+ * reason a caller is told. Checked before any fallback, so a retired binary
+ * format is refused by name instead of being read as plain text.
+ */
+export const RETIRED_DOCUMENT_EXTENSIONS: Readonly<Record<string, string>> = {
+  // ADR 0012: SheetJS was the only `.xls` reader and it was removed.
+  xls: 'legacy binary Excel (.xls) is not supported; save the workbook as .xlsx',
+}
+
+/** The refusal reason for a retired extension, or `undefined` when it is not retired. */
+export function retiredExtensionReason(extension: string): string | undefined {
+  return Object.hasOwn(RETIRED_DOCUMENT_EXTENSIONS, extension.toLowerCase())
+    ? RETIRED_DOCUMENT_EXTENSIONS[extension.toLowerCase()]
+    : undefined
+}
 
 export type SupportedDocumentExtension = (typeof SUPPORTED_DOCUMENT_EXTENSIONS)[number]
 

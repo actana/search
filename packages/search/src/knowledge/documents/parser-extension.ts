@@ -2,6 +2,7 @@ import { getExtensionFromMimeType } from '../../blob/index.ts'
 import {
   isAlphanumericExtension,
   isSupportedExtension,
+  retiredExtensionReason,
   SUPPORTED_DOCUMENT_EXTENSIONS,
 } from '../../blob/index.ts'
 
@@ -20,6 +21,15 @@ export function resolveParserExtension(
   }
 
   const mimeExtension = mimeType ? getExtensionFromMimeType(mimeType) : undefined
+
+  // A retired format is refused by name, before the mime and plain-text
+  // fallbacks could hand its bytes to a parser that would read them as text.
+  for (const candidate of [filenameExtension, mimeExtension]) {
+    const reason = candidate ? retiredExtensionReason(candidate) : undefined
+    if (candidate && reason) {
+      throw new Error(`Unsupported file type: ${candidate} (${reason})`)
+    }
+  }
   if (mimeExtension && isSupportedExtension(mimeExtension)) {
     return mimeExtension
   }

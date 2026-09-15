@@ -245,11 +245,12 @@ knowing before reading it:
 | [0004](docs/adr/0004-model-endpoints-flow-both-ways.md) | Model endpoints flow both ways |
 | [0005](docs/adr/0005-behaviour-is-identical-nothing-is-retired.md) | Behaviour is identical; nothing is retired |
 | [0006](docs/adr/0006-blob-storage-and-queue-are-searchs-own.md) | Blob storage and the queue are Search's own |
-| [0007](docs/adr/0007-the-sheetjs-exception.md) | The SheetJS exception — two advisories acknowledged, not fixed |
+| [0007](docs/adr/0007-the-sheetjs-exception.md) | The SheetJS exception — two advisories acknowledged, not fixed (superseded by 0012) |
 | [0008](docs/adr/0008-the-pairing-code-is-copied-from-control.md) | The pairing code is copied from Control, and will be lifted into a package |
 | [0009](docs/adr/0009-one-contract-defined-once-in-zod.md) | One contract, defined once in zod, served and consumed |
 | [0010](docs/adr/0010-the-worker-is-searchs-own-and-a-missing-key-fails-a-job-cleanly.md) | The worker is Search's own, and a missing key fails a job cleanly |
 | [0011](docs/adr/0011-the-one-engine-edit-replacing-a-documents-chunks-under-a-lock.md) | The one engine edit: replacing a document's chunks under a lock |
+| [0012](docs/adr/0012-spreadsheets-parse-without-sheetjs.md) | Spreadsheets parse without SheetJS; `.xls` is no longer supported |
 
 ## Moving data out of Studio
 

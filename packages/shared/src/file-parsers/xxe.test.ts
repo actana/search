@@ -3,7 +3,7 @@
  *
  * Feeds malicious OOXML documents — external network and local-file entity
  * declarations plus references in text content — through the real parsers
- * (mammoth, officeparser, xlsx; no parser mocks) and asserts that no
+ * (mammoth, officeparser, the in-repo xlsx parser; no parser mocks) and asserts that no
  * outbound entity fetch is attempted at the TCP layer and that no
  * local-file entity content leaks into the parsed output. A parse is
  * allowed to succeed with the entities unresolved or to fail outright;

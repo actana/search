@@ -35,6 +35,8 @@ export {
   isSupportedExtension,
   MAX_UPLOAD_SIZE_BYTES,
   requestBodyExceedsUploadCap,
+  RETIRED_DOCUMENT_EXTENSIONS,
+  retiredExtensionReason,
   SUPPORTED_DOCUMENT_EXTENSIONS,
   type SupportedDocumentExtension,
 } from './validation.ts'
