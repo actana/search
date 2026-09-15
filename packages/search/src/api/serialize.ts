@@ -108,28 +108,43 @@ export function documentToWire(row: DocumentRow): SearchDocument {
   };
 }
 
-/** The shape the chunk service hands back, with its two timestamps converted. */
-export function chunkToWire(row: {
-  id: string;
-  chunkIndex: number;
-  content: string;
-  contentLength: number;
-  tokenCount: number;
-  enabled: boolean;
-  startOffset: number;
-  endOffset: number;
-  tag1?: string | null;
-  tag2?: string | null;
-  tag3?: string | null;
-  tag4?: string | null;
-  tag5?: string | null;
-  tag6?: string | null;
-  tag7?: string | null;
-  createdAt: Date | string;
-  updatedAt: Date | string;
-}): Chunk {
+/**
+ * The shape the chunk service hands back, with its two timestamps converted.
+ *
+ * **`documentId` is a separate argument** because the lifted `ChunkData` does
+ * not carry one: `queryChunks`, `createChunk` and `updateChunk` all answer
+ * about chunks of a document the *caller* named, so the id never had to be in
+ * their return shape. `ChunkSchema.documentId` is required all the same — every
+ * caller of this function holds the document id already, either from the path
+ * it was addressed at or from the `embedding` row it just read — and making the
+ * field an argument rather than an optional key is what makes that checked at
+ * compile time instead of hoped for.
+ */
+export function chunkToWire(
+  row: {
+    id: string;
+    chunkIndex: number;
+    content: string;
+    contentLength: number;
+    tokenCount: number;
+    enabled: boolean;
+    startOffset: number;
+    endOffset: number;
+    tag1?: string | null;
+    tag2?: string | null;
+    tag3?: string | null;
+    tag4?: string | null;
+    tag5?: string | null;
+    tag6?: string | null;
+    tag7?: string | null;
+    createdAt: Date | string;
+    updatedAt: Date | string;
+  },
+  documentId: string,
+): Chunk {
   return {
     id: row.id,
+    documentId,
     chunkIndex: row.chunkIndex,
     content: row.content,
     contentLength: row.contentLength,

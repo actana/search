@@ -15,10 +15,11 @@ import {
   ListChunksQuerySchema,
   UpdateChunkRequestSchema,
 } from "@actana/search/contracts";
+import type { ChunkKeywordLink } from "@actana/search/contracts";
 import { generateShortId } from "@actana/search-shared/short-id";
-import { and, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import { db } from "../../db/client.ts";
-import { kbKeyword } from "../../db/schema.ts";
+import { embeddingKeyword, kbKeyword } from "../../db/schema.ts";
 import {
   attachKeywordToChunk,
   detachKeywordFromChunk,
@@ -58,7 +59,7 @@ export function registerChunkRoutes(router: SearchRouter): void {
       const query = parseWith(ListChunksQuerySchema, queryOf(url));
       const result = await queryChunks(docId!, query, requestId());
       sendJson(res, 200, {
-        chunks: result.chunks.map(chunkToWire),
+        chunks: result.chunks.map((chunk) => chunkToWire(chunk, docId!)),
         pagination: result.pagination,
       });
     }),
@@ -101,7 +102,7 @@ export function registerChunkRoutes(router: SearchRouter): void {
         }
         throw err;
       }
-      sendJson(res, 201, chunkToWire(created));
+      sendJson(res, 201, chunkToWire(created, docId!));
     }),
   );
 
@@ -118,7 +119,8 @@ export function registerChunkRoutes(router: SearchRouter): void {
      */
     route("GET", BY_ID, "read", async ({ res, client }, { kbId, chunkId }) => {
       await requireKb(client, kbId!);
-      sendJson(res, 200, chunkToWire(chunkRowToData(await requireChunkInKb(kbId!, chunkId!))));
+      const row = await requireChunkInKb(kbId!, chunkId!);
+      sendJson(res, 200, chunkToWire(chunkRowToData(row), row.documentId));
     }),
   );
 
@@ -147,7 +149,7 @@ export function registerChunkRoutes(router: SearchRouter): void {
           refuseIfNoEmbeddingEndpoint(err, kbId!);
           throw err;
         }
-        sendJson(res, 200, chunkToWire(updated));
+        sendJson(res, 200, chunkToWire(updated, docId!));
       },
     ),
   );
@@ -236,6 +238,92 @@ export function registerChunkRoutes(router: SearchRouter): void {
       },
     ),
   );
+
+  router.add(
+    /**
+     * `GET …/chunks/:chunkId/keywords` — the read half of the two writes above.
+     *
+     * **The links, not the vocabulary.** `GET /v1/kbs/:kbId/keywords` answers
+     * which keywords a knowledge base has and how many chunks carry each one;
+     * this answers which of them carry *this* chunk, and with each one the
+     * `source` — `llm` for a link the extractor made, `manual` for one a person
+     * made — and the `attachedAt` off the link row. Neither is derivable from
+     * the vocabulary listing, and a caller wanting one chunk's overlay had
+     * nowhere else to ask: the attach and the detach were chunk-addressed in
+     * the first round of these additions and the read was not, so Studio's own
+     * overlay route was the last surface still refusing on a wired knowledge
+     * base (TASK-009c, contract request 10's read half).
+     *
+     * Scoped exactly as its two writes are — `requireKb` then
+     * `requireChunkInKb` — so a chunk in another of this client's KBs and a
+     * chunk of somebody else's are both `404`, and neither answer says which
+     * (ADR 0009 D5).
+     */
+    route("GET", `${BY_ID}/keywords`, "read", async ({ res, client }, { kbId, chunkId }) => {
+      await requireKb(client, kbId!);
+      await requireChunkInKb(kbId!, chunkId!);
+      sendJson(res, 200, { keywords: await chunkKeywordLinks(kbId!, chunkId!) });
+    }),
+  );
+}
+
+/**
+ * One chunk's keyword links, ordered by the canonical form.
+ *
+ * **The route's query, because the engine has none.** The lifted keyword
+ * service attaches, detaches and re-aggregates; it has no per-chunk read to
+ * call, and growing one would be editing a frozen module (ADR 0005). So this is
+ * a read of the two tables it already owns with the KB pinned — the same shape,
+ * and for the same reason, as `keywordById` below.
+ *
+ * `kb_keyword.knowledge_base_id` is in the predicate even though the chunk has
+ * already been proved to be in this KB: the join row names a keyword by id and
+ * nothing in the table constrains the two to the same knowledge base, so
+ * pinning it is what stops one KB's link from putting another KB's vocabulary
+ * row on the wire.
+ *
+ * `usageCount` is the vocabulary's count across the whole KB, carried because
+ * it is on the row this join already reads and Studio's own answer has it —
+ * not a count of anything about this chunk.
+ */
+async function chunkKeywordLinks(kbId: string, chunkId: string): Promise<ChunkKeywordLink[]> {
+  const rows = await db
+    .select({
+      id: kbKeyword.id,
+      knowledgeBaseId: kbKeyword.knowledgeBaseId,
+      keyword: kbKeyword.keyword,
+      displayLabel: kbKeyword.displayLabel,
+      usageCount: kbKeyword.usageCount,
+      createdAt: kbKeyword.createdAt,
+      updatedAt: kbKeyword.updatedAt,
+      createdByUserId: kbKeyword.createdByUserId,
+      source: embeddingKeyword.source,
+      attachedAt: embeddingKeyword.createdAt,
+    })
+    .from(embeddingKeyword)
+    .innerJoin(kbKeyword, eq(kbKeyword.id, embeddingKeyword.kbKeywordId))
+    .where(
+      and(eq(embeddingKeyword.embeddingId, chunkId), eq(kbKeyword.knowledgeBaseId, kbId)),
+    )
+    .orderBy(asc(kbKeyword.keyword));
+
+  return rows.map((row) => ({
+    id: row.id,
+    knowledgeBaseId: row.knowledgeBaseId,
+    keyword: row.keyword,
+    displayLabel: row.displayLabel,
+    usageCount: row.usageCount,
+    createdAt: isoRequired(row.createdAt),
+    updatedAt: isoRequired(row.updatedAt),
+    createdByUserId: row.createdByUserId,
+    /**
+     * The column is plain `text` in the schema rather than an enum, so it is
+     * narrowed here to the two values the engine writes — `attachKeywordToChunk`
+     * takes an `EmbeddingKeywordSource` and the extractor passes `'llm'`.
+     */
+    source: row.source === "manual" ? "manual" : "llm",
+    attachedAt: isoRequired(row.attachedAt),
+  }));
 }
 
 /**

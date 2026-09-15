@@ -251,6 +251,7 @@ unchanged.
 | `GET /v1/kbs/:kbId/chunks/:chunkId` | read | — | `ChunkSchema` |
 | `PUT\|POST /v1/kbs/:kbId/chunks/:chunkId/keywords` | write | `AttachChunkKeywordRequestSchema` | `ChunkKeywordResponseSchema` |
 | `DELETE /v1/kbs/:kbId/chunks/:chunkId/keywords/:keywordId` | write | — | `{ id, deleted: true }` |
+| `GET /v1/kbs/:kbId/chunks/:chunkId/keywords` | read | — | `ListChunkKeywordsResponseSchema` |
 
 Editing a chunk's `content` re-embeds it through the KB's embedding endpoint.
 That is not optional: a chunk whose text and vector disagree ranks for the wrong
@@ -262,7 +263,7 @@ content is embedded before it is stored, the chunk lands at the next
 `chunkCount`, `tokenCount` and `characterCount` go up by what it added.
 
 **A chunk is addressable twice: through its document, and by its own id**
-(ADR 0009 D10). The last three rows are the second: a chunk id is unique across
+(ADR 0009 D10). The last four rows are the second: a chunk id is unique across
 the instance, the `:kbId` is the ownership anchor, and a caller that holds only
 a chunk id — Studio's chunk editor, its `kb_admin` tool — can say what it means
 without a document id it does not have. One handler each, so the two addressings
@@ -270,6 +271,22 @@ cannot come to mean different things; the document-addressed form additionally
 asserts the chunk is in *that* document. The attach takes `PUT` **and** `POST`
 because it is idempotent (create-or-return on the pair) and both verbs are
 unambiguous.
+
+`GET …/chunks/:chunkId/keywords` is the **read** of that overlay, and it answers
+the links rather than the vocabulary: each row is the `KeywordSchema` fields plus
+the join's own two — `source` (`llm` for a link the extractor made, `manual` for
+one a person made) and `attachedAt` — ordered by the canonical form. Those two
+differ between two chunks carrying the same keyword, which is why
+`GET /v1/kbs/:kbId/keywords` cannot answer this: its `usageCount` is a count
+across the whole KB, and it is carried here for the same reason (it is on the row
+the join already reads), not as a count of anything about this chunk. A chunk
+outside this KB is a `404`, exactly as it is on `GET /v1/kbs/:kbId/chunks/:chunkId`.
+
+Every chunk response carries **`documentId`**, required: the column is `NOT NULL`
+and each of the four routes that answer with a chunk already knows the document
+without a second query — three of them are addressed through it, and the
+chunk-by-id read gets the whole `embedding` row. A caller that addressed a chunk
+by id alone can therefore check which document it landed in rather than assume.
 
 `POST …/documents/:docId/chunks`, the chunk reads and the keyword attach all work
 over the **shared `embedding` table** — v1 code, frozen (ADR 0005) — which the

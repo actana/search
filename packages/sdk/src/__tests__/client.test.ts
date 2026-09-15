@@ -27,6 +27,7 @@ import {
   HybridQueryResponseSchema,
   IngestResponseSchema,
   KnowledgeBaseSchema,
+  ListChunkKeywordsResponseSchema,
   ListKbsResponseSchema,
   SEARCH_FEATURES,
 } from "../contracts.ts";
@@ -217,6 +218,11 @@ describe("the namespaces", () => {
       "DELETE",
       "/v1/kbs/kb_1/chunks/c_1/keywords/k_1",
     );
+    await check(
+      () => client.chunks.keywords("kb_1", "c_1"),
+      "GET",
+      "/v1/kbs/kb_1/chunks/c_1/keywords",
+    );
     await check(() => client.keywords.list("kb_1"), "GET", "/v1/kbs/kb_1/keywords");
     await check(
       () => client.keywords.put("kb_1", { displayLabel: "Leave" }),
@@ -278,6 +284,24 @@ describe("the namespaces", () => {
   it("unwraps the collection envelopes the routes answer with", async () => {
     canned = { status: 200, json: ListKbsResponseSchema.parse({ knowledgeBases: [KB] }) };
     await expect(client.kbs.list()).resolves.toEqual([KnowledgeBaseSchema.parse(KB)]);
+
+    // `chunks.keywords` is unwrapped the same way `keywords.list` is, and what
+    // it hands back is the *link*: `source` and `attachedAt` come off the join
+    // row, so they are not in the KB's vocabulary listing at all.
+    const link = {
+      id: "k_1",
+      knowledgeBaseId: "kb_1",
+      keyword: "parental-leave",
+      displayLabel: "Parental Leave",
+      usageCount: 4,
+      createdAt: "2026-09-15T00:00:00.000Z",
+      updatedAt: "2026-09-15T00:00:00.000Z",
+      createdByUserId: null,
+      source: "manual" as const,
+      attachedAt: "2026-09-15T01:00:00.000Z",
+    };
+    canned = { status: 200, json: ListChunkKeywordsResponseSchema.parse({ keywords: [link] }) };
+    await expect(client.chunks.keywords("kb_1", "c_1")).resolves.toEqual([link]);
   });
 
   it("answers `kbs.restore` with the knowledge base, renamed or not", async () => {

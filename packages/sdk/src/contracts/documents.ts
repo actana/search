@@ -443,9 +443,29 @@ export type BulkDocumentsResponse = z.infer<typeof BulkDocumentsResponseSchema>;
 
 // ─── Chunks ──────────────────────────────────────────────────────────────────
 
-/** A chunk as the chunk routes return it. The shared `embedding` table's row. */
+/**
+ * A chunk as the chunk routes return it. The shared `embedding` table's row.
+ *
+ * **`documentId` is required, on every route that answers with a chunk.** The
+ * column is `NOT NULL` — a chunk with no document is not a row this table holds
+ * — and each of the four producers already knows which document it is answering
+ * about without a second query: the listing, the create and the `PATCH` are
+ * addressed *through* a document, and the chunk-by-id read is handed the whole
+ * `embedding` row by `requireChunkInKb`. So none of them had to make it
+ * optional.
+ *
+ * It is here because the chunk-by-id read could not say it. Studio's unwired
+ * chunk lookup filters `embedding.document_id = :documentId`, asserting the
+ * chunk is in *this* document rather than a sibling in the same KB, and
+ * `chunks.get` takes no document — so the wrapper stamped the caller's own
+ * `documentId` back onto the answer rather than reading one (TASK-009c,
+ * contract request 12). Now the row says which document it is in, and a caller
+ * comparing the two is making the assertion itself.
+ */
 export const ChunkSchema = z.object({
   id: z.string(),
+  /** The document this chunk belongs to. Off the row, never inferred. */
+  documentId: z.string(),
   chunkIndex: z.number().int(),
   content: z.string(),
   contentLength: z.number().int(),
