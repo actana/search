@@ -29,13 +29,18 @@
 
 import { and, eq, inArray } from "drizzle-orm";
 import { PutEndpointsRequestSchema } from "@actana/search/contracts";
-import type { Endpoint, EndpointDeclaration } from "@actana/search/contracts";
-import { db } from "../../db/client.ts";
+import type {
+  Endpoint,
+  EndpointDeclaration,
+  PutEndpointsRequest,
+} from "@actana/search/contracts";
+import { db, type SearchExecutor } from "../../db/client.ts";
 import { knowledgeBase, modelEndpoint } from "../../db/schema.ts";
 import { validateExternalUrl } from "../../core/security/url-guard.ts";
 import {
   createLocalEndpoint,
   getEndpointSourceSummary,
+  invalidateEndpointKeyCache,
   listEndpoints,
   setEndpointSource,
   upsertMirroredEndpoints,
@@ -43,6 +48,7 @@ import {
   type LocalEndpointInput,
   type MirroredEndpointInput,
 } from "../../models/endpoint-registry.ts";
+import { readApiKeyEndpointId } from "../../models/endpoint-api-key.ts";
 import { badRequest, parseWith, readJsonBody, route, sendJson } from "../http.ts";
 import type { SearchRouter } from "../routes.ts";
 
@@ -86,40 +92,101 @@ export function registerEndpointRoutes(router: SearchRouter): void {
         }
       }
 
-      // The source first, so a bad resolver URL is refused before any endpoint
-      // row is written against it. The declaration is stored on the paired
-      // client, so nothing has to be threaded into the rows below.
-      await asBadRequest(() => setEndpointSource(client!.id, body.source));
-
-      const answered: Array<{ id: string; externalId: string }> = [];
-      const mirrored: MirroredEndpointInput[] = [];
-      for (const declared of body.endpoints) {
-        if (body.source.kind === "mirrored") {
-          if (declared.apiKey !== undefined) {
-            throw badRequest(
-              "a mirrored endpoint carries no key — Search resolves one per job and never " +
-                "stores it",
-            );
-          }
-          mirrored.push(mirroredInput(declared));
-          continue;
-        }
-        const row = await asBadRequest(() =>
-          createLocalEndpoint(client!.id, localInput(declared), declared.apiKey ?? null),
-        );
-        answered.push({ id: row.id, externalId: declared.externalId });
-      }
-      if (mirrored.length > 0) {
-        answered.push(...(await asBadRequest(() => upsertMirroredEndpoints(client!.id, mirrored))));
-      }
-
-      await removeUndeclared(
-        client!.id,
-        body.endpoints.map((e) => e.externalId),
-      );
-      sendJson(res, 200, { endpoints: answered });
+      sendJson(res, 200, { endpoints: await applyEndpointDeclaration(client!.id, body) });
     }),
   );
+}
+
+/**
+ * Apply one `PUT /v1/endpoints` body: the source, the endpoints, and the
+ * reconciliation of what is no longer declared — **all of it or none of it**.
+ *
+ * It used to be neither. `setEndpointSource` committed on its own, then each
+ * endpoint committed on its own, then the reconciliation ran; so a body whose
+ * fourth endpoint was refused (an embedding endpoint with no dimension, a
+ * provider the catalog does not know) left a client with a *new* source
+ * declaration, three of its endpoints written, the rest missing and the
+ * previous set still there — a half-applied declaration that no retry of the
+ * same body would have produced. One transaction: a refusal on row N leaves
+ * exactly what was there before.
+ *
+ * Exported because it is the unit worth testing against a real Postgres — the
+ * atomicity *is* the database — and a route handler needs a request to be
+ * called at all.
+ */
+export async function applyEndpointDeclaration(
+  clientId: string,
+  body: PutEndpointsRequest,
+): Promise<Array<{ id: string; externalId: string }>> {
+  const answered = await db.transaction(async (tx) => {
+    // The source first, so a bad resolver URL is refused before any endpoint
+    // row is written against it. The declaration is stored on the paired
+    // client, so nothing has to be threaded into the rows below.
+    await asBadRequest(() => setEndpointSource(clientId, body.source, tx));
+
+    /**
+     * The endpoint ids this client may link a key to: its own, plus the ones
+     * this request is creating.
+     *
+     * `config` is a `z.record(z.unknown())` on the wire and this route passes
+     * it through, so `config.apiKeyEndpointId` was a free choice of *any*
+     * endpoint id in the instance — and an id is a public value, answered by
+     * this very route. Client B could therefore declare an endpoint keyed on
+     * client A's, bind a KB to it and embed with A's sealed key.
+     * `resolveEndpointApiKey` refuses that at the moment of use; this refuses
+     * it at the moment it is declared, which is the message that reaches the
+     * client that made the mistake.
+     */
+    const linkable = new Set((await listEndpoints(clientId, tx)).map((e) => e.id));
+
+    const written: Array<{ id: string; externalId: string }> = [];
+    const mirrored: MirroredEndpointInput[] = [];
+    for (const declared of body.endpoints) {
+      const linkedId = readApiKeyEndpointId(declared.config);
+      if (linkedId !== null && !linkable.has(linkedId)) {
+        throw badRequest(
+          `config.apiKeyEndpointId "${linkedId}" is not one of your endpoints — a key can ` +
+            "only be shared with an endpoint this client owns",
+        );
+      }
+      if (body.source.kind === "mirrored") {
+        if (declared.apiKey !== undefined) {
+          throw badRequest(
+            "a mirrored endpoint carries no key — Search resolves one per job and never " +
+              "stores it",
+          );
+        }
+        mirrored.push(mirroredInput(declared));
+        continue;
+      }
+      const row = await asBadRequest(() =>
+        createLocalEndpoint(clientId, localInput(declared), declared.apiKey ?? null, tx),
+      );
+      linkable.add(row.id);
+      written.push({ id: row.id, externalId: declared.externalId });
+    }
+    if (mirrored.length > 0) {
+      written.push(...(await asBadRequest(() => upsertMirroredEndpoints(clientId, mirrored, tx))));
+    }
+
+    await removeUndeclared(
+      clientId,
+      body.endpoints.map((e) => e.externalId),
+      tx,
+    );
+    return written;
+  });
+
+  /**
+   * After the commit, not during it.
+   *
+   * The registry's writes defer the invalidation when they are handed a
+   * transaction: dropping this client's resolved keys before a commit that may
+   * still roll back would forget keys that are still current and re-read them
+   * under a declaration that is about to be undone.
+   */
+  invalidateEndpointKeyCache(clientId);
+  return answered;
 }
 
 /**
@@ -185,8 +252,12 @@ function localInput(declared: EndpointDeclaration): LocalEndpointInput {
  * of `PUT` being *declarative*: the registry's job is to write one endpoint, and
  * the request's is to say what the whole set is.
  */
-async function removeUndeclared(pairedClientId: string, declared: string[]): Promise<void> {
-  const bound = await db
+async function removeUndeclared(
+  pairedClientId: string,
+  declared: string[],
+  executor: SearchExecutor = db,
+): Promise<void> {
+  const bound = await executor
     .select({
       embeddingEndpointId: knowledgeBase.embeddingEndpointId,
       inferenceEndpointId: knowledgeBase.inferenceEndpointId,
@@ -202,7 +273,7 @@ async function removeUndeclared(pairedClientId: string, declared: string[]): Pro
   );
 
   const wanted = new Set(declared);
-  const removable = (await listEndpoints(pairedClientId))
+  const removable = (await listEndpoints(pairedClientId, executor))
     // A row with no `externalId` was not declared through this route at all —
     // the admin socket's path, and anything a migration left — so it is not
     // this route's to reap.
@@ -212,7 +283,7 @@ async function removeUndeclared(pairedClientId: string, declared: string[]): Pro
     )
     .map((row) => row.id);
   if (removable.length === 0) return;
-  await db
+  await executor
     .delete(modelEndpoint)
     .where(
       and(

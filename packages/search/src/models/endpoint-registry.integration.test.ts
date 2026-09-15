@@ -20,7 +20,7 @@
  * Gated on `SEARCH_TEST_DATABASE_URL`.
  */
 
-import { eq } from 'drizzle-orm'
+import { eq, inArray } from 'drizzle-orm'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { generateShortId } from '@actana/search-shared/short-id'
 import { resetConfig } from '../config.ts'
@@ -663,6 +663,240 @@ describeDb('the endpoint registry', () => {
       } finally {
         await db.delete(pairedClient).where(eq(pairedClient.id, OTHER)).catch(() => {})
       }
+    })
+  })
+  /**
+   * The blocker, at both layers. `config` is a `z.record(z.unknown())` on the
+   * wire and `PUT /v1/endpoints` passes it through, so
+   * `config.apiKeyEndpointId` was a free choice of any endpoint id in the
+   * instance — and an id is a public value, answered by that very route. Client
+   * B could declare an endpoint keyed on client A's, bind a KB to it, and embed
+   * a corpus with A's sealed key, with nothing in either client's view of the
+   * instance to show it.
+   */
+  describe('a key link may only name this client’s own endpoint', () => {
+    const LINKER = `${PREFIX}-linker`
+    const KEYHOLDER = `${PREFIX}-keyholder`
+    let foreignEndpointId: string
+
+    beforeAll(async () => {
+      await db.insert(pairedClient).values(
+        [LINKER, KEYHOLDER].map((id, i) => ({
+          id,
+          label: `${PREFIX} ${id}`,
+          certSerial: `${PREFIX}-serial-link-${i}`,
+          certFingerprint: `${PREFIX}-fingerprint-link-${i}`,
+          scope: 'admin' as const,
+          status: 'active' as const,
+          createdAt: new Date(),
+        })),
+      )
+      const held = await registry.createLocalEndpoint(
+        KEYHOLDER,
+        {
+          kind: 'embedding',
+          provider: 'openai',
+          template: 'openai',
+          model: 'text-embedding-3-small',
+          dimensions: 1536,
+          label: 'the key somebody else paid for',
+        },
+        'sk-the-other-clients-key-0123456789',
+      )
+      foreignEndpointId = held.id
+    }, 60_000)
+
+    afterAll(async () => {
+      await db
+        .delete(pairedClient)
+        .where(inArray(pairedClient.id, [LINKER, KEYHOLDER]))
+        .catch(() => {})
+    })
+
+    it('refuses the declaration at the route, naming the id', async () => {
+      const { applyEndpointDeclaration } = await import('../api/routes/endpoints.ts')
+      const refused = await applyEndpointDeclaration(LINKER, {
+        source: { kind: 'local' },
+        endpoints: [
+          {
+            externalId: 'borrowed',
+            kind: 'inference',
+            provider: 'openai',
+            model: 'gpt-4o-mini',
+            label: 'borrowed',
+            config: { apiKeyEndpointId: foreignEndpointId },
+          },
+        ],
+      })
+        .then(() => null)
+        .catch((err: unknown) => err as Error & { status?: number })
+
+      expect(refused?.message).toMatch(/not one of your endpoints/)
+      // A statement about the request, so a 400 rather than the router's
+      // catch-all 500.
+      expect(refused?.status).toBe(400)
+      // And nothing written.
+      expect(await registry.listEndpoints(LINKER)).toEqual([])
+    })
+
+    it('refuses to resolve one that was planted underneath the route', async () => {
+      // The row as it would exist if it had been written before this check
+      // existed — or by anything other than the route.
+      const planted = `${PREFIX}-planted`
+      const now = new Date()
+      await db.insert(modelEndpoint).values({
+        id: planted,
+        pairedClientId: LINKER,
+        kind: 'inference',
+        provider: 'openai',
+        template: 'openai',
+        model: 'gpt-4o-mini',
+        keyCiphertext: null,
+        source: 'local',
+        config: { apiKeyEndpointId: foreignEndpointId },
+        createdAt: now,
+        updatedAt: now,
+      })
+
+      const { LocalEndpointSource } = await import('./local-endpoint-source.ts')
+      await expect(
+        new LocalEndpointSource().inference({ endpointId: planted }),
+      ).rejects.toMatchObject({
+        name: 'EndpointKeyUnavailableError',
+        reason: 'client-mismatch',
+        retryable: false,
+      })
+
+      // And a listing does not claim a key it cannot produce. `hasKey` used to
+      // be the mere presence of `config.apiKeyEndpointId`.
+      const listed = await registry.listEndpoints(LINKER)
+      expect(listed).toHaveLength(1)
+      expect(listed[0]).toMatchObject({ id: planted, hasKey: false })
+
+      await db.delete(modelEndpoint).where(eq(modelEndpoint.id, planted))
+    })
+
+    it('still follows a link to one of the client’s own endpoints', async () => {
+      // The feature, unchanged: two endpoints of one client sharing a key.
+      const owner = await registry.createLocalEndpoint(
+        LINKER,
+        {
+          externalId: 'own-key',
+          kind: 'inference',
+          provider: 'openai',
+          template: 'openai',
+          model: 'gpt-4o',
+          label: 'the one with the key',
+        },
+        'sk-my-own-key-0123456789',
+      )
+      const borrower = await registry.createLocalEndpoint(
+        LINKER,
+        {
+          externalId: 'shares-it',
+          kind: 'inference',
+          provider: 'openai',
+          template: 'openai',
+          model: 'gpt-4o-mini',
+          label: 'shares it',
+          config: { apiKeyEndpointId: owner.id },
+        },
+        null,
+      )
+      expect(borrower.hasKey).toBe(true)
+
+      const { LocalEndpointSource } = await import('./local-endpoint-source.ts')
+      const resolved = await new LocalEndpointSource().inference({ endpointId: borrower.id })
+      expect(resolved?.apiKey).toBe('sk-my-own-key-0123456789')
+
+      await db
+        .delete(modelEndpoint)
+        .where(inArray(modelEndpoint.id, [owner.id, borrower.id]))
+    })
+  })
+
+  /**
+   * `PUT /v1/endpoints` is one declaration, and it used to be applied as a
+   * source write that committed, then a row per endpoint, then a
+   * reconciliation. A refusal partway through left a client with a new source,
+   * some of its endpoints written and the rest missing — a state no retry of
+   * the same body would produce.
+   */
+  describe('a declaration is applied whole, or not at all', () => {
+    const SUBJECT = `${PREFIX}-atomic`
+
+    beforeAll(async () => {
+      await db.insert(pairedClient).values({
+        id: SUBJECT,
+        label: `${PREFIX} atomic`,
+        certSerial: `${PREFIX}-serial-atomic`,
+        certFingerprint: `${PREFIX}-fingerprint-atomic`,
+        scope: 'admin',
+        status: 'active',
+        createdAt: new Date(),
+      })
+    }, 60_000)
+
+    afterAll(async () => {
+      await db.delete(pairedClient).where(eq(pairedClient.id, SUBJECT)).catch(() => {})
+    })
+
+    it('leaves the previous declaration intact when a later row is refused', async () => {
+      const { applyEndpointDeclaration } = await import('../api/routes/endpoints.ts')
+
+      // The declaration that stands.
+      const first = await applyEndpointDeclaration(SUBJECT, {
+        source: { kind: 'local' },
+        endpoints: [
+          {
+            externalId: 'keeper',
+            kind: 'embedding',
+            provider: 'openai',
+            template: 'openai',
+            model: 'text-embedding-3-small',
+            dimensions: 1536,
+            label: 'keeper',
+            apiKey: 'sk-keeper-0123456789',
+          },
+        ],
+      })
+      expect(first).toHaveLength(1)
+
+      // And the one that is refused on its second row: a new source, a new
+      // endpoint, and then a link to an endpoint this client does not own.
+      await expect(
+        applyEndpointDeclaration(SUBJECT, {
+          source: {
+            kind: 'mirrored',
+            resolverUrl: 'https://studio.example/api/search/resolve-endpoint',
+            resolverKey: RESOLVER_KEY,
+          },
+          endpoints: [
+            {
+              externalId: 'newcomer',
+              kind: 'inference',
+              provider: 'openai',
+              model: 'gpt-4o',
+              label: 'newcomer',
+            },
+            {
+              externalId: 'the-bad-row',
+              kind: 'inference',
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              label: 'the bad row',
+              config: { apiKeyEndpointId: 'ep-belonging-to-nobody' },
+            },
+          ],
+        }),
+      ).rejects.toThrow(/not one of your endpoints/)
+
+      // Exactly what was there before: one endpoint, still keyed, and the
+      // source still `local` — the source write rolled back with the rest.
+      const after = await registry.listEndpoints(SUBJECT)
+      expect(after).toHaveLength(1)
+      expect(after[0]).toMatchObject({ externalId: 'keeper', hasKey: true })
+      expect(await registry.getEndpointSourceDeclaration(SUBJECT)).toEqual({ kind: 'local' })
     })
   })
 })

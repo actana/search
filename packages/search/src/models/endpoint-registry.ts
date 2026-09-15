@@ -32,12 +32,25 @@
  *
  * **No function here returns a key.** `listEndpoints` reports whether a row has
  * one (`hasKey`), which is what an operator needs to see, and never the value.
+ *
+ * **Every write takes an optional executor.** `PUT /v1/endpoints` is one
+ * declaration — a source and a set of endpoints — and it used to be applied as
+ * a source write that committed, then a row per endpoint, then a
+ * reconciliation: a refusal on the fourth endpoint left the first three and the
+ * new source behind, which is a client whose keys now come from a resolver that
+ * half its endpoints were never pushed to. Passing a transaction in is what
+ * makes the route atomic. It also moves one thing: an executor means the caller
+ * is inside a transaction, so the **cache invalidation is the caller's** —
+ * dropping resolved keys before a commit that may still roll back would forget
+ * keys that are still current, and, worse, re-read them under a declaration
+ * that is about to be undone. The caller invalidates after the commit
+ * ({@link invalidateEndpointKeyCache}).
  */
 
 import { and, eq, sql } from 'drizzle-orm'
 import { createLogger } from '@actana/search-shared/log'
 import { generateId } from '@actana/search-shared/short-id'
-import { db } from '../db/client.ts'
+import { db, type SearchExecutor } from '../db/client.ts'
 import { modelEndpoint, pairedClient } from '../db/schema.ts'
 import { encryptSecret, decryptSecret } from '../core/security/encryption.ts'
 import { validateExternalUrl } from '../core/security/url-guard.ts'
@@ -49,6 +62,7 @@ import {
   type MirroredResolver,
 } from './mirrored-endpoint-source.ts'
 import { EndpointKeyUnavailableError } from './endpoint-key-errors.ts'
+import { readApiKeyEndpointId } from './endpoint-api-key.ts'
 import type { ModelEndpointSource } from './source.ts'
 
 const logger = createLogger('EndpointRegistry')
@@ -161,10 +175,11 @@ export interface EndpointSummary {
  */
 export async function setEndpointSource(
   clientId: string,
-  declaration: EndpointSourceDeclaration
+  declaration: EndpointSourceDeclaration,
+  executor?: SearchExecutor
 ): Promise<EndpointSourceSummary> {
   const stored = await sealDeclaration(declaration)
-  const updated = await db
+  const updated = await (executor ?? db)
     .update(pairedClient)
     .set({ endpointSource: stored })
     .where(eq(pairedClient.id, clientId))
@@ -182,7 +197,7 @@ export async function setEndpointSource(
    * rest of the TTL — which makes "I have revoked that" take a minute to be
    * true. It is a minute, and it is still the wrong answer.
    */
-  invalidateResolvedKeysFor(clientId)
+  invalidateUnlessDeferred(clientId, executor)
   // The URL, never the credential, and never the scope's *value* at info.
   logger.info('Endpoint source declared', { pairedClientId: clientId, kind: declaration.kind })
   return summariseSource(stored)
@@ -282,7 +297,8 @@ export async function openResolver(
  */
 export async function upsertMirroredEndpoints(
   clientId: string,
-  endpoints: MirroredEndpointInput[]
+  endpoints: MirroredEndpointInput[],
+  executor?: SearchExecutor
 ): Promise<Array<{ id: string; externalId: string }>> {
   const out: Array<{ id: string; externalId: string }> = []
   for (const input of endpoints) {
@@ -308,7 +324,7 @@ export async function upsertMirroredEndpoints(
       createdAt: now,
       updatedAt: now,
     }
-    const [row] = await db
+    const [row] = await (executor ?? db)
       .insert(modelEndpoint)
       .values(values)
       .onConflictDoUpdate({
@@ -342,7 +358,7 @@ export async function upsertMirroredEndpoints(
   // A re-pushed catalog may have moved an `externalId` to a different endpoint,
   // or turned a local row into a mirror. Either way what was cached for this
   // client was resolved against the catalog that has just been replaced.
-  invalidateResolvedKeysFor(clientId)
+  invalidateUnlessDeferred(clientId, executor)
   logger.info('Mirrored endpoints upserted', { pairedClientId: clientId, count: out.length })
   return out
 }
@@ -375,7 +391,8 @@ export async function upsertMirroredEndpoints(
 export async function createLocalEndpoint(
   clientId: string,
   input: LocalEndpointInput,
-  apiKey: string | null
+  apiKey: string | null,
+  executor?: SearchExecutor
 ): Promise<EndpointSummary> {
   if (apiKey !== null && !apiKey) {
     throw new Error('createLocalEndpoint: a local endpoint needs an API key')
@@ -404,11 +421,12 @@ export async function createLocalEndpoint(
     updatedAt: now,
   }
 
+  const write = executor ?? db
   let row: EndpointRow
   if (externalId === null) {
-    ;[row] = await db.insert(modelEndpoint).values(values).returning()
+    ;[row] = await write.insert(modelEndpoint).values(values).returning()
   } else {
-    ;[row] = await db
+    ;[row] = await write
       .insert(modelEndpoint)
       .values(values)
       .onConflictDoUpdate({
@@ -445,17 +463,24 @@ export async function createLocalEndpoint(
   })
   // A row that has just been re-declared may have been resolved through the
   // mirror a moment ago.
-  invalidateResolvedKeysFor(clientId)
-  return summarise(row)
+  invalidateUnlessDeferred(clientId, executor)
+  return summarise(row, await keyHolderIds(clientId, row, write))
 }
 
 /** Every endpoint this client owns. Keys are reported as a boolean, never a value. */
-export async function listEndpoints(clientId: string): Promise<EndpointSummary[]> {
-  const rows = await db
+export async function listEndpoints(
+  clientId: string,
+  executor?: SearchExecutor
+): Promise<EndpointSummary[]> {
+  const rows = await (executor ?? db)
     .select()
     .from(modelEndpoint)
     .where(eq(modelEndpoint.pairedClientId, clientId))
-  return rows.map(summarise)
+  // Which of this client's rows actually hold a ciphertext, so that a link is
+  // reported as a key only when it leads to one. No extra query: the answer is
+  // in the rows already selected.
+  const holders = new Set(rows.filter((r) => Boolean(r.keyCiphertext)).map((r) => r.id))
+  return rows.map((row) => summarise(row, holders))
 }
 
 /** Drop one endpoint. `false` when this client does not own it. */
@@ -476,7 +501,42 @@ export async function deleteEndpoint(clientId: string, endpointId: string): Prom
 
 type EndpointRow = typeof modelEndpoint.$inferSelect
 
-function summarise(row: EndpointRow): EndpointSummary {
+/**
+ * The ids of this client's endpoints that hold a key, for a single row's
+ * summary.
+ *
+ * `listEndpoints` derives this from the rows it already has;
+ * {@link createLocalEndpoint} has one row, so it asks — and only when the row
+ * carries a link at all, which is rare.
+ */
+async function keyHolderIds(
+  clientId: string,
+  row: EndpointRow,
+  executor: SearchExecutor
+): Promise<Set<string>> {
+  if (!readApiKeyEndpointId(row.config)) return new Set()
+  const rows = await executor
+    .select({ id: modelEndpoint.id, keyCiphertext: modelEndpoint.keyCiphertext })
+    .from(modelEndpoint)
+    .where(eq(modelEndpoint.pairedClientId, clientId))
+  return new Set(rows.filter((r) => Boolean(r.keyCiphertext)).map((r) => r.id))
+}
+
+/** Drop this client's resolved keys. The caller's job after a transaction commits. */
+export function invalidateEndpointKeyCache(clientId: string): void {
+  invalidateResolvedKeysFor(clientId)
+}
+
+/**
+ * Invalidate now, unless a transaction is open — in which case the caller does
+ * it after the commit. See the header.
+ */
+function invalidateUnlessDeferred(clientId: string, executor?: SearchExecutor): void {
+  if (executor) return
+  invalidateResolvedKeysFor(clientId)
+}
+
+function summarise(row: EndpointRow, keyHolders: ReadonlySet<string> = new Set()): EndpointSummary {
   return {
     id: row.id,
     externalId: row.externalId,
@@ -489,13 +549,23 @@ function summarise(row: EndpointRow): EndpointSummary {
     label: row.label,
     source: row.source === 'mirrored' ? 'mirrored' : 'local',
     config: (row.config as Record<string, unknown> | null) ?? {},
-    // A mirrored row's key is always obtainable in principle — it is one
-    // resolver call away — and a local row's is obtainable when it has a
-    // ciphertext or points at another endpoint that does.
+    /**
+     * A mirrored row's key is always obtainable in principle — it is one
+     * resolver call away — and a local row's is obtainable when it has a
+     * ciphertext, or points at another endpoint **of this client** that has
+     * one.
+     *
+     * The presence of `config.apiKeyEndpointId` used to be enough, which made
+     * `hasKey: true` a claim about a string rather than about a key: a link to
+     * a deleted endpoint, or to another client's (which `resolveEndpointApiKey`
+     * now refuses outright), reported a key this instance cannot produce. The
+     * link has to lead to a ciphertext, and the resolver follows a link exactly
+     * one level, so this does too.
+     */
     hasKey:
       row.source === 'mirrored' ||
       Boolean(row.keyCiphertext) ||
-      Boolean((row.config as { apiKeyEndpointId?: unknown } | null)?.apiKeyEndpointId),
+      keyHolders.has(readApiKeyEndpointId(row.config) ?? ''),
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   }
