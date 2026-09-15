@@ -17,7 +17,7 @@
  * then poll `GET …/documents/:docId`, or listen on `GET /v1/events`.
  */
 
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne, notInArray, or } from "drizzle-orm";
 import {
   AttachBlobMultipartFieldsSchema,
   BulkDocumentsRequestSchema,
@@ -76,8 +76,8 @@ const requestId = (): string => `rest-${generateShortId(8)}`;
  * `processing` is the legacy umbrella and the other four are the same run
  * further along (`ProcessingStatusSchema`), so all five are one answer to one
  * question: is something reading the object right now? `pending` is not among
- * them — an upload made with `includedInKb: false` rests there with no job
- * enqueued — and `completed` and `failed` are both settled.
+ * them on its own — see {@link blobAttachRefusal} for when it counts —
+ * and `completed` and `failed` are both settled.
  */
 const PROCESSING_IN_FLIGHT: ReadonlySet<string> = new Set([
   "processing",
@@ -86,6 +86,86 @@ const PROCESSING_IN_FLIGHT: ReadonlySet<string> = new Set([
   "clustering",
   "keywording",
 ]);
+
+/**
+ * Why `PUT …/documents/:docId/blob` must refuse this row right now, or `null`.
+ *
+ * **The attachable set is exactly:** `completed`, `failed`, and `pending` with
+ * `includedInKb: false`. Refused:
+ *
+ * - the five in-flight statuses — a worker is reading the current object, so
+ *   swapping the row underneath it would leave the chunks describing one
+ *   object and the row naming another;
+ * - `pending` with `includedInKb: true` — that is the state `POST …/documents`
+ *   and `POST …/include` leave a row in **with a job already queued**, and the
+ *   job's payload carries the current `fileUrl`. Repointing the row in that
+ *   window has the job chunk the old bytes under a row that names new ones.
+ *
+ * `pending` with `includedInKb: false` stays attachable: an upload made that
+ * way rests there with no job at all, which is the migration's case.
+ *
+ * {@link blobAttachableSql} is the same rule as a `WHERE` clause, and the two
+ * must change together.
+ */
+export function blobAttachRefusal(row: {
+  processingStatus: string;
+  includedInKb: boolean;
+}): string | null {
+  if (PROCESSING_IN_FLIGHT.has(row.processingStatus)) {
+    return `it is ${row.processingStatus}: a running job is reading its current bytes`;
+  }
+  if (row.processingStatus === "pending" && row.includedInKb) {
+    return "it is pending with includedInKb: true: a queued job holds its current bytes";
+  }
+  return null;
+}
+
+/** {@link blobAttachRefusal}'s attachable set, as a predicate on `document`. */
+function blobAttachableSql() {
+  return and(
+    notInArray(document.processingStatus, [...PROCESSING_IN_FLIGHT]),
+    or(ne(document.processingStatus, "pending"), eq(document.includedInKb, false)),
+  );
+}
+
+/**
+ * Repoint a document at a new object — only if it is still attachable.
+ *
+ * The route checks the row before it streams and stores the bytes, and a run
+ * can start in the time that takes. So the check is repeated *inside* the
+ * write rather than trusted: the `UPDATE` carries {@link blobAttachableSql} in
+ * its `WHERE`, and `false` means no row matched — the document left the
+ * attachable set (or was deleted) after the check — and nothing was written.
+ */
+export async function repointDocumentBlob(
+  kbId: string,
+  documentId: string,
+  values: { fileUrl: string; fileSize: number; mimeType: string },
+): Promise<boolean> {
+  const updated = await db
+    .update(document)
+    .set(values)
+    .where(
+      and(
+        eq(document.id, documentId),
+        eq(document.knowledgeBaseId, kbId),
+        isNull(document.deletedAt),
+        blobAttachableSql(),
+      ),
+    )
+    .returning({ id: document.id });
+  return updated.length > 0;
+}
+
+/** The 409 for a document outside the attachable set. */
+function blobAttachConflict(docId: string, reason: string): HttpError {
+  return conflict(
+    `document ${docId} cannot take new bytes yet: ${reason}. Only a completed or failed ` +
+      "document, or a pending one with includedInKb: false, is attachable. Wait for " +
+      "`processingStatus` to settle (poll GET …/documents/:docId, or listen on " +
+      "GET /v1/events) and attach again",
+  );
+}
 
 export function registerDocumentRoutes(router: SearchRouter): void {
   router.add(
@@ -238,31 +318,28 @@ export function registerDocumentRoutes(router: SearchRouter): void {
      * **left in place** deliberately: a job holding the old `fileUrl` in its
      * payload may still be reading it, and a migration that is re-run after a
      * partial failure should not have had its source deleted underneath it.
+     * **Known cost:** every replaced object — and the one stored by an attach
+     * that loses the race below — is orphaned in the bucket. No GC or reaper
+     * exists yet, and no route calls `deleteFile`.
+     *
+     * **Attachable set:** `completed`, `failed`, and `pending` with
+     * `includedInKb: false`; anything else is `409 conflict`
+     * ({@link blobAttachRefusal}). The rule is checked before the upload and
+     * again inside the `UPDATE`'s `WHERE`, so a run that starts while the
+     * bytes stream turns the write into a 409 rather than a silent repoint.
      */
     route("PUT", "/v1/kbs/:kbId/documents/:docId/blob", "write", async (ctx, { kbId, docId }) => {
       await requireKb(ctx.client, kbId!);
       const row = await requireDocument(kbId!, docId!);
 
       /**
-       * A document being processed right now keeps its old `fileUrl` in the
-       * job payload and in the worker's hands, so swapping the row underneath
-       * it would leave the chunks describing one object and the row naming
-       * another. Refused rather than raced.
-       *
-       * The whole in-flight set and not the literal `processing`: that value is
-       * the legacy umbrella (`ProcessingStatusSchema`) and `chunking`,
-       * `embedding`, `clustering` and `keywording` are the same run further
-       * along. `pending` is **not** in it — a document uploaded with
-       * `includedInKb: false` sits there with no job at all, and attaching its
-       * bytes is exactly what a caller would want to do next.
+       * Refused before the body is read and the bytes stored, so a document
+       * outside the attachable set costs no upload ({@link blobAttachRefusal}
+       * has the set and why). This is only the early answer: the write below
+       * repeats the predicate, because a run can start while the bytes stream.
        */
-      if (PROCESSING_IN_FLIGHT.has(row.processingStatus)) {
-        throw conflict(
-          `document ${docId} is ${row.processingStatus}: a running job is reading its current ` +
-            "bytes, so they cannot be replaced yet. Wait for `processingStatus` to settle " +
-            "(poll GET …/documents/:docId, or listen on GET /v1/events) and attach again",
-        );
-      }
+      const refusal = blobAttachRefusal(row);
+      if (refusal) throw blobAttachConflict(docId!, refusal);
 
       const body = await readMultipartBody(ctx.req);
       const file = body.files.find((f) => f.field === "file") ?? body.files[0];
@@ -286,10 +363,21 @@ export function registerDocumentRoutes(router: SearchRouter): void {
         context: "knowledge-base",
       });
 
-      await db
-        .update(document)
-        .set({ fileUrl: stored.path, fileSize: file.bytes.length, mimeType })
-        .where(eq(document.id, docId!));
+      const written = await repointDocumentBlob(kbId!, docId!, {
+        fileUrl: stored.path,
+        fileSize: file.bytes.length,
+        mimeType,
+      });
+      if (!written) {
+        // Lost the race: a delete is still a 404, anything else is the 409 the
+        // early check would have given. The object just stored is orphaned,
+        // like every superseded one (no reaper exists yet).
+        const now = await requireDocument(kbId!, docId!);
+        throw blobAttachConflict(
+          docId!,
+          blobAttachRefusal(now) ?? `it changed to ${now.processingStatus} during the attach`,
+        );
+      }
 
       sendJson(ctx.res, 200, documentToWire(await requireDocument(kbId!, docId!)));
     }),

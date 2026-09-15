@@ -305,15 +305,32 @@ object is **left in place** — a job holding the old `fileUrl` in its payload m
 still be reading it, and a migration re-run after a partial failure should not
 find its source deleted.
 
+**Known cost: replaced objects are orphaned.** Every attach that supersedes an
+object leaves the old one in the bucket, and so does an attach that stores its
+bytes and then loses the race described below. There is no GC or reaper yet —
+no route deletes an object — so a bucket that sees repeated attaches grows
+until one is built.
+
 `404` for a document that is not this client's or does not exist, as on every
-other document route (ADR 0009 D5). `409 conflict` while a run is reading the
-current bytes — `processing`, `chunking`, `embedding`, `clustering` or
-`keywording`: swapping the object underneath a worker would leave the chunks
-describing one object and the row naming another. `pending` is **not** refused,
-because a document uploaded with `includedInKb: false` rests there with no job
-enqueued and attaching its bytes is the obvious next thing to do; `completed`
-and `failed` are settled. Poll `GET …/documents/:docId` until the status leaves
-that set.
+other document route (ADR 0009 D5).
+
+**The attachable set is exactly: `completed`, `failed`, and `pending` with
+`includedInKb: false`.** Anything else is `409 conflict`:
+
+- `processing`, `chunking`, `embedding`, `clustering` or `keywording` — a run is
+  reading the current bytes, and swapping the object underneath a worker would
+  leave the chunks describing one object and the row naming another;
+- `pending` with `includedInKb: true` — the state `POST …/documents` and
+  `POST …/documents/:docId/include` leave a row in *with a job already queued*
+  whose payload carries the current `fileUrl`; repointing the row in that window
+  would have the job chunk the old bytes.
+
+`pending` with `includedInKb: false` stays attachable, because an upload made
+that way rests there with no job enqueued and attaching its bytes is the obvious
+next thing to do — it is the migration's case. The rule is checked before the
+bytes are stored and again as a predicate on the `UPDATE` itself, so a run that
+starts while the body streams makes the attach a `409` rather than a silent
+repoint. Poll `GET …/documents/:docId` until the document is back in the set.
 
 ## Chunks
 
