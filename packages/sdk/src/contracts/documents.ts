@@ -83,6 +83,21 @@ export const IngestJsonRequestSchema = z
     tags: TagWritesSchema.optional(),
     /** Defaults to `true` on the REST surface: a caller that posts a document wants it searchable. */
     includedInKb: z.boolean().optional(),
+    /**
+     * The document's id, chosen by the caller rather than by this instance.
+     *
+     * **For a caller that already has an id for this document.** Studio's
+     * wrapper (TASK-009) ingests rows whose ids its own callers hold, and those
+     * ids have to survive being wired through Search — same ids before and
+     * after. Omitted, Search generates one as it always did.
+     *
+     * **It is scoped by the knowledge base.** An id already taken in *another*
+     * KB is `409 conflict` and never an overwrite; the same id in the *same* KB
+     * is the idempotent re-ingest the engine already supports — the answer is
+     * that document's current status and no second row is written. The response
+     * echoes the id that was asked for either way.
+     */
+    documentId: z.string().min(1).max(128).optional(),
   })
   .refine((v) => (v.text === undefined) !== (v.url === undefined), {
     message: "provide exactly one of `text` or `url`",
@@ -92,13 +107,19 @@ export type IngestJsonRequest = z.infer<typeof IngestJsonRequestSchema>;
 /**
  * The multipart form's non-file fields. `file` carries the bytes; everything
  * else is a string part, because that is all a form can hold.
+ *
+ * `metadata`, `includedInKb` and `documentId` mean exactly what they mean on
+ * {@link IngestJsonRequestSchema} — a form just has to spell them as strings.
  */
 export const IngestMultipartFieldsSchema = z.object({
   filename: z.string().min(1).max(512).optional(),
   mimeType: z.string().min(1).max(255).optional(),
   /** JSON-encoded object. A form part cannot be structured any other way. */
   metadata: z.string().optional(),
+  /** `1|true|yes|on` or `0|false|no|off`; anything else is a `400`. */
   includedInKb: z.string().optional(),
+  /** The caller's own id for this document. See {@link IngestJsonRequestSchema}. */
+  documentId: z.string().min(1).max(128).optional(),
 });
 export type IngestMultipartFields = z.infer<typeof IngestMultipartFieldsSchema>;
 

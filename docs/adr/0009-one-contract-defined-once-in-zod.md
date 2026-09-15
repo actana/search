@@ -113,6 +113,14 @@ the same enum `SearchApiError.code` is documented against.
 surface has spelled it that way since it was copied out of Control (ADR 0008),
 and a client written against that spelling still works.
 
+**Beside, not instead of, and on every surface.** The refusal writer the
+pairing routes brought with them (`sendRefusal`) wrote `{ code, error }` and no
+`message`, and the router refuses through that same function — so a scope
+refusal, a KB-allow-list refusal, an unknown route, a missing certificate and a
+`core-error` were all bodies `ErrorBodySchema` does not describe, on a surface
+whose whole premise is that it is described once. Every refusal now carries all
+three keys.
+
 **D7 — A `500` carries an error id and no stack.** A stack is an internal map of
 the process. The id is in the log line beside the real error, which is what an
 operator greps.

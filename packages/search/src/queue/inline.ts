@@ -21,14 +21,19 @@
  * the order BullMQ guarantees and the order the in-process fixture suite
  * already drives by hand.
  *
- * It refuses to run outside a test environment for the same reason
+ * **It refuses to run outside a test environment**, for the same reason
  * `SEARCH_DEV_INSECURE` does: a deployment that quietly ran its ingestion
  * inside its API process would look like it was working right up until the
- * process was restarted mid-document.
+ * process was restarted mid-document. The refusal is in two places and both
+ * earn their keep — `SEARCH_INLINE_JOBS` is in the configuration schema, so
+ * `config()` throws before such a process finishes starting (`config.ts`), and
+ * {@link inlineJobsEnabled} throws too, so no code path reaches this backend by
+ * asking the question instead of reading the configuration.
  */
 
 import { createLogger } from "@actana/search-shared/log";
 import { generateId } from "@actana/search-shared/short-id";
+import { inATestEnvironment } from "../config.ts";
 import type { EnqueueOptions, JobQueueBackend, JobType } from "./index.ts";
 
 const logger = createLogger("queue/inline");
@@ -36,9 +41,25 @@ const logger = createLogger("queue/inline");
 /** The variable. */
 export const INLINE_JOBS_VAR = "SEARCH_INLINE_JOBS";
 
-/** Is the inline runner on? */
+/**
+ * Is the inline runner on?
+ *
+ * Throws rather than answering outside a test environment: the variable being
+ * set there at all is the mistake, and answering `false` would hand the caller
+ * the Redis-backed queue while leaving the misconfiguration in place for
+ * something else to discover.
+ */
 export function inlineJobsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return /^(1|true|yes|on)$/i.test(env[INLINE_JOBS_VAR] ?? "");
+  if (!/^(1|true|yes|on)$/i.test(env[INLINE_JOBS_VAR] ?? "")) return false;
+  if (!inATestEnvironment(env)) {
+    throw new Error(
+      `${INLINE_JOBS_VAR} is set outside a test environment. That mode runs the ingestion jobs ` +
+        "inside this process instead of on a worker, so a deployment would look like it was " +
+        "working right up until it was restarted mid-document — it runs only where " +
+        "NODE_ENV=test or SEARCH_TEST_DATABASE_URL is set.",
+    );
+  }
+  return true;
 }
 
 type Task = () => Promise<void>;

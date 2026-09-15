@@ -160,7 +160,17 @@ export async function readJsonBody(
   return parsed;
 }
 
-/** Read the whole body into memory, refusing past `maxBytes`. */
+/**
+ * Read the whole body into memory, refusing past `maxBytes`.
+ *
+ * **The refusal is a `413`, and it has to survive being written.** Destroying
+ * the request the moment the cap is passed — which is what this did — sends the
+ * client an `ECONNRESET` instead of the status this promise describes: the
+ * socket was gone before `sendError` had written a byte. So the read is
+ * *paused*, the refusal carries `connection: close`, and Node ends the socket
+ * after the response has been flushed rather than before. The chunks already
+ * buffered are dropped, because nothing is going to parse them.
+ */
 export function readBody(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -172,10 +182,20 @@ export function readBody(req: IncomingMessage, maxBytes: number): Promise<Buffer
       reject(err);
     };
     req.on("data", (chunk: Buffer) => {
+      if (settled) return;
       size += chunk.length;
       if (size > maxBytes) {
-        fail(new HttpError(413, "payload-too-large", `the body is over ${maxBytes} bytes`));
-        req.destroy();
+        req.pause();
+        chunks.length = 0;
+        fail(
+          new HttpError(
+            413,
+            "payload-too-large",
+            `the body is over ${maxBytes} bytes`,
+            undefined,
+            { connection: "close" },
+          ),
+        );
         return;
       }
       chunks.push(chunk);
@@ -219,6 +239,13 @@ export type PathParams = Record<string, string>;
  * no regular expression a reviewer has to run in their head. A parameter never
  * matches an empty segment, so `/v1/kbs//query` is a 404 rather than a query
  * against a KB called "".
+ *
+ * **A malformed escape is "no match", not a throw.** `decodeURIComponent
+ * ("%E0")` raises `URIError`, and this function is called from the router's own
+ * `routes.find` — outside every try in the request path — so a throw here used
+ * to become an unhandled rejection and one bad URL could end the process.
+ * `/v1/kbs/%E0/query` is not a path this router has, which is exactly what
+ * `null` says.
  */
 export function matchPath(pattern: string, pathname: string): PathParams | null {
   const wanted = pattern.split("/");
@@ -230,7 +257,13 @@ export function matchPath(pattern: string, pathname: string): PathParams | null 
     const g = got[i]!;
     if (w.startsWith(":")) {
       if (g === "") return null;
-      params[w.slice(1)] = decodeURIComponent(g);
+      let decoded: string;
+      try {
+        decoded = decodeURIComponent(g);
+      } catch {
+        return null;
+      }
+      params[w.slice(1)] = decoded;
       continue;
     }
     if (w !== g) return null;

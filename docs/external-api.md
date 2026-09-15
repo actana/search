@@ -60,6 +60,12 @@ in it; do not infer capability from `protocol`.
 `?scope=archived`. Creating a KB also provisions its vector partition, sized to
 the embedding endpoint's dimension.
 
+`embeddingEndpointId` and `inferenceEndpointId` must name **this client's own**
+endpoints (`GET /v1/endpoints` is the list). An id that is not is `404
+not-found` on both the create and the patch — not `403`, because an endpoint id
+that is not yours is an id you must not be able to confirm exists (ADR 0009 D5).
+Binding a KB to somebody else's endpoint would be spending their provider key.
+
 ## Query
 
 | Route | Scope | Request | Response |
@@ -104,7 +110,34 @@ convenient.
 
 Poll `GET …/documents/:docId` for `processingStatus`, or listen on
 `GET /v1/events`. A file part over 50 MB is `413`; the multipart envelope is
-capped at 64 MB and a JSON body at 4 MB.
+capped at 64 MB and a JSON body at 4 MB. A body over either cap is answered
+`413 payload-too-large` with `Connection: close` — the answer arrives, and then
+the socket goes.
+
+**The multipart encoding carries the same fields as the JSON one**, as string
+parts beside `file`:
+
+| Part | Meaning |
+|---|---|
+| `filename`, `mimeType` | Override what the file part declared. |
+| `includedInKb` | `1\|true\|yes\|on` or `0\|false\|no\|off`; anything else is a `400`. `false` stores the bytes and the row and does **not** chunk the document — no pipeline runs, the document has no chunks and cannot be matched by a query, and `POST …/documents/:docId/include` is the way in afterwards. |
+| `metadata` | A JSON-encoded object, validated against `MetadataSchema` — a malformed value is a `400` rather than a part quietly dropped. **Accepted and not written on a file ingest**: only the `text` path (`ingestDocument`) carries metadata onto the chunk rows, and that is frozen engine code (ADR 0005). The JSON encoding's `url` branch is the same pipeline and does the same thing. |
+| `documentId` | The caller's own id for the document. |
+
+**`documentId` lets the caller keep its own id** (both encodings). Omitted,
+Search generates one. Supplied, it is the id the row gets and the id the
+response echoes — which is what lets a caller whose rows already have ids wire
+them through Search without the ids changing. It is scoped by the knowledge
+base:
+
+- the id is **free** → the document is created with it;
+- the id is **already used in this KB** → the idempotent re-ingest the engine
+  already supports: the answer is that document's current `processingStatus`, no
+  second row is written and no new work is enqueued;
+- the id is **used in another KB** (this client's or anybody's) → `409
+  conflict`, never an overwrite. `document.id` is the primary key across every
+  KB on the instance, and the refusal says nothing about whose the other row
+  is.
 
 `upsert` identifies an existing document by `(connectorId, externalId)` when
 both are given and by `filename` otherwise, and answers
@@ -137,6 +170,9 @@ query.
 `PUT` is create-or-return: dedup is on the canonical (lowercased, trimmed) form,
 so two callers asking for `Parental Leave` and `parental-leave` get the same row.
 `extract-keywords` enqueues one job per document; it does not extract inline.
+With `scope: "document"` the `documentId` must be a document **in that KB** —
+otherwise `404 not-found`, because the job it enqueues is also what announces
+that document's events and those go to the document's owner.
 
 ## Clusters
 
@@ -180,6 +216,13 @@ declaration may carry `apiKey` and it comes back only as `hasKey: true`; a
 `mirrored` one carries none at all: `resolverUrl` is asked for one per job with
 `resolverKey` as the bearer, and `resolverScope` — an opaque string Search never
 parses — is echoed back verbatim as that request's `workspaceId`.
+
+**Every URL in the body goes through the SSRF guard** before anything is
+written: `resolverUrl` and each endpoint's `baseUrl`, which is the address
+embedding and inference requests are actually posted to. `https://` (or
+loopback `http://` where `SEARCH_ALLOW_LOCAL_FETCH` is set), no private or
+reserved address, no blocked port — anything else is `400 bad-request` and the
+push writes nothing at all.
 
 ## Events
 
@@ -226,14 +269,17 @@ enum is closed (`SEARCH_ERROR_CODES`).
 | 403 | `scope-forbidden` | The pairing's scope is below the route's. |
 | 403 | `kb-forbidden` | The pairing named KB ids and this is not one. |
 | 404 | `not-found` | No such route, or no such row **for this client**. |
-| 409 | `conflict` | A duplicate KB name; an include with no stored bytes. |
+| 409 | `conflict` | A duplicate KB name; an include with no stored bytes; a `documentId` already used in another KB. |
 | 413 | `payload-too-large` | Over the body or upload cap. |
 | 415 | `unsupported-media-type` | A content type the route does not read. |
 | 429 | `rate-limited` | Too many requests in the window. |
 | 500 | `core-error` | This instance failed. `detail.errorId` is what to grep the log for; there is no stack. |
 
 `error` appears beside `message` with the same string, for the pairing surface's
-older spelling. New code reads `message`.
+older spelling. New code reads `message`. **Every** refusal carries all three
+keys — `code`, `message` and `error` — the router's own (a scope, a KB
+allow-list, an unknown route, a missing certificate, a `core-error`) included,
+so `ErrorBodySchema` validates any of them.
 
 ## Rate limiting
 

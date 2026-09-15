@@ -18,7 +18,7 @@ import { document, kbKeyword } from "../../db/schema.ts";
 import { listKbKeywords, upsertKbKeyword, type KbKeywordRow } from "../../kb/keywords/index.ts";
 import { getJobQueue } from "../../queue/index.ts";
 import { badRequest, notFound, parseWith, queryOf, readJsonBody, route, sendJson } from "../http.ts";
-import { requireKb } from "../ownership.ts";
+import { requireDocument, requireKb } from "../ownership.ts";
 import type { SearchRouter } from "../routes.ts";
 import { isoRequired } from "../serialize.ts";
 
@@ -86,9 +86,21 @@ export function registerKeywordRoutes(router: SearchRouter): void {
         await requireKb(client, kbId!);
         const body = parseWith(ExtractKeywordsRequestSchema, await readJsonBody(req));
 
+        /**
+         * A named document has to be **in this knowledge base**.
+         *
+         * Without `requireDocument` the route took the id on trust, and the job
+         * it enqueues carries `{ documentId, knowledgeBaseId }` — while the
+         * announcement at the end of a job reads the document row and publishes
+         * to *that row's* owner (`jobs/run.ts`). So any `documentId` was a way
+         * to make a `document.ingested` appear on another client's event stream,
+         * and to spend that client's inference endpoint doing it. `404` rather
+         * than `403` for a document that is not this caller's (ADR 0009 D5),
+         * which is what `requireDocument` answers.
+         */
         const documents =
           body.scope === "document"
-            ? [{ id: body.documentId! }]
+            ? [{ id: (await requireDocument(kbId!, body.documentId!)).id }]
             : await db
                 .select({ id: document.id })
                 .from(document)

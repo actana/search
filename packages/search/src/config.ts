@@ -57,6 +57,18 @@ const schema = z.object({
    * `SEARCH_TEST_DATABASE_URL` is set.
    */
   SEARCH_DEV_INSECURE: booleanish.default(false),
+  /**
+   * Run the ingestion jobs **inside this process**, in worker order, with no
+   * Redis and no worker process (`queue/inline.ts`).
+   *
+   * For the fixture suites only, and refused exactly the way
+   * `SEARCH_DEV_INSECURE` is: {@link config} throws unless `NODE_ENV=test` or
+   * `SEARCH_TEST_DATABASE_URL` is set, so a process that so much as reads its
+   * configuration with this on does not start. A deployment that quietly ran
+   * its ingestion inside its API process would look like it was working right
+   * up until it was restarted mid-document.
+   */
+  SEARCH_INLINE_JOBS: booleanish.default(false),
   /** CA, server certificate, pairing material. The instance's identity. */
   SEARCH_STATE_DIR: z.string().optional(),
   SEARCH_LOG_LEVEL: z.enum(["debug", "info", "warn", "error", "silent"]).default("info"),
@@ -74,6 +86,39 @@ const schema = z.object({
 
 export type SearchConfig = z.infer<typeof schema>;
 
+/**
+ * Is this a process a test-only mode may run in?
+ *
+ * **Allow-list, not a deny-list, and that is the change.** Refusing only under
+ * `NODE_ENV=production` made every environment that forgot to set `NODE_ENV` —
+ * a bare `node src/index.ts`, a container whose entrypoint drops it, a staging
+ * box nobody labelled — an environment where one variable turns the mTLS wall
+ * off and makes `x-paired-client` an identity. An unset `NODE_ENV` is the
+ * default, so the default has to be the refusal.
+ *
+ * Two ways in, both of which a test run has and a deployment does not:
+ * `NODE_ENV=test`, which every runner sets, and `SEARCH_TEST_DATABASE_URL`,
+ * which is what this repository's integration suites gate on.
+ *
+ * Asked by `SEARCH_DEV_INSECURE` (`api/server.ts`) and by
+ * `SEARCH_INLINE_JOBS` (`queue/inline.ts`, and {@link config} below). It lives
+ * here because it is a question about the environment rather than about either
+ * mode, and because two copies of the answer are two things to get wrong.
+ */
+export function inATestEnvironment(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.NODE_ENV === "test" || (env.SEARCH_TEST_DATABASE_URL ?? "") !== "";
+}
+
+/** Refuse to run the jobs in-process outside a test, and say what that mode is. */
+function assertNotInlineJobs(): never {
+  throw new Error(
+    "SEARCH_INLINE_JOBS is set outside a test environment. That mode runs the ingestion jobs " +
+      "inside this process instead of on a worker (queue/inline.ts), so a deployment would look " +
+      "like it was working right up until it was restarted mid-document — it runs only where " +
+      "NODE_ENV=test or SEARCH_TEST_DATABASE_URL is set.",
+  );
+}
+
 let cached: SearchConfig | undefined;
 
 /** The parsed configuration. Throws with every offending variable named. */
@@ -86,6 +131,10 @@ export function config(): SearchConfig {
       .join("\n");
     throw new Error(`Invalid Search configuration:\n${problems}`);
   }
+  // Not a `.refine` on the schema: the refusal is about the *environment* this
+  // process is in rather than about the value, and a reader of the error wants
+  // the sentence rather than a zod issue path.
+  if (parsed.data.SEARCH_INLINE_JOBS && !inATestEnvironment()) assertNotInlineJobs();
   cached = parsed.data;
   return cached;
 }

@@ -8,7 +8,7 @@
  * between two engines and then gets out of the way.
  */
 
-import { eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import {
   CreateKbRequestSchema,
   ListKbsQuerySchema,
@@ -52,6 +52,7 @@ import {
 } from "../http.ts";
 import { chargeQuery } from "../rate-limit.ts";
 import { ownerIdFor, requireKb } from "../ownership.ts";
+import { listEndpoints } from "./endpoints.ts";
 import type { SearchRouter } from "../routes.ts";
 import { iso, kbToWire } from "../serialize.ts";
 
@@ -71,12 +72,43 @@ const DEFAULT_EMBEDDING_DIMENSION = 1536;
 /** The column default, spelled out so a create and a UI-made KB agree. */
 const DEFAULT_CHUNKING_CONFIG: ChunkingConfig = { maxSize: 1024, minSize: 1, overlap: 200 };
 
+/**
+ * Every model endpoint id in this request has to be one of the caller's own.
+ *
+ * **The frozen service will not check.** `createKnowledgeBase` looks the
+ * embedding endpoint up by id with no `paired_client_id` predicate and never
+ * looks the inference one up at all (`knowledge/service.ts`), so a client that
+ * knew — or walked onto — another client's endpoint id could bind its own KB to
+ * that client's sealed provider key and have this instance spend it. The engine
+ * is behaviour-frozen (ADR 0005), so the check lives here, in the route, before
+ * the id is handed over.
+ *
+ * `404 not-found` rather than `403`: an id that is not the caller's must not be
+ * confirmed to exist (ADR 0009 D5).
+ *
+ * **One helper and one lookup**, because TASK-005 replaces this branch's
+ * registry (`api/routes/endpoints.ts`) with `models/endpoint-registry.ts` —
+ * whose `listEndpoints(clientId)` is this name and signature already, so the
+ * rebase swaps the import and nothing else.
+ */
+async function requireOwnedEndpoints(
+  pairedClientId: string,
+  ids: Array<string | null | undefined>,
+): Promise<void> {
+  const wanted = ids.filter((id): id is string => typeof id === "string" && id !== "");
+  if (wanted.length === 0) return;
+  const owned = new Set((await listEndpoints(pairedClientId)).map((row) => row.id));
+  for (const id of wanted) {
+    if (!owned.has(id)) throw notFound(`no model endpoint ${id}`);
+  }
+}
+
 export function registerKbRoutes(router: SearchRouter): void {
   router.add(
     route("GET", "/v1/kbs", "read", async ({ res, client, url }) => {
       const query = parseWith(ListKbsQuerySchema, queryOf(url));
       const rows = await getKnowledgeBases(client!.id, client!.id, query.scope ?? "active");
-      const languages = await languagesFor(rows.map((r) => r.id));
+      const languages = await languagesFor(client!.id, rows.map((r) => r.id));
       sendJson(res, 200, {
         knowledgeBases: rows.map((kb) => kbToWire(kb, { language: languages.get(kb.id) })),
       });
@@ -86,6 +118,10 @@ export function registerKbRoutes(router: SearchRouter): void {
   router.add(
     route("POST", "/v1/kbs", "write", async ({ req, res, client }) => {
       const body = parseWith(CreateKbRequestSchema, await readJsonBody(req));
+      await requireOwnedEndpoints(client!.id, [
+        body.embeddingEndpointId,
+        body.inferenceEndpointId,
+      ]);
 
       let created;
       try {
@@ -178,6 +214,12 @@ export function registerKbRoutes(router: SearchRouter): void {
       await requireKb(client, kbId!);
       const body = parseWith(UpdateKbRequestSchema, await readJsonBody(req));
       if (Object.keys(body).length === 0) throw badRequest("the patch is empty");
+      // Same reason as the create: `updateKnowledgeBase` writes the id it is
+      // given without asking whose it is.
+      await requireOwnedEndpoints(client!.id, [
+        body.inferenceEndpointId,
+        (body as { embeddingEndpointId?: string | null }).embeddingEndpointId,
+      ]);
       let updated;
       try {
         updated = await updateKnowledgeBase(kbId!, body, requestId());
@@ -312,12 +354,27 @@ async function runV1TagQuery(
   };
 }
 
-/** The `language` column for a batch of KBs, which the lifted type omits. */
-async function languagesFor(kbIds: string[]): Promise<Map<string, string>> {
+/**
+ * The `language` column for a batch of KBs, which the lifted type omits.
+ *
+ * Restricted to the ids asked for **and** to the calling client: this read used
+ * to select every `knowledge_base` row on the instance and filter in memory,
+ * which is one `GET /v1/kbs` reading every other client's rows to answer with
+ * four of its own.
+ */
+async function languagesFor(
+  pairedClientId: string,
+  kbIds: string[],
+): Promise<Map<string, string>> {
   if (kbIds.length === 0) return new Map();
   const rows = await db
     .select({ id: knowledgeBase.id, language: knowledgeBase.language })
-    .from(knowledgeBase);
-  const wanted = new Set(kbIds);
-  return new Map(rows.filter((r) => wanted.has(r.id)).map((r) => [r.id, r.language]));
+    .from(knowledgeBase)
+    .where(
+      and(
+        eq(knowledgeBase.pairedClientId, pairedClientId),
+        inArray(knowledgeBase.id, kbIds),
+      ),
+    );
+  return new Map(rows.map((r) => [r.id, r.language]));
 }

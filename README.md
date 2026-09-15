@@ -46,7 +46,9 @@ pnpm dev
 > brings the worker that runs them, so on this commit a document posted to a
 > running instance stays `pending` unless something is draining the queue. The
 > fixture suite drives the whole pipeline with `SEARCH_INLINE_JOBS=1`, which
-> runs the jobs in-process and refuses to start outside a test.
+> runs the jobs in-process and refuses to start outside a test: it is in the
+> configuration schema, so `config()` throws unless `NODE_ENV=test` or
+> `SEARCH_TEST_DATABASE_URL` is set, and the queue's own switch throws too.
 >
 > `SEARCH_ENCRYPTION_KEY` is required rather than generated, and nothing
 > generates one for you.

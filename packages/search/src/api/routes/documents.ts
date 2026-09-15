@@ -23,6 +23,7 @@ import {
   IngestMultipartFieldsSchema,
   IncludeDocumentRequestSchema,
   ListDocumentsQuerySchema,
+  MetadataSchema,
   UpdateDocumentRequestSchema,
   UpsertDocumentRequestSchema,
 } from "@actana/search/contracts";
@@ -34,6 +35,7 @@ import { StorageService } from "../../blob/index.ts";
 import { MAX_UPLOAD_SIZE_BYTES } from "../../blob/validation.ts";
 import { stageIngestedDocument } from "../../kb/ingest.ts";
 import { getJobQueue } from "../../queue/index.ts";
+import type { KbIngestDocumentPayload } from "../../jobs/types.ts";
 import {
   deleteDocument,
   getDocuments,
@@ -219,6 +221,30 @@ async function ingestMultipart(
   const fields = parseWith(IngestMultipartFieldsSchema, body.fields);
   const filename = fields.filename ?? file.filename;
   const mimeType = fields.mimeType ?? file.contentType;
+  /**
+   * `includedInKb` and `metadata` are on the multipart contract and the SDK
+   * sends both — and this route read neither, so a form that said
+   * `includedInKb=false` got a document chunked into the KB anyway. Both are
+   * read the way the JSON encoding reads them now, which for `metadata` also
+   * means a malformed value is a `400` rather than a part quietly dropped.
+   */
+  const includedInKb = booleanField(fields.includedInKb, "includedInKb") ?? true;
+  /**
+   * Validated for its own sake, and the value goes nowhere: on a *file* ingest
+   * `metadata` is accepted and not written, because only `ingestDocument` — the
+   * text path — carries it onto the chunk rows and that is lifted,
+   * behaviour-frozen code (ADR 0005). The JSON encoding's `url` branch is the
+   * same pipeline and does the same thing, and `docs/external-api.md` says so
+   * rather than leaving it to be discovered. Validating anyway is the
+   * difference between "not written" and "silently dropped, malformed or not".
+   */
+  metadataField(fields.metadata);
+
+  // Before the upload: a `documentId` that belongs to another knowledge base is
+  // refused rather than answered after this instance has stored the bytes.
+  const reused = await documentForSuppliedId(kbId, fields.documentId);
+  if (reused) return { documentId: reused.id, processingStatus: reused.processingStatus };
+  const documentId = fields.documentId ?? generateId();
 
   const stored = await StorageService.uploadFile({
     file: file.bytes,
@@ -227,7 +253,6 @@ async function ingestMultipart(
     context: "knowledge-base",
   });
 
-  const documentId = generateId();
   await stageIngestedDocument({
     kbId,
     documentId,
@@ -235,9 +260,19 @@ async function ingestMultipart(
     mimeType,
     fileUrl: stored.path,
     fileSize: file.bytes.length,
-    includedInKb: true,
+    includedInKb,
     tags: coerceTags(tagWritesFrom(body.fields)),
   });
+
+  /**
+   * `includedInKb: false` means "the bytes are here, do not chunk them", so the
+   * pipeline is not enqueued at all — which is what `ingestDocument` does with
+   * the same flag on the text path ("persisting metadata only"). The document
+   * stays at `pending` with no chunks, which is what keeps it out of every
+   * query, and `POST …/documents/:docId/include` is the way in afterwards: it
+   * has stored bytes, so that route works on it.
+   */
+  if (!includedInKb) return { documentId, processingStatus: "pending" };
 
   await enqueueFileProcessing(kbId, documentId, {
     filename,
@@ -256,7 +291,9 @@ async function ingestJson(
   const body = parseWith(IngestJsonRequestSchema, await readJsonBody(req));
   const includedInKb = body.includedInKb ?? true;
   const mimeType = body.mimeType ?? "application/octet-stream";
-  const documentId = generateId();
+  const reused = await documentForSuppliedId(kbId, body.documentId);
+  if (reused) return { documentId: reused.id, processingStatus: reused.processingStatus };
+  const documentId = body.documentId ?? generateId();
   const tags = coerceTags(body.tags);
 
   if (body.url !== undefined) {
@@ -294,7 +331,10 @@ async function ingestJson(
     tags,
   });
   const queue = await getJobQueue();
-  await queue.enqueue("kb.ingest.document", {
+  // Typed rather than inline: `KbIngestDocumentPayload` is the shape the frozen
+  // `ingestDocument` destructures, and TASK-005's worker declares a different
+  // one for this job name (see that type's note).
+  const payload: KbIngestDocumentPayload = {
     kbId,
     documentId,
     text: body.text,
@@ -302,8 +342,9 @@ async function ingestJson(
     mimeType,
     metadata: body.metadata ?? {},
     includedInKb,
-    tags,
-  });
+    ...(tags === undefined ? {} : { tags }),
+  };
+  await queue.enqueue("kb.ingest.document", payload);
   return { documentId, processingStatus: "pending" };
 }
 
@@ -381,7 +422,7 @@ async function upsert(
       tags: { ...tags, ...provenance },
     });
     const queue = await getJobQueue();
-    await queue.enqueue("kb.ingest.document", {
+    const payload: KbIngestDocumentPayload = {
       kbId,
       documentId,
       text: body.text,
@@ -389,8 +430,9 @@ async function upsert(
       mimeType,
       metadata: body.metadata ?? {},
       includedInKb: true,
-      tags,
-    });
+      ...(tags === undefined ? {} : { tags }),
+    };
+    await queue.enqueue("kb.ingest.document", payload);
   }
 
   return {
@@ -415,6 +457,73 @@ async function enqueueFileProcessing(
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * What a caller's own `documentId` means, decided in one place for both
+ * encodings.
+ *
+ * Three answers, and the middle one is the point:
+ *
+ *   - **No row has that id** → `null`, and the caller's id is used as-is. A
+ *     caller that already has an id for this document keeps it (TASK-009's
+ *     wrapper needs the ids either side of the wire to be the same ids).
+ *   - **A row in *this* KB has it** → that row, and the route answers with its
+ *     status and writes nothing. This is the idempotent re-ingest the engine
+ *     already supports: `stageIngestedDocument` is `onConflictDoNothing`, so a
+ *     second POST of the same id was already a no-op on the row — answering
+ *     with the row's real status is just saying so out loud.
+ *   - **A row in *another* KB has it** → `409 conflict`. `document.id` is the
+ *     primary key across every knowledge base on the instance, so honouring the
+ *     id would either overwrite somebody else's document or silently ingest
+ *     into their KB. Neither is something a caller can have asked for, and a
+ *     `409` is the one answer that does not confirm whose it is.
+ */
+async function documentForSuppliedId(
+  kbId: string,
+  suppliedId: string | undefined,
+): Promise<{ id: string; processingStatus: string } | null> {
+  if (suppliedId === undefined) return null;
+  const [row] = await db
+    .select({
+      id: document.id,
+      knowledgeBaseId: document.knowledgeBaseId,
+      processingStatus: document.processingStatus,
+    })
+    .from(document)
+    .where(eq(document.id, suppliedId))
+    .limit(1);
+  if (!row) return null;
+  if (row.knowledgeBaseId !== kbId) {
+    throw conflict(`document ${suppliedId} already exists in another knowledge base`);
+  }
+  return { id: row.id, processingStatus: row.processingStatus };
+}
+
+/**
+ * A form part as a boolean, or a `400`.
+ *
+ * Refused rather than coerced: `includedInKb=banana` read as `false` is a
+ * document silently left out of the KB the caller thought it had filled.
+ */
+function booleanField(raw: string | undefined, name: string): boolean | undefined {
+  if (raw === undefined) return undefined;
+  const value = raw.trim();
+  if (/^(1|true|yes|on)$/i.test(value)) return true;
+  if (/^(0|false|no|off)$/i.test(value)) return false;
+  throw badRequest(`\`${name}\` must be true or false, not ${JSON.stringify(raw)}`);
+}
+
+/** The `metadata` form part, as the JSON encoding's own schema validates it. */
+function metadataField(raw: string | undefined): Record<string, unknown> | undefined {
+  if (raw === undefined || raw.trim() === "") return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw badRequest("`metadata` must be a JSON object");
+  }
+  return parseWith(MetadataSchema, parsed);
+}
 
 /** The document rows for a page of ids, indexed by id. */
 async function rowsById(

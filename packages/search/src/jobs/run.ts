@@ -1,6 +1,10 @@
 /**
  * One job name → one handler, and what is announced when it finishes.
  *
+ * **TASK-005's BullMQ worker must call {@link runSearchJob} — not a handler
+ * directly — so that the worker transport and the inline one run the same code,
+ * including the announcement below.**
+ *
  * **This is the seam.** TASK-005's worker process pulls a job off BullMQ and
  * calls {@link runSearchJob}; the inline runner (`queue/inline.ts`,
  * `SEARCH_INLINE_JOBS=1`) calls exactly the same function from the enqueue
@@ -23,22 +27,43 @@ import type { SearchEvent } from "@actana/search/contracts";
 import { db } from "../db/client.ts";
 import { document, knowledgeBase } from "../db/schema.ts";
 import { publishSearchEvent, searchEventId } from "../events/publish.ts";
-import type { JobType } from "../queue/index.ts";
 
 const logger = createLogger("jobs/run");
 
-/**
- * The flow parent's job name.
- *
- * `embed-pipeline.ts` names it `kb.embed.finalize` and `queue/index.ts`'s
- * `JobType` calls it `kb.document.finalize`. Both spellings reach the same
- * handler because both spellings are already on the wire — renaming either is a
- * change that drops an in-flight job on the floor.
- */
-const FINALIZE_JOB_NAMES = new Set(["kb.document.finalize", "kb.embed.finalize"]);
-
 /** A job, as a runner hands it over. */
 export type SearchJob = { type: string; payload: unknown };
+
+/**
+ * Every job name a runner can hand over, and where that job's handler is.
+ *
+ * **This table is the only place a job name is spelled.** It used to be two
+ * places — a `FINALIZE_JOB_NAMES` set beside a `switch` — which is one place
+ * too many for a string that is also sitting in Redis. `kb.document.finalize`
+ * and `kb.embed.finalize` are both here because both are already on the wire:
+ * `embed-pipeline.ts` enqueues the second and `queue/index.ts`'s `JobType`
+ * declares the first, and renaming either drops an in-flight job on the floor.
+ *
+ * Handlers are imported lazily, one module per entry, because this file is
+ * loaded by the API process as well and the engine behind it is large.
+ */
+const JOB_HANDLERS: Record<string, () => Promise<(payload: never) => Promise<unknown>>> = {
+  "kb.document.finalize": async () =>
+    (await import("../knowledge/documents/embed-pipeline.ts")).finalizeDocumentEmbedding,
+  "kb.embed.finalize": async () =>
+    (await import("../knowledge/documents/embed-pipeline.ts")).finalizeDocumentEmbedding,
+  "knowledge-process-document": async () =>
+    (await import("../knowledge/documents/embed-pipeline.ts")).planDocumentEmbedding,
+  "kb.embed.batch": async () =>
+    (await import("../knowledge/documents/embed-pipeline.ts")).processEmbedBatch,
+  "kb.ingest.document": async () => (await import("../kb/ingest.ts")).ingestDocument,
+  "kb-keywords-extract": async () =>
+    (await import("../kb/jobs/keywords-extract.ts")).handleKeywordsExtract,
+  "kb.clusters.validate": async () =>
+    (await import("../kb/jobs/clusters-validate.ts")).handleClustersValidate,
+};
+
+/** Every job name this file answers for. `JobType`'s spellings are a subset. */
+export const SEARCH_JOB_NAMES: readonly string[] = Object.keys(JOB_HANDLERS);
 
 /**
  * Run one job to completion, then announce whatever it made terminal.
@@ -64,43 +89,12 @@ export async function runSearchJob(job: SearchJob): Promise<void> {
 }
 
 async function dispatch(type: string, payload: Record<string, unknown>): Promise<void> {
-  if (FINALIZE_JOB_NAMES.has(type)) {
-    const { finalizeDocumentEmbedding } = await import(
-      "../knowledge/documents/embed-pipeline.ts"
-    );
-    await finalizeDocumentEmbedding(payload as never);
-    return;
-  }
-
-  switch (type as JobType) {
-    case "knowledge-process-document": {
-      const { planDocumentEmbedding } = await import("../knowledge/documents/embed-pipeline.ts");
-      await planDocumentEmbedding(payload as never);
-      return;
-    }
-    case "kb.embed.batch": {
-      const { processEmbedBatch } = await import("../knowledge/documents/embed-pipeline.ts");
-      await processEmbedBatch(payload as never);
-      return;
-    }
-    case "kb.ingest.document": {
-      const { ingestDocument } = await import("../kb/ingest.ts");
-      await ingestDocument(payload as never);
-      return;
-    }
-    case "kb-keywords-extract": {
-      const { handleKeywordsExtract } = await import("../kb/jobs/keywords-extract.ts");
-      await handleKeywordsExtract(payload as never);
-      return;
-    }
-    case "kb.clusters.validate": {
-      const { handleClustersValidate } = await import("../kb/jobs/clusters-validate.ts");
-      await handleClustersValidate(payload as never);
-      return;
-    }
-    default:
-      throw new Error(`no handler for job type "${type}"`);
-  }
+  const load = JOB_HANDLERS[type];
+  // A payload nobody handles is work that was lost, so an unknown name is an
+  // error rather than a silent success.
+  if (!load) throw new Error(`no handler for job type "${type}"`);
+  const handler = await load();
+  await handler(payload as never);
 }
 
 /**
@@ -168,6 +162,29 @@ async function announce(type: string, payload: Record<string, unknown>): Promise
     .where(eq(document.id, documentId))
     .limit(1);
   if (!row) return;
+
+  /**
+   * The document has to be in the KB the payload named.
+   *
+   * This lookup is by document id alone — which is right, because the row is
+   * what says what happened — and the event is then published to *that row's*
+   * owner. So a payload naming one client's document under another client's KB
+   * would have announced on the first client's stream on the second client's
+   * say-so. The route layer refuses such a pair now (`api/routes/keywords.ts`),
+   * and this is the same check on the other side of the queue, where a payload
+   * may also have been written by an older version of a route.
+   */
+  const claimedKbId = payloadKbId(payload);
+  if (claimedKbId !== undefined && claimedKbId !== row.knowledgeBaseId) {
+    logger.warn("A job's payload named a knowledge base the document is not in; not announcing", {
+      documentId,
+      claimedKbId,
+      actualKbId: row.knowledgeBaseId,
+      type,
+    });
+    return;
+  }
+
   if (row.processingStatus !== "completed" && row.processingStatus !== "failed") return;
 
   const kb = await kbOwner(row.knowledgeBaseId);
@@ -190,6 +207,18 @@ async function announce(type: string, payload: Record<string, unknown>): Promise
       : {}),
   };
   await publishSearchEvent(kb.pairedClientId, event);
+}
+
+/**
+ * The knowledge base a payload claims, under either of the two names the
+ * payloads use — `knowledgeBaseId` in the worker-flow payloads and `kbId` in
+ * `kb.ingest.document`'s. `undefined` when it names none, which is not a
+ * mismatch: `kb.embed.batch` carries only the document.
+ */
+function payloadKbId(payload: Record<string, unknown>): string | undefined {
+  if (typeof payload.knowledgeBaseId === "string") return payload.knowledgeBaseId;
+  if (typeof payload.kbId === "string") return payload.kbId;
+  return undefined;
 }
 
 async function kbOwner(

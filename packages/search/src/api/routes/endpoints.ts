@@ -74,7 +74,24 @@ export function registerEndpointRoutes(router: SearchRouter): void {
     route("PUT", "/v1/endpoints", "admin", async ({ req, res, client }) => {
       const body = parseWith(PutEndpointsRequestSchema, await readJsonBody(req));
 
-      // The source first, so a bad resolver URL is refused before any endpoint
+      /**
+       * Every declared `baseUrl` through the SSRF guard, before anything is
+       * written and for the same reason `resolverUrl` goes through it: that URL
+       * is **fetched** — `models/embedding.ts` posts to it per batch — so an
+       * admin-scoped client naming `https://169.254.169.254/` here would be
+       * asking this process to read its own instance metadata and hand back
+       * whatever came out as an embedding. Same dev allowance as the resolver's:
+       * `SEARCH_ALLOW_LOCAL_FETCH` is what makes a loopback endpoint legal.
+       */
+      for (const declared of body.endpoints) {
+        if (declared.baseUrl === undefined) continue;
+        const verdict = validateExternalUrl(declared.baseUrl, "endpoints[].baseUrl");
+        if (!verdict.isValid) {
+          throw badRequest(verdict.error ?? "that endpoint base URL cannot be used");
+        }
+      }
+
+      // The source next, so a bad resolver URL is refused before any endpoint
       // row is written against it.
       const declaration = await setEndpointSource(client!.id, body.source);
 

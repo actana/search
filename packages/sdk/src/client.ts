@@ -342,6 +342,11 @@ export class SearchClient {
      * fetch them and do the same, and `{ text }` takes the `ingestDocument`
      * path. Asynchronous in all three: what comes back is a document id and a
      * status to poll, or to wait for on {@link SearchClient.events}.
+     *
+     * `documentId` is the caller's own id for the document, carried on all
+     * three shapes (a form part on the multipart one), and the answer echoes
+     * it: the same id twice in one KB is an idempotent re-ingest and the same id
+     * in a different KB is a `409`.
      */
     ingest: (kbId: string, input: IngestInput): Promise<IngestResponse> => {
       const path = `/v1/kbs/${encodeURIComponent(kbId)}/documents`;
@@ -682,6 +687,7 @@ function ingestFormData(
         });
   form.append("file", blob, input.filename);
   form.append("filename", input.filename);
+  if (input.documentId !== undefined) form.append("documentId", input.documentId);
   if (input.mimeType !== undefined) form.append("mimeType", input.mimeType);
   if (input.metadata !== undefined) form.append("metadata", JSON.stringify(input.metadata));
   if (input.includedInKb !== undefined) form.append("includedInKb", String(input.includedInKb));
